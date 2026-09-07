@@ -119,8 +119,11 @@ def _resolve_include_schemas(config: dict[str, Any]) -> tuple[str, ...]:
 class PostgresSourceConnector(SourceConnector):
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
-        self._include_schemas: tuple[str, ...] = _resolve_include_schemas(config)
         self._conn: Any = None
+
+    @property
+    def _include_schemas(self) -> tuple[str, ...]:
+        return _resolve_include_schemas(self._config)
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     def connect(self) -> None:
@@ -156,10 +159,11 @@ class PostgresSourceConnector(SourceConnector):
             validate_identifier(t, "table")
         return tables
 
-    def get_object_count(self, object_name: str) -> int:
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
         validate_identifier(object_name, "table")
+        table_name = f"{schema_name}.{object_name}" if schema_name else object_name
         with self._conn.cursor() as cur:
-            cur.execute(f"SELECT count(*) FROM {object_name}")
+            cur.execute(f"SELECT count(*) FROM {table_name}")
             return cur.fetchone()[0]
 
     @staticmethod
@@ -178,7 +182,7 @@ class PostgresSourceConnector(SourceConnector):
             return [PostgresSourceConnector._coerce_value(i) for i in v]  # PG arrays
         return v
 
-    def export_full(self, object_name: str, statement_timeout_ms: int = 0) -> Iterator[dict[str, Any]]:
+    def export_full(self, object_name: str, statement_timeout_ms: int = 0, schema_name: str | None = None) -> Iterator[dict[str, Any]]:
         """Stream all rows from *object_name* using a server-side cursor.
 
         Fix #8: Sets lock_timeout (5 s) so the SELECT never queues behind a
@@ -186,13 +190,14 @@ class PostgresSourceConnector(SourceConnector):
         disabled) so callers can cap run-away exports.
         """
         validate_identifier(object_name, "table")
+        table_name = f"{schema_name}.{object_name}" if schema_name else object_name
         with self._conn.cursor() as setup_cur:
             # 5-second lock timeout — fails fast rather than waiting forever.
             setup_cur.execute("SET LOCAL lock_timeout = '5s'")
             if statement_timeout_ms:
                 setup_cur.execute(f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}")
         with self._conn.cursor(name=f"export_{object_name}") as cur:
-            cur.execute(f"SELECT * FROM {object_name}")
+            cur.execute(f"SELECT * FROM {table_name}")
             columns = [desc.name for desc in cur.description]
             for row in cur:
                 yield {k: self._coerce_value(v) for k, v in zip(columns, row)}
@@ -389,19 +394,21 @@ class PostgresSourceConnector(SourceConnector):
     def list_all_sequences(self) -> list["SequenceDef"]:
         """Return every sequence in the configured schemas with full metadata."""
         from core.connectors.base import SequenceDef
-        results: list[SequenceDef] = []
+        results: list["SequenceDef"] = []
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT "
+                "  s.schemaname, "
                 "  s.sequencename, "
                 "  s.start_value, s.min_value, s.max_value, "
                 "  s.increment_by, s.cycle, "
                 "  s.last_value, "
                 "  ("
-                "    SELECT pc.relname || '.' || a.attname "
+                "    SELECT n.nspname || '.' || pc.relname || '.' || a.attname "
                 "    FROM pg_class sc "
                 "    JOIN pg_depend d ON d.objid = sc.oid AND d.deptype = 'a' "
                 "    JOIN pg_class pc ON pc.oid = d.refobjid "
+                "    JOIN pg_namespace n ON pc.relnamespace = n.oid "
                 "    JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
                 "    WHERE sc.relname = s.sequencename "
                 "      AND sc.relnamespace = ANY(SELECT oid FROM pg_namespace WHERE nspname = ANY(%s)) "
@@ -409,11 +416,11 @@ class PostgresSourceConnector(SourceConnector):
                 "  ) AS owned_by "
                 "FROM pg_sequences s "
                 "WHERE s.schemaname = ANY(%s) "
-                "ORDER BY s.sequencename",
+                "ORDER BY s.schemaname, s.sequencename",
                 (list(self._include_schemas), list(self._include_schemas)),
             )
             for row in cur.fetchall():
-                seq_name, start, min_v, max_v, incr, cycle, last_v, owned_by = row
+                seq_schema, seq_name, start, min_v, max_v, incr, cycle, last_v, owned_by = row
                 results.append(SequenceDef(
                     name=seq_name,
                     start_value=int(start),
@@ -423,6 +430,7 @@ class PostgresSourceConnector(SourceConnector):
                     cycle=bool(cycle),
                     last_value=int(last_v) if last_v is not None else None,
                     owned_by=owned_by,
+                    schema=seq_schema,
                 ))
         return results
 
@@ -864,53 +872,76 @@ class PostgresTargetConnector(TargetConnector):
         validate_identifier(schema.name, "table")
         table_schema = schema.schema_name or "public"
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_name = %s AND table_schema = %s",
-                (schema.name, table_schema),
-            )
-            if cur.fetchone() is not None:
-                return
+            try:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_name = %s AND table_schema = %s",
+                    (schema.name, table_schema),
+                )
+                if cur.fetchone() is not None:
+                    return
 
-            col_defs = []
-            for col in schema.columns:
-                col_type = col.target_type or col.source_type
-                if col.generated:
-                    # GENERATED ALWAYS AS (expr) STORED — do NOT include NULL/DEFAULT
-                    col_defs.append(
-                        f"{col.name} {col_type} GENERATED ALWAYS AS ({col.generated}) STORED"
-                    )
+                col_defs = []
+                for col in schema.columns:
+                    col_type = col.target_type or col.source_type
+                    if col.generated:
+                        # GENERATED ALWAYS AS (expr) STORED — do NOT include NULL/DEFAULT
+                        col_defs.append(
+                            f"{col.name} {col_type} GENERATED ALWAYS AS ({col.generated}) STORED"
+                        )
+                    else:
+                        null_str = "NULL" if col.nullable else "NOT NULL"
+                        default_str = f" DEFAULT {col.default}" if col.default else ""
+                        col_defs.append(f"{col.name} {col_type}{default_str} {null_str}")
+
+                if schema.primary_key:
+                    pk_cols = ", ".join(schema.primary_key)
+                    col_defs.append(f"PRIMARY KEY ({pk_cols})")
+
+                if table_schema == "public":
+                    ddl = f"CREATE TABLE {schema.name} ({', '.join(col_defs)})"
                 else:
-                    null_str = "NULL" if col.nullable else "NOT NULL"
-                    default_str = f" DEFAULT {col.default}" if col.default else ""
-                    col_defs.append(f"{col.name} {col_type}{default_str} {null_str}")
-
-            if schema.primary_key:
-                pk_cols = ", ".join(schema.primary_key)
-                col_defs.append(f"PRIMARY KEY ({pk_cols})")
-
-            if table_schema == "public":
-                ddl = f"CREATE TABLE {schema.name} ({', '.join(col_defs)})"
-            else:
-                ddl = f"CREATE TABLE {quote_identifier(table_schema)}.{quote_identifier(schema.name)} ({', '.join(col_defs)})"
-            if schema.partition_key:
-                ddl += f" PARTITION BY {schema.partition_key}"
-            cur.execute(ddl)
-            self._conn.commit()
-            audit_log(phase="create_table", status="created", details={"table": schema.name})
+                    ddl = f"CREATE TABLE {quote_identifier(table_schema)}.{quote_identifier(schema.name)} ({', '.join(col_defs)})"
+                if schema.partition_key:
+                    ddl += f" PARTITION BY {schema.partition_key}"
+                cur.execute(ddl)
+                self._conn.commit()
+                audit_log(phase="create_table", status="created", details={"table": schema.name})
+            except Exception:
+                # Always roll back so a single bad DDL does not poison the
+                # connection for subsequent tables / phases.
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
 
     # ------------------------------------------------------------------
     # Phase 3.5 — Sequences (create before tables that reference them)
     # ------------------------------------------------------------------
 
     def create_sequence(self, seq: "SequenceDef") -> None:
-        """Create a sequence with the exact same properties as on the source."""
+        """Create a sequence with the exact same properties as on the source.
+
+        Phase 3.5 runs BEFORE tables are created (Phase 4), so we
+        intentionally do NOT apply ``ALTER SEQUENCE ... OWNED BY`` here:
+        PostgreSQL rejects ``OWNED BY`` when the referenced table does
+        not yet exist, and the orchestrator would otherwise see every
+        sequence creation fail and lose them.  Ownership is reattached
+        later by ``apply_constraints`` / ``advance_sequence`` once the
+        owning table exists.
+        """
         from core.connectors.base import SequenceDef  # noqa: F401
+        seq_schema = seq.schema or "public"
+        seq_qname = (
+            seq.name if seq_schema == "public"
+            else f"{quote_identifier(seq_schema)}.{quote_identifier(seq.name)}"
+        )
         with self._conn.cursor() as cur:
             try:
                 cycle_clause = "CYCLE" if seq.cycle else "NO CYCLE"
                 cur.execute(
-                    f"CREATE SEQUENCE IF NOT EXISTS {seq.name} "
+                    f"CREATE SEQUENCE IF NOT EXISTS {seq_qname} "
                     f"START WITH {seq.start_value} "
                     f"INCREMENT BY {seq.increment} "
                     f"MINVALUE {seq.min_value} "
@@ -919,27 +950,36 @@ class PostgresTargetConnector(TargetConnector):
                 )
                 self._conn.commit()
                 audit_log(phase="create_sequence", status="created",
-                          details={"sequence": seq.name, "owned_by": seq.owned_by})
+                          details={"sequence": seq_qname, "owned_by": seq.owned_by})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_sequence", status="skipped",
-                          details={"sequence": seq.name, "reason": str(exc)})
+                          details={"sequence": seq_qname, "reason": str(exc)})
 
-    def advance_sequence(self, seq_name: str, table: str, column: str) -> None:
+    def advance_sequence(self, seq_name: str, table: str, column: str, owned_by: str | None = None) -> None:
         """After data load: advance sequence to max(column) so next INSERT gets the right value.
 
         Fix #5: sequence name is passed via a %s placeholder (psycopg casts it
         to regclass automatically), which safely handles quoted names like
         'public."Order-id_seq"' without raw f-string injection.
+
+        Fix #9: For non-public schemas, the table may be in a different schema
+        than the sequence. Extract the schema from owned_by (schema.table.column)
+        to qualify the table reference in the MAX() query.
         """
-        validate_identifier(table, "table")
         validate_identifier(column, "column")
+        table_qname = table
+        if owned_by:
+            parts = owned_by.rsplit(".", 2)
+            if len(parts) == 3:
+                table_schema, table_name_from_owned, _ = parts
+                if table_name_from_owned == table:
+                    table_qname = f"{quote_identifier(table_schema)}.{quote_identifier(table)}"
         with self._conn.cursor() as cur:
             try:
-                # Use %s so psycopg quotes/escapes seq_name correctly via regclass cast.
                 cur.execute(
                     f"SELECT setval(%s::regclass, "
-                    f"COALESCE((SELECT MAX({column}) FROM {table}), 0) + 1, false)",
+                    f"COALESCE((SELECT MAX({column}) FROM {table_qname}), 0) + 1, false)",
                     (seq_name,),
                 )
                 self._conn.commit()
@@ -1012,12 +1052,16 @@ class PostgresTargetConnector(TargetConnector):
         else:
             conflict_clause = "ON CONFLICT DO NOTHING"
 
+        table_name = (
+            object_name if not schema or not schema.schema_name or schema.schema_name == "public"
+            else f"{quote_identifier(schema.schema_name)}.{quote_identifier(object_name)}"
+        )
         sql = (
-            f"INSERT INTO {object_name} ({col_names}) "
+            f"INSERT INTO {table_name} ({col_names}) "
             f"VALUES ({placeholders}) "
             f"{conflict_clause} SET {update_set}"
             if pk_cols else
-            f"INSERT INTO {object_name} ({col_names}) "
+            f"INSERT INTO {table_name} ({col_names}) "
             f"VALUES ({placeholders}) "
             f"{conflict_clause}"
         )
@@ -1046,6 +1090,10 @@ class PostgresTargetConnector(TargetConnector):
 
     def apply_constraints(self, schema: Schema) -> None:
         validate_identifier(schema.name, "table")
+        table_qname = (
+            schema.name if not schema.schema_name or schema.schema_name == "public"
+            else f"{quote_identifier(schema.schema_name)}.{quote_identifier(schema.name)}"
+        )
         with self._conn.cursor() as cur:
             # Indexes (use full DDL from pg_get_indexdef if available)
             for idx in schema.indexes:
@@ -1060,7 +1108,7 @@ class PostgresTargetConnector(TargetConnector):
                         col_list = ", ".join(idx.columns)
                         cur.execute(
                             f"CREATE {idx_type} IF NOT EXISTS {idx.name} "
-                            f"ON {schema.name} ({col_list})"
+                            f"ON {table_qname} ({col_list})"
                         )
                     self._conn.commit()
                     audit_log(phase="create_index", status="created",
@@ -1074,7 +1122,7 @@ class PostgresTargetConnector(TargetConnector):
             for chk in schema.check_constraints:
                 try:
                     cur.execute(
-                        f"ALTER TABLE {schema.name} "
+                        f"ALTER TABLE {table_qname} "
                         f"ADD CONSTRAINT {chk.name} CHECK ({chk.expression})"
                     )
                     self._conn.commit()
@@ -1091,7 +1139,7 @@ class PostgresTargetConnector(TargetConnector):
                 ref_col_list = ", ".join(fk.ref_columns)
                 try:
                     cur.execute(
-                        f"ALTER TABLE {schema.name} "
+                        f"ALTER TABLE {table_qname} "
                         f"ADD CONSTRAINT {fk.name} "
                         f"FOREIGN KEY ({col_list}) "
                         f"REFERENCES {fk.ref_table} ({ref_col_list}) "
@@ -1292,10 +1340,11 @@ class PostgresTargetConnector(TargetConnector):
     # Misc
     # ------------------------------------------------------------------
 
-    def get_object_count(self, object_name: str) -> int:
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
         validate_identifier(object_name, "table")
+        table_name = f"{schema_name}.{object_name}" if schema_name else object_name
         with self._conn.cursor() as cur:
-            cur.execute(f"SELECT count(*) FROM {object_name}")
+            cur.execute(f"SELECT count(*) FROM {table_name}")
             return cur.fetchone()[0]
 
     def delete(self, object_name: str, document: dict[str, Any], schema: Schema | None = None) -> None:
@@ -1311,10 +1360,11 @@ class PostgresTargetConnector(TargetConnector):
             self._conn.commit()
             audit_log(phase="cdc_delete", status="deleted", details={"table": object_name})
 
-    def export_full(self, object_name: str) -> Iterator[dict[str, Any]]:
+    def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict[str, Any]]:
         validate_identifier(object_name, "table")
+        table_name = f"{schema_name}.{object_name}" if schema_name else object_name
         with self._conn.cursor(name=f"export_target_{object_name}") as cur:
-            cur.execute(f"SELECT * FROM {object_name}")
+            cur.execute(f"SELECT * FROM {table_name}")
             columns = [desc.name for desc in cur.description]
             for row in cur:
                 yield dict(zip(columns, row))

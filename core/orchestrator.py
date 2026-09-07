@@ -62,11 +62,12 @@ class MigrationOrchestrator:
         if self._status is not None:
             self._status.update_status(phase, progress, errors)
 
-    def _estimate_total_rows(self, objects: list[str]) -> int:
+    def _estimate_total_rows(self, objects: list[str], schema_map: dict[str, str | None] | None = None) -> int:
         total = 0
         for obj_name in objects:
             try:
-                total += self._source.get_object_count(obj_name)
+                schema_name = schema_map.get(obj_name) if schema_map else None
+                total += self._source.get_object_count(obj_name, schema_name=schema_name)
             except Exception:
                 pass
         return total
@@ -245,14 +246,15 @@ class MigrationOrchestrator:
             self._update_status("create_partitions", 17, all_errors)
 
             # ---------- Phase 5: Migrate Data ----------
-            total_rows = self._estimate_total_rows(objects)
+            schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
+            total_rows = self._estimate_total_rows(objects, schema_map)
             processed_rows = 0
             for idx, (obj_name, schema) in enumerate(all_schemas.items(), start=1):
                 upsert_result = UpsertResult()
                 count: int | None = None
                 try:
-                    count = self._source.get_object_count(obj_name)
-                    rows = self._source.export_full(obj_name)
+                    count = self._source.get_object_count(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
+                    rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
                     for chunk in self._chunked(rows, self._batch_size):
                         chunk_result = self._target.upsert_batch(obj_name, iter(chunk), schema)
                         upsert_result.success_count += chunk_result.success_count
@@ -331,17 +333,24 @@ class MigrationOrchestrator:
                 all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
                 for seq in all_sequences:
                     if seq.owned_by:
-                        # owned_by is "table.column"
-                        parts = seq.owned_by.split(".", 1)
-                        if len(parts) == 2:
-                            tbl, col = parts
-                            if tbl not in seq_advance_results:
-                                seq_advance_results[tbl] = []
-                            try:
-                                self._target.advance_sequence(seq.name, tbl, col)
-                                seq_advance_results[tbl].append(f"{seq.name}: advanced")
-                            except Exception as exc:
-                                seq_advance_results[tbl].append(f"{seq.name}: skipped ({exc})")
+                        # owned_by may be either "table.column" (legacy) or
+                        # "schema.table.column" (now produced by the source
+                        # connector for non-public schemas).
+                        parts = seq.owned_by.rsplit(".", 2)
+                        if len(parts) == 3:
+                            seq_schema, tbl, col = parts
+                        elif len(parts) == 2:
+                            seq_schema, tbl, col = "public", parts[0], parts[1]
+                        else:
+                            continue
+                        if tbl not in seq_advance_results:
+                            seq_advance_results[tbl] = []
+                        seq_qname = seq.name if seq_schema == "public" else f"{seq_schema}.{seq.name}"
+                        try:
+                            self._target.advance_sequence(seq_qname, tbl, col, seq.owned_by)
+                            seq_advance_results[tbl].append(f"{seq_qname}: advanced")
+                        except Exception as exc:
+                            seq_advance_results[tbl].append(f"{seq_qname}: skipped ({exc})")
             except Exception as exc:
                 seq_advance_results["_error"] = [str(exc)]
             result["phases"]["advance_sequences"] = seq_advance_results
@@ -439,7 +448,7 @@ class MigrationOrchestrator:
             validation_objects = [
                 obj_name for obj_name in all_schemas if obj_name not in failed_objects
             ]
-            validation = self.validate(validation_objects)
+            validation = self.validate(validation_objects, schema_map=schema_map)
             result["phases"]["validation"] = validation
             if failed_objects:
                 result["status"] = "partial_success" if validation_objects else "failed"
@@ -799,12 +808,13 @@ class MigrationOrchestrator:
             self._update_status("create_partitions", 16, all_errors)
 
             # ---- Phase 5: Initial Data Sync ----
-            total_rows = self._estimate_total_rows(objects)
+            schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
+            total_rows = self._estimate_total_rows(objects, schema_map)
             processed_rows = 0
             for idx, obj_name in enumerate(objects, start=1):
                 schema = all_schemas[obj_name]
-                count = self._source.get_object_count(obj_name)
-                rows = self._source.export_full(obj_name)
+                count = self._source.get_object_count(obj_name, schema.schema_name if hasattr(schema, "schema_name") else None)
+                rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
                 upsert_result = UpsertResult()
                 for chunk in self._chunked(rows, self._batch_size):
                     chunk_result = self._target.upsert_batch(obj_name, iter(chunk), schema)
@@ -1034,7 +1044,7 @@ class MigrationOrchestrator:
         )
         return report
 
-    def validate(self, objects: list[str] | None = None) -> dict[str, Any]:
+    def validate(self, objects: list[str] | None = None, schema_map: dict[str, str | None] | None = None) -> dict[str, Any]:
         validator = Validator(self._source, self._target)
         validation_mode = self._config.get("validation", {}).get("mode", "count")
         source_objects = objects if objects is not None else self._source.list_objects()
@@ -1046,7 +1056,8 @@ class MigrationOrchestrator:
 
         all_passed = True
         for obj_name in source_objects:
-            check = validator.validate(obj_name, mode=validation_mode)
+            schema_name = schema_map.get(obj_name) if schema_map else None
+            check = validator.validate(obj_name, mode=validation_mode, schema_name=schema_name)
             results["checks"][obj_name] = check
             if not check.get("match", False):
                 all_passed = False

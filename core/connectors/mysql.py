@@ -60,13 +60,13 @@ class MySQLSourceConnector(SourceConnector):
             validate_identifier(t, "table")
         return tables
 
-    def get_object_count(self, object_name: str) -> int:
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
         validate_identifier(object_name, "table")
         with self._conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM {object_name}")
             return cur.fetchone()[0]
 
-    def export_full(self, object_name: str) -> Iterator[dict[str, Any]]:
+    def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict[str, Any]]:
         validate_identifier(object_name, "table")
         with self._conn.cursor(dictionary=True) as cur:
             cur.execute(f"SELECT * FROM {object_name}")
@@ -225,7 +225,7 @@ class MySQLTargetConnector(TargetConnector):
 
         return result
 
-    def get_object_count(self, object_name: str) -> int:
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
         validate_identifier(object_name, "table")
         with self._conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM {object_name}")
@@ -247,7 +247,7 @@ class MySQLTargetConnector(TargetConnector):
             self._conn.commit()
             audit_log(phase="cdc_delete", status="deleted", details={"table": object_name})
 
-    def export_full(self, object_name: str) -> Iterator[dict[str, Any]]:
+    def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict[str, Any]]:
         validate_identifier(object_name, "table")
         with self._conn.cursor(dictionary=True) as cur:
             cur.execute(f"SELECT * FROM {object_name}")

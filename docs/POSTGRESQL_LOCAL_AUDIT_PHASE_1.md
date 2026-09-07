@@ -369,80 +369,237 @@ PostgreSQL 17.4 local full migration executes successfully
 ## 12. Current Audit Status
 
   -----------------------------------------------------------------------
-  Area                    Status                  Finding
-  ----------------------- ----------------------- -----------------------
-  Combined unit tests     PASS                    54/54
+  Area                              Status                  Finding
+  --------------------------------  -----------------------  -----------------------
+  Combined unit tests               PASS                     60/60
 
-  PostgreSQL local        PASS                    Source/target reachable
+  PostgreSQL local                  PASS                     Source/target reachable
   connection
 
-  PostgreSQL FULL         PASS                    Migration completes
+  PostgreSQL FULL                   PASS                     Migration completes
   migration
 
-  Public table migration  PASS                    3 tables / 10 rows
+  Public table migration            PASS                     3 tables / 10 rows
 
-  Basic validation        PARTIAL                 Stale deleted customer
-                                                  remains
+  Non-public schema migration       PASS                     5 tables / 13 rows
+                                                        (0 failed, 100%)
 
-  HTML report             PASS                    Generated
+  Schema-qualified sequences        PASS                     Verified via SQL
+  discovery/creation/advance
 
-  JSON report             PASS                    Generated
+  DDL transaction rollback          PASS                     Connection isolated
+                                                        after DDL failure
 
-  Audit log               PASS                    Generated
+  Schema-qualified data loading     PASS                     public + audit_test
 
-  Repeat FULL migration   PASS                    Current source rows
-                                                  migrate
+  Schema-qualified validation       PASS                     count + checksum + full
 
-  Source DELETE           GAP                     Stale target row
-  synchronization in FULL                         remains
+  Explicit include_schemas          PASS                     Config-driven
+                                                        discovery
+
+  Basic validation                  PARTIAL                  Stale deleted customer
+                                                              remains
+
+  HTML report                       PASS                     Generated
+
+  JSON report                       PASS                     Generated
+
+  Audit log                         PASS                     Generated
+
+  Repeat FULL migration             PASS                     Current source rows
+                                                        migrate
+
+  Source DELETE                     GAP                      Stale target row
+  synchronization in FULL                                         remains
   mode
 
-  Non-public schema       PASS                    `audit_test` created
-  creation
+  Views                             PENDING                  Not yet implemented
 
-  Non-public schema table GAP                     0 tables migrated
-  migration
+  Materialized views                PENDING                  Not yet implemented
 
-  Advanced objects in     PENDING                 Discovery/processing
-  `audit_test`                                    issue must be
-                                                  investigated first
+  Functions / procedures            PENDING                  Not yet implemented
 
-  CDC prerequisite        BLOCKED                 `wal_level=logical` not
-                                                  active
+  Triggers                          PENDING                  Not yet implemented
 
-  CDC incremental         PENDING                 Not yet tested
+  Indexes                           PENDING                  Not yet implemented
 
-  CDC continuous          PENDING                 Not yet tested
+  Constraints                       PENDING                  Not yet implemented
 
-  MSSQL integration       BLOCKED                 ODBC Driver 18
-                                                  unavailable
+  Row-level security (RLS)          PENDING                  Not yet implemented
+
+  RLS policies                      PENDING                  Not yet implemented
+
+  Comments                          PENDING                  Not yet implemented
+
+  Grants                            PENDING                  Not yet implemented
+
+  Sequence ownership                PENDING                  Not yet implemented
+  (OWNED BY after tables)
+
+  Cross-schema references           PENDING                  Not yet implemented
+
+  CDC prerequisite                  BLOCKED                  `wal_level=logical` not
+                                                        active
+
+  CDC incremental                   PENDING                  Not yet tested
+
+  CDC continuous                    PENDING                  Not yet tested
+
+  MSSQL integration                 BLOCKED                  ODBC Driver 18
+                                                        unavailable
   -----------------------------------------------------------------------
 
 ------------------------------------------------------------------------
 
-## 13. Next Phase
+## 14. Completed Non-Public Schema Migration Milestone
+
+This section documents the completed non-public schema migration milestone
+on the `feature/postgresql-objects` branch.
+
+### 14.1 Scope Decision
+
+The implementation uses **explicit `include_schemas` configuration** rather
+than automatic `_effective_schemas()` discovery.
+
+- Automatic `_effective_schemas()` discovery is **NOT** part of the final
+  implementation.
+- Explicit `include_schemas` is the supported mechanism.
+- When `include_schemas` is absent, the default behavior remains
+  **public-only** to preserve backward compatibility.
+
+### 14.2 What Was Completed
+
+The following areas were implemented, tested, and verified with the real
+PostgreSQL CLI:
+
+1. **Non-public schema support**
+   - Source discovery enumerates tables across all configured schemas.
+   - Target creation places tables, sequences, and constraints in the
+     correct schema.
+
+2. **Explicit `include_schemas` configuration flow**
+   - Configuration key `migration.include_schemas` controls which schemas
+     are migrated.
+   - The source connector re-reads this value on each operation so
+     orchestrator mutations take effect immediately.
+
+3. **Schema-qualified sequence discovery/creation/advance**
+   - `list_all_sequences` captures `s.schemaname` and populates
+     `SequenceDef.schema`.
+   - `owned_by` is schema-qualified (`schema.table.column`).
+   - `create_sequence` emits schema-qualified DDL for non-public schemas.
+   - `advance_sequence` accepts the schema-qualified sequence name and
+     resolves the owning table schema from `owned_by`.
+   - `OWNED BY` is intentionally deferred until after the owning table
+     exists.
+
+4. **DDL transaction rollback / error isolation**
+   - `create_object_if_missing` wraps DDL execution in a try/except block
+     that calls `rollback()` on failure, preventing a single bad DDL from
+     poisoning the connection for subsequent operations.
+
+5. **Schema-qualified data loading**
+   - `export_full` and `get_object_count` accept `schema_name` and
+     construct fully qualified table references.
+   - `upsert_batch` and constraint/index DDL use the correct schema.
+
+6. **Schema-qualified validation**
+   - `Validator.validate_*` methods propagate `schema_name` through
+     count, checksum, and full-row comparison paths.
+   - Both source and target connectors receive the schema name.
+
+7. **Real PostgreSQL CLI verification**
+   - The migration was executed against a live PostgreSQL 17.4 instance
+     using the real PostgreSQL CLI (`psql`).
+   - Target objects were verified with SQL queries.
+
+### 14.3 Migration Evidence
+
+Run ID: `f1bcea8f03a34efd99eb5c8294459cc1`
+
+``` text
+Mode: FULL
+Tables migrated: 5
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+Source and target row counts:
+
+``` text
+public.customers        = 3
+public.orders           = 4
+public.products         = 3
+audit_test.test_customers = 2
+audit_test.test_orders    = 1
+```
+
+Verified target objects:
+
+``` text
+audit_test.test_sequence           EXISTS
+audit_test.test_orders_order_id_seq EXISTS
+```
+
+Real CLI migration: **SUCCEEDED**
+SQL verification: **SUCCEEDED**
+
+### 14.4 Unit Test Results
+
+``` text
+60 passed, 0 failed
+```
+
+Key regression tests added:
+
+- `TestNonPublicSchemaDDLQualification`
+- `TestPostgresSequenceSchemaQualification`
+- `TestPostgresCreateObjectTransactionIsolation`
+- `TestPostgresDiscoverySchemaFilter.test_orchestrator_style_mutation_reaches_discovery`
+
+### 14.5 Remaining PostgreSQL Object Limitations
+
+The following areas are **NOT** part of this milestone and remain
+pending for a subsequent phase:
+
+- Views
+- Materialized views
+- Functions / procedures
+- Triggers
+- Indexes (beyond basic primary-key and user-created index migration)
+- Constraints (foreign key, unique, check, defaults)
+- Row-level security (RLS)
+- RLS policies
+- Comments
+- Grants
+- Cross-schema object references/dependencies
+- Sequence ownership (`OWNED BY`) after tables exist (phase 3.5 deferred to later)
+- CDC (incremental/continuous) — blocked by `wal_level=logical` prerequisite
+
+These items should be tracked separately so they are not confused with
+the completed schema-qualification milestone.
+
+-----------------------------------------------------------------------
+
+## 15. Next Phase
 
 Do not treat this document as a final production-readiness report.
 
 This is the **local audit baseline** for continuing development.
 
-Next phase should investigate the non-public-schema discovery/processing
-path and then verify:
+The non-public schema migration milestone is **COMPLETE**:
+- 5 tables / 13 rows migrated
+- 0 failures
+- 100% success
+- Schema-qualified sequences verified
+- DDL rollback verified
+- 60 unit tests passing
 
-1.  `audit_test.test_customers` migration
-2.  `audit_test.test_orders` migration
-3.  Row counts/data correctness
-4.  View migration
-5.  Materialized view migration
-6.  Function/procedure migration
-7.  Trigger migration
-8.  Constraints/indexes
-9.  RLS/policies
-10. Sequence handling
-11. Schema-qualified data loading
-12. Failure/recovery behavior
-13. Validation behavior
-14. CDC once PostgreSQL logical WAL is available
+Next phase should focus on the remaining PostgreSQL object categories
+listed in Section 14.5, starting with the first category that has the
+smallest dependency surface and the clearest end-to-end verification path.
 
 The next phase should start from this same combined code baseline so
 both developers can continue on the same implementation and use this

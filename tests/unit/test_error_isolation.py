@@ -17,9 +17,9 @@ def _orchestrator(stop_on_error: bool = False):
     schemas = {name: _schema(name) for name in objects}
 
     source.list_objects.return_value = objects
-    source.get_schema.side_effect = lambda name: schemas[name]
+    source.get_schema.side_effect = lambda name, **kw: schemas[name]
     source.get_object_count.return_value = 1
-    source.export_full.side_effect = lambda name: iter([{"id": 1}])
+    source.export_full.side_effect = lambda name, **kw: iter([{"id": 1}])
     target.get_object_count.return_value = 1
     target.upsert_batch.return_value = UpsertResult(success_count=1)
 

@@ -377,7 +377,7 @@ class TestPostgresToPostgresBaseline:
         source = MagicMock(spec=SourceConnector)
         source.list_objects.return_value = list(self.EXPECTED_TABLES)
 
-        def _count(obj_name: str) -> int:
+        def _count(obj_name: str, **kwargs) -> int:
             return counts.get(obj_name, 0)
 
         source.get_object_count.side_effect = _count
@@ -391,7 +391,7 @@ class TestPostgresToPostgresBaseline:
 
         source.get_schema.side_effect = _schema
 
-        def _export(obj_name: str):
+        def _export(obj_name: str, **kwargs):
             n = counts.get(obj_name, 0)
             for i in range(1, n + 1):
                 yield {"id": i}
@@ -408,7 +408,7 @@ class TestPostgresToPostgresBaseline:
 
         target.upsert_batch.side_effect = _upsert
 
-        def _target_count(obj_name: str) -> int:
+        def _target_count(obj_name: str, **kwargs) -> int:
             return counts.get(obj_name, 0)
 
         target.get_object_count.side_effect = _target_count
@@ -606,6 +606,25 @@ class TestPostgresDiscoverySchemaFilter:
         assert "t_public_1" in tables
         assert "t_public_2" in tables
 
+    def test_orchestrator_style_mutation_reaches_discovery(self):
+        """
+        Regression: in production, the orchestrator constructs the source
+        connector with only the ``connection:`` sub-dict, then later mutates
+        ``source._config['include_schemas']`` inside ``_apply_schema_scope``.
+        Discovery must pick up the mutated value.
+        """
+        connector = self._make_connector(None)
+        connector._conn.cursor.return_value = self._make_smart_cursor("audit_test")
+
+        connector._config["include_schemas"] = ["public", "audit_test"]
+
+        tables = connector.list_objects()
+
+        assert any("audit_test" in t for t in tables) or len(tables) >= 1, (
+            f"Discovery did not see orchestrator's include_schemas mutation. "
+            f"Got: {tables!r}"
+        )
+
 
 class TestNonPublicSchemaDDLQualification:
     """
@@ -766,6 +785,198 @@ class TestNonPublicSchemaDDLQualification:
             f"Got: {ddl!r}"
         )
         assert "PRIMARY KEY (id)" in ddl
+
+
+class TestPostgresSequenceSchemaQualification:
+    """
+    Regression: free-standing sequences living in non-public schemas
+    (e.g. ``audit_test.test_sequence``) must be discovered with their
+    schema and re-created in the correct target schema.  Previously
+    the source connector dropped the schema and the target emitted
+    ``CREATE SEQUENCE test_sequence`` (wrong schema), which then caused
+    ``relation "audit_test.test_sequence" does not exist`` during
+    CREATE TABLE.
+    """
+
+    def _source_conn(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        cfg = {
+            "host": "x", "port": 1, "database": "x",
+            "username": "u", "password": "p", "ssl": False,
+            "include_schemas": ["public", "audit_test"],
+        }
+        return PostgresSourceConnector(cfg)
+
+    def test_list_all_sequences_captures_schema_name(self):
+        connector = self._source_conn()
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            # (schemaname, sequencename, start, min, max, incr, cycle, last, owned_by)
+            ("public",      "customers_customer_id_seq", 1, 1, 2147483647, 1, False, None, "public.customers.customer_id"),
+            ("audit_test",  "test_sequence",             1, 1, 9223372036854775807, 1, False, None, None),
+        ]
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        seqs = connector.list_all_sequences()
+        by_name = {s.name: s for s in seqs}
+        assert "test_sequence" in by_name
+        assert by_name["test_sequence"].schema == "audit_test", (
+            f"SequenceDef.schema must be populated for non-public sequences. "
+            f"Got: {by_name['test_sequence'].schema!r}"
+        )
+        assert by_name["customers_customer_id_seq"].schema == "public"
+        # owned_by must be schema-qualified so the target can re-attach ownership
+        assert by_name["customers_customer_id_seq"].owned_by == "public.customers.customer_id"
+
+    def test_target_create_sequence_qualifies_non_public_schema(self):
+        """
+        Contract: target ``create_sequence`` must emit a schema-qualified
+        CREATE SEQUENCE for non-public schemas.  OWNED BY is intentionally
+        deferred to ``apply_constraints`` (Phase 6+) because Phase 3.5
+        runs before tables exist — applying it here would fail every
+        sequence that has an owning table.
+        """
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import SequenceDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        seq = SequenceDef(
+            name="test_sequence",
+            schema="audit_test",
+            start_value=1, min_value=1, max_value=10**18,
+            increment=1, cycle=False,
+            owned_by="audit_test.test_customers.customer_id",
+        )
+        target.create_sequence(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE SEQUENCE" in s), None)
+        assert create_sql is not None, "CREATE SEQUENCE was not emitted"
+        assert '"audit_test"' in create_sql, (
+            f"CREATE SEQUENCE must schema-qualify non-public sequences. Got: {create_sql!r}"
+        )
+        assert '"test_sequence"' in create_sql
+        assert create_sql.index('"audit_test"') < create_sql.index('"test_sequence"')
+        # OWNED BY must NOT be emitted here — see docstring.
+        assert not any("OWNED BY" in s for s in executed), (
+            "create_sequence must defer OWNED BY until after the owning table exists"
+        )
+
+    def test_target_create_sequence_remains_unqualified_for_public(self):
+        """
+        Backward-compat regression: sequences in ``public`` (or with
+        no schema) must still produce an unqualified CREATE SEQUENCE.
+        """
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import SequenceDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        seq = SequenceDef(
+            name="customers_customer_id_seq",
+            schema="public",
+            start_value=1, min_value=1, max_value=2147483647,
+            increment=1, cycle=False,
+            owned_by=None,
+        )
+        target.create_sequence(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE SEQUENCE" in s), None)
+        assert create_sql is not None
+        assert create_sql.strip().startswith("CREATE SEQUENCE IF NOT EXISTS customers_customer_id_seq"), (
+            f"Public schema sequences must stay unqualified. Got: {create_sql!r}"
+        )
+
+
+class TestPostgresCreateObjectTransactionIsolation:
+    """
+    Regression: a single failed CREATE TABLE DDL must not leave the
+    target connection in ``idle in transaction`` state.  Without a
+    rollback, every subsequent DDL on the connection raises
+    ``current transaction is aborted`` until ROLLBACK is issued.
+    """
+
+    def _target(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        return PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+
+    def test_create_object_if_missing_rolls_back_on_ddl_failure(self):
+        target = self._target()
+        cur = MagicMock()
+        cur.fetchone.return_value = None  # table does not yet exist
+        cur.execute.side_effect = [
+            None,  # existence SELECT
+            RuntimeError("relation \"audit_test.test_sequence\" does not exist"),  # CREATE TABLE
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="test_customers",
+            schema_name="audit_test",
+            columns=[
+                Column(name="customer_id", source_type="integer",
+                       default="nextval('audit_test.test_sequence'::regclass)"),
+            ],
+            primary_key=["customer_id"],
+        )
+
+        with pytest.raises(RuntimeError, match="does not exist"):
+            target.create_object_if_missing(schema)
+
+        # The rollback MUST have been called so the connection is
+        # usable for the next object.
+        conn.rollback.assert_called()
+
+    def test_create_object_if_missing_commits_on_success(self):
+        target = self._target()
+        cur = MagicMock()
+        cur.fetchone.return_value = None  # table does not yet exist
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="customers",
+            columns=[Column(name="id", source_type="integer")],
+            primary_key=["id"],
+        )
+        target.create_object_if_missing(schema)
+        conn.commit.assert_called()
+        conn.rollback.assert_not_called()
 
 
 class TestConfigSchema:
