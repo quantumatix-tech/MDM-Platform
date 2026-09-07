@@ -26,6 +26,7 @@ from core.connectors.base import (
     ApplyResult,
     ChangeEvent,
     validate_identifier,
+    quote_identifier,
 )
 from core.driver_installer import ensure_driver
 from core.retry import retry_with_backoff
@@ -59,12 +60,66 @@ def _make_conn_kwargs(config: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Schema scope — STEP 3B
+# ---------------------------------------------------------------------------
+
+# Default schema scope: backward-compatible with every test/config/migration
+# that existed before the schema-scope feature. Callers that omit
+# include_schemas get exactly the old `public`-only behavior.
+DEFAULT_INCLUDE_SCHEMAS: tuple[str, ...] = ("public",)
+
+# PostgreSQL internal schemas that must NEVER be enumerated as user
+# metadata, regardless of what the operator puts in `include_schemas`.
+# Mirrors the existing exclusion list in list_schemas().
+_SYSTEM_SCHEMAS: frozenset[str] = frozenset({
+    "pg_catalog",
+    "information_schema",
+    "pg_toast",
+})
+
+
+def _resolve_include_schemas(config: dict[str, Any]) -> tuple[str, ...]:
+    """
+    Return the normalized, system-schema-free list of schemas that
+    metadata discovery should consult.
+
+    Precedence:
+      1. ``config["include_schemas"]`` — list of strings (the
+         orchestrator injects this from ``migration.include_schemas``).
+      2. ``DEFAULT_INCLUDE_SCHEMAS`` ("public") when absent.
+
+    Validation:
+      * Must be a non-empty list/tuple of non-empty strings.
+      * PostgreSQL internal schemas (``pg_catalog``, ``information_schema``,
+        ``pg_toast``, anything starting with ``pg_``) are filtered out
+        defensively so an explicit include cannot accidentally enumerate
+        system objects.
+    """
+    raw = config.get("include_schemas")
+    if raw is None:
+        return DEFAULT_INCLUDE_SCHEMAS
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return DEFAULT_INCLUDE_SCHEMAS
+    cleaned: list[str] = []
+    for s in raw:
+        if not isinstance(s, str) or not s:
+            continue
+        if s in _SYSTEM_SCHEMAS or s.startswith("pg_"):
+            continue
+        cleaned.append(s)
+    if not cleaned:
+        return DEFAULT_INCLUDE_SCHEMAS
+    return tuple(cleaned)
+
+
+# ---------------------------------------------------------------------------
 # Source Connector
 # ---------------------------------------------------------------------------
 
 class PostgresSourceConnector(SourceConnector):
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
+        self._include_schemas: tuple[str, ...] = _resolve_include_schemas(config)
         self._conn: Any = None
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
@@ -79,7 +134,7 @@ class PostgresSourceConnector(SourceConnector):
     # ------------------------------------------------------------------
 
     def list_objects(self) -> list[str]:
-        """List non-partition-child tables in the public schema."""
+        """List non-partition-child tables in the configured schemas."""
         validate_identifier(self._config.get("database", ""), "database")
         with self._conn.cursor() as cur:
             # Exclude partition child tables (relispartition=true) so only the
@@ -89,11 +144,12 @@ class PostgresSourceConnector(SourceConnector):
                 "FROM information_schema.tables t "
                 "LEFT JOIN pg_class c "
                 "  ON c.relname = t.table_name "
-                "  AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') "
-                "WHERE t.table_schema = 'public' "
+                "  AND c.relnamespace = ANY(SELECT oid FROM pg_namespace WHERE nspname = ANY(%s)) "
+                "WHERE t.table_schema = ANY(%s) "
                 "  AND t.table_type = 'BASE TABLE' "
                 "  AND (c.relispartition IS NULL OR c.relispartition = false) "
-                "ORDER BY t.table_name"
+                "ORDER BY t.table_name",
+                (list(self._include_schemas), list(self._include_schemas)),
             )
             tables = [row[0] for row in cur.fetchall()]
         for t in tables:
@@ -151,6 +207,16 @@ class PostgresSourceConnector(SourceConnector):
         sequences: list[str] = []
 
         with self._conn.cursor() as cur:
+            # --- Resolve actual source schema for this table ---
+            cur.execute(
+                "SELECT table_schema FROM information_schema.tables "
+                "WHERE table_name = %s AND table_schema = ANY(%s) "
+                "LIMIT 1",
+                (object_name, list(self._include_schemas)),
+            )
+            schema_row = cur.fetchone()
+            table_schema = schema_row[0] if schema_row else "public"
+
             # --- Columns (with defaults + GENERATED ALWAYS detection) ---
             # Join pg_attribute to detect GENERATED ALWAYS AS (expr) STORED columns
             # (attgenerated = 's').  Also read udt_name so ARRAY columns get their
@@ -167,13 +233,13 @@ class PostgresSourceConnector(SourceConnector):
                 "       ELSE NULL END AS generation_expr "
                 "FROM information_schema.columns c "
                 "JOIN pg_class pc ON pc.relname = c.table_name "
-                "  AND pc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') "
+                "  AND pc.relnamespace = ANY(SELECT oid FROM pg_namespace WHERE nspname = ANY(%s)) "
                 "JOIN pg_attribute a ON a.attrelid = pc.oid AND a.attname = c.column_name "
                 "  AND a.attnum > 0 AND NOT a.attisdropped "
                 "LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum "
-                "WHERE c.table_name = %s AND c.table_schema = 'public' "
+                "WHERE c.table_name = %s AND c.table_schema = ANY(%s) "
                 "ORDER BY c.ordinal_position",
-                (object_name,),
+                (list(self._include_schemas), object_name, list(self._include_schemas)),
             )
             for row in cur.fetchall():
                 col_name, data_type, nullable, max_len, col_default, gen_expr = row
@@ -271,8 +337,8 @@ class PostgresSourceConnector(SourceConnector):
             cur.execute(
                 "SELECT c.relrowsecurity FROM pg_class c "
                 "JOIN pg_namespace n ON c.relnamespace = n.oid "
-                "WHERE c.relname = %s AND n.nspname = 'public'",
-                (object_name,),
+                "WHERE c.relname = %s AND n.nspname = ANY(%s)",
+                (object_name, list(self._include_schemas)),
             )
             rls_row = cur.fetchone()
             rls_enabled = bool(rls_row[0]) if rls_row else False
@@ -282,14 +348,15 @@ class PostgresSourceConnector(SourceConnector):
                 "SELECT pg_get_partkeydef(c.oid) "
                 "FROM pg_class c "
                 "JOIN pg_namespace n ON c.relnamespace = n.oid "
-                "WHERE c.relname = %s AND n.nspname = 'public' AND c.relkind = 'p'",
-                (object_name,),
+                "WHERE c.relname = %s AND n.nspname = ANY(%s) AND c.relkind = 'p'",
+                (object_name, list(self._include_schemas)),
             )
             part_row = cur.fetchone()
             partition_key = part_row[0] if part_row else None
 
         return Schema(
             name=object_name,
+            schema_name=table_schema,
             columns=columns,
             primary_key=primary_key,
             indexes=indexes,
@@ -320,7 +387,7 @@ class PostgresSourceConnector(SourceConnector):
     # ------------------------------------------------------------------
 
     def list_all_sequences(self) -> list["SequenceDef"]:
-        """Return every sequence in the public schema with full metadata."""
+        """Return every sequence in the configured schemas with full metadata."""
         from core.connectors.base import SequenceDef
         results: list[SequenceDef] = []
         with self._conn.cursor() as cur:
@@ -337,12 +404,13 @@ class PostgresSourceConnector(SourceConnector):
                 "    JOIN pg_class pc ON pc.oid = d.refobjid "
                 "    JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
                 "    WHERE sc.relname = s.sequencename "
-                "      AND sc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public') "
+                "      AND sc.relnamespace = ANY(SELECT oid FROM pg_namespace WHERE nspname = ANY(%s)) "
                 "    LIMIT 1 "
                 "  ) AS owned_by "
                 "FROM pg_sequences s "
-                "WHERE s.schemaname = 'public' "
-                "ORDER BY s.sequencename"
+                "WHERE s.schemaname = ANY(%s) "
+                "ORDER BY s.sequencename",
+                (list(self._include_schemas), list(self._include_schemas)),
             )
             for row in cur.fetchall():
                 seq_name, start, min_v, max_v, incr, cycle, last_v, owned_by = row
@@ -363,7 +431,7 @@ class PostgresSourceConnector(SourceConnector):
     # ------------------------------------------------------------------
 
     def list_partitions(self) -> list["PartitionDef"]:
-        """Return every partition child in the public schema."""
+        """Return every partition child in the configured schemas."""
         from core.connectors.base import PartitionDef
         results: list[PartitionDef] = []
         with self._conn.cursor() as cur:
@@ -376,8 +444,9 @@ class PostgresSourceConnector(SourceConnector):
                 "JOIN pg_namespace n ON c.relnamespace = n.oid "
                 "JOIN pg_inherits i ON i.inhrelid = c.oid "
                 "JOIN pg_class parent ON i.inhparent = parent.oid "
-                "WHERE n.nspname = 'public' AND c.relispartition = true "
-                "ORDER BY parent.relname, c.relname"
+                "WHERE n.nspname = ANY(%s) AND c.relispartition = true "
+                "ORDER BY parent.relname, c.relname",
+                (list(self._include_schemas),)
             )
             for row in cur.fetchall():
                 part_name, parent_table, bound = row
@@ -409,6 +478,7 @@ class PostgresSourceConnector(SourceConnector):
     def list_types(self) -> list[TypeDef]:
         types: list[TypeDef] = []
         with self._conn.cursor() as cur:
+            schemas = list(self._include_schemas)
             # ENUMs
             cur.execute(
                 "SELECT t.typname, "
@@ -416,8 +486,9 @@ class PostgresSourceConnector(SourceConnector):
                 "FROM pg_type t "
                 "JOIN pg_enum e ON t.oid = e.enumtypid "
                 "JOIN pg_namespace n ON t.typnamespace = n.oid "
-                "WHERE n.nspname = 'public' "
-                "GROUP BY t.typname ORDER BY t.typname"
+                "WHERE n.nspname = ANY(%s) "
+                "GROUP BY t.typname ORDER BY t.typname",
+                (schemas,),
             )
             for row in cur.fetchall():
                 type_name, labels = row
@@ -436,8 +507,9 @@ class PostgresSourceConnector(SourceConnector):
                 "   FROM pg_constraint c WHERE c.contypid = t.oid) AS checks "
                 "FROM pg_type t "
                 "JOIN pg_namespace n ON t.typnamespace = n.oid "
-                "WHERE t.typtype = 'd' AND n.nspname = 'public' "
-                "ORDER BY t.typname"
+                "WHERE t.typtype = 'd' AND n.nspname = ANY(%s) "
+                "ORDER BY t.typname",
+                (schemas,),
             )
             for row in cur.fetchall():
                 type_name, base, dflt, notnull, checks = row
@@ -459,9 +531,10 @@ class PostgresSourceConnector(SourceConnector):
                 "JOIN pg_class c ON c.oid = t.typrelid "
                 "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 "
                 "JOIN pg_namespace n ON t.typnamespace = n.oid "
-                "WHERE t.typtype = 'c' AND n.nspname = 'public' "
+                "WHERE t.typtype = 'c' AND n.nspname = ANY(%s) "
                 "  AND c.relkind = 'c' "
-                "GROUP BY t.typname ORDER BY t.typname"
+                "GROUP BY t.typname ORDER BY t.typname",
+                (schemas,),
             )
             for row in cur.fetchall():
                 type_name, cols = row
@@ -479,8 +552,9 @@ class PostgresSourceConnector(SourceConnector):
             cur.execute(
                 "SELECT table_name, view_definition "
                 "FROM information_schema.views "
-                "WHERE table_schema = 'public' "
-                "ORDER BY table_name"
+                "WHERE table_schema = ANY(%s) "
+                "ORDER BY table_name",
+                (list(self._include_schemas),),
             )
             return [ViewDefinition(name=row[0], definition=row[1]) for row in cur.fetchall()]
 
@@ -493,8 +567,9 @@ class PostgresSourceConnector(SourceConnector):
             cur.execute(
                 "SELECT matviewname, pg_get_viewdef(matviewname::regclass) "
                 "FROM pg_matviews "
-                "WHERE schemaname = 'public' "
-                "ORDER BY matviewname"
+                "WHERE schemaname = ANY(%s) "
+                "ORDER BY matviewname",
+                (list(self._include_schemas),),
             )
             return [MaterializedViewDef(name=row[0], definition=row[1]) for row in cur.fetchall()]
 
@@ -512,9 +587,10 @@ class PostgresSourceConnector(SourceConnector):
                     "SELECT p.proname, pg_get_functiondef(p.oid) "
                     "FROM pg_proc p "
                     "JOIN pg_namespace n ON p.pronamespace = n.oid "
-                    "WHERE n.nspname = 'public' "
+                    "WHERE n.nspname = ANY(%s) "
                     "  AND p.prokind IN ('f', 'p') "
-                    "ORDER BY p.proname"
+                    "ORDER BY p.proname",
+                    (list(self._include_schemas),),
                 )
                 for row in cur.fetchall():
                     func_name, ddl = row
@@ -537,8 +613,9 @@ class PostgresSourceConnector(SourceConnector):
                     "FROM pg_trigger t "
                     "JOIN pg_class c ON t.tgrelid = c.oid "
                     "JOIN pg_namespace n ON c.relnamespace = n.oid "
-                    "WHERE n.nspname = 'public' AND NOT t.tgisinternal "
-                    "ORDER BY c.relname, t.tgname"
+                    "WHERE n.nspname = ANY(%s) AND NOT t.tgisinternal "
+                    "ORDER BY c.relname, t.tgname",
+                    (list(self._include_schemas),),
                 )
                 for row in cur.fetchall():
                     trig_name, table_name, ddl = row
@@ -567,8 +644,8 @@ class PostgresSourceConnector(SourceConnector):
                 "FROM pg_policy pol "
                 "JOIN pg_class c ON c.oid = pol.polrelid "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = 'public' AND c.relname = %s",
-                (table,),
+                "WHERE n.nspname = ANY(%s) AND c.relname = %s",
+                (list(self._include_schemas), table),
             )
             for row in cur.fetchall():
                 pol_name, cmd, permissive, using_expr, check_expr = row
@@ -587,6 +664,7 @@ class PostgresSourceConnector(SourceConnector):
     def list_comments(self) -> list[CommentDef]:
         comments: list[CommentDef] = []
         with self._conn.cursor() as cur:
+            schemas = list(self._include_schemas)
             # Table / view / matview comments
             cur.execute(
                 "SELECT CASE c.relkind "
@@ -596,9 +674,10 @@ class PostgresSourceConnector(SourceConnector):
                 "FROM pg_description d "
                 "JOIN pg_class c ON d.objoid = c.oid "
                 "JOIN pg_namespace n ON c.relnamespace = n.oid "
-                "WHERE n.nspname = 'public' AND d.objsubid = 0 "
+                "WHERE n.nspname = ANY(%s) AND d.objsubid = 0 "
                 "  AND c.relkind IN ('r', 'v', 'm') "
-                "ORDER BY c.relname"
+                "ORDER BY c.relname",
+                (schemas,),
             )
             for row in cur.fetchall():
                 obj_type, obj_name, comment = row
@@ -611,8 +690,9 @@ class PostgresSourceConnector(SourceConnector):
                 "JOIN pg_attribute a ON d.objoid = a.attrelid AND d.objsubid = a.attnum "
                 "JOIN pg_class c ON a.attrelid = c.oid "
                 "JOIN pg_namespace n ON c.relnamespace = n.oid "
-                "WHERE n.nspname = 'public' AND a.attnum > 0 "
-                "ORDER BY c.relname, a.attnum"
+                "WHERE n.nspname = ANY(%s) AND a.attnum > 0 "
+                "ORDER BY c.relname, a.attnum",
+                (schemas,),
             )
             for row in cur.fetchall():
                 table_name, col_name, comment = row
@@ -629,8 +709,9 @@ class PostgresSourceConnector(SourceConnector):
                 "FROM pg_description d "
                 "JOIN pg_proc p ON d.objoid = p.oid "
                 "JOIN pg_namespace n ON p.pronamespace = n.oid "
-                "WHERE n.nspname = 'public' "
-                "ORDER BY p.proname"
+                "WHERE n.nspname = ANY(%s) "
+                "ORDER BY p.proname",
+                (schemas,),
             )
             for row in cur.fetchall():
                 func_sig, comment = row
@@ -645,16 +726,18 @@ class PostgresSourceConnector(SourceConnector):
     def list_grants(self) -> list[GrantDef]:
         grants: list[GrantDef] = []
         with self._conn.cursor() as cur:
+            schemas = list(self._include_schemas)
             # Table grants
             cur.execute(
                 "SELECT grantee, table_name, "
                 "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
                 "FROM information_schema.role_table_grants "
-                "WHERE table_schema = 'public' "
+                "WHERE table_schema = ANY(%s) "
                 "  AND grantee NOT IN ('PUBLIC') "
                 "  AND grantor != grantee "
                 "GROUP BY grantee, table_name "
-                "ORDER BY table_name, grantee"
+                "ORDER BY table_name, grantee",
+                (schemas,),
             )
             for row in cur.fetchall():
                 grantee, table_name, privs = row
@@ -668,11 +751,12 @@ class PostgresSourceConnector(SourceConnector):
                 "SELECT grantee, object_name, "
                 "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
                 "FROM information_schema.role_usage_grants "
-                "WHERE object_schema = 'public' "
+                "WHERE object_schema = ANY(%s) "
                 "  AND object_type = 'SEQUENCE' "
                 "  AND grantee NOT IN ('PUBLIC') "
                 "GROUP BY grantee, object_name "
-                "ORDER BY object_name, grantee"
+                "ORDER BY object_name, grantee",
+                (schemas,),
             )
             for row in cur.fetchall():
                 grantee, seq_name, privs = row
@@ -778,11 +862,12 @@ class PostgresTargetConnector(TargetConnector):
 
     def create_object_if_missing(self, schema: Schema) -> None:
         validate_identifier(schema.name, "table")
+        table_schema = schema.schema_name or "public"
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM information_schema.tables "
-                "WHERE table_name = %s AND table_schema = 'public'",
-                (schema.name,),
+                "WHERE table_name = %s AND table_schema = %s",
+                (schema.name, table_schema),
             )
             if cur.fetchone() is not None:
                 return
@@ -804,7 +889,10 @@ class PostgresTargetConnector(TargetConnector):
                 pk_cols = ", ".join(schema.primary_key)
                 col_defs.append(f"PRIMARY KEY ({pk_cols})")
 
-            ddl = f"CREATE TABLE {schema.name} ({', '.join(col_defs)})"
+            if table_schema == "public":
+                ddl = f"CREATE TABLE {schema.name} ({', '.join(col_defs)})"
+            else:
+                ddl = f"CREATE TABLE {quote_identifier(table_schema)}.{quote_identifier(schema.name)} ({', '.join(col_defs)})"
             if schema.partition_key:
                 ddl += f" PARTITION BY {schema.partition_key}"
             cur.execute(ddl)

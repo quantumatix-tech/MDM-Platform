@@ -77,6 +77,7 @@ class CheckConstraint:
 @dataclass
 class Schema:
     name: str
+    schema_name: str = "public"
     columns: list[Column] = field(default_factory=list)
     primary_key: list[str] = field(default_factory=list)
     type_map_hints: dict[str, str] = field(default_factory=dict)

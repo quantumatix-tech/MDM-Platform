@@ -49,6 +49,15 @@ migration:
   max_document_size_mb:
     type: number
     default: 2.0
+  include_schemas:
+    type: array
+    items: { type: string }
+    default: [public]
+    description: |
+      STEP 3B — list of source schemas for PostgreSQL metadata discovery.
+      Default is ["public"] for backward compatibility. PostgreSQL
+      internal schemas (pg_catalog, information_schema, pg_toast, pg_*)
+      are filtered out defensively regardless of what is configured.
 
 cdc:
   poll_interval:

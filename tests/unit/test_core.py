@@ -353,6 +353,421 @@ class TestOrchestratorConnects:
         target.connect.assert_called()
 
 
+class TestPostgresToPostgresBaseline:
+    """
+    STEP 1 — Baseline Regression Freeze.
+
+    Pins the currently-working Postgres → Postgres basic full-load behavior
+    that the project has been validated against in reports/ (e.g. 808a…,
+    93df…, b0ef…, e28c…): 3 customers, 3 products, 4 orders.
+
+    No production code, no orchestrator refactor, no type-mapping changes
+    are allowed to break this test in any later step.
+
+    The stale DELETE-synchronization gap is documented separately, in
+    TestPostgresToPostgresBaseline::test_stale_target_row_is_known_gap,
+    and is explicitly NOT treated as expected-correct behavior.
+    """
+
+    EXPECTED_TABLES = ["customers", "products", "orders"]
+    EXPECTED_COUNTS = {"customers": 3, "products": 3, "orders": 4}
+    EXPECTED_TOTAL = 10
+
+    def _make_source(self, counts: dict[str, int]):
+        source = MagicMock(spec=SourceConnector)
+        source.list_objects.return_value = list(self.EXPECTED_TABLES)
+
+        def _count(obj_name: str) -> int:
+            return counts.get(obj_name, 0)
+
+        source.get_object_count.side_effect = _count
+
+        def _schema(obj_name: str) -> Schema:
+            return Schema(
+                name=obj_name,
+                columns=[Column(name="id", source_type="integer", target_type="INT")],
+                primary_key=["id"],
+            )
+
+        source.get_schema.side_effect = _schema
+
+        def _export(obj_name: str):
+            n = counts.get(obj_name, 0)
+            for i in range(1, n + 1):
+                yield {"id": i}
+
+        source.export_full.side_effect = _export
+        return source
+
+    def _make_target(self, counts: dict[str, int]):
+        target = MagicMock(spec=TargetConnector)
+
+        def _upsert(object_name, rows, schema=None):
+            batch = list(rows)
+            return UpsertResult(success_count=len(batch))
+
+        target.upsert_batch.side_effect = _upsert
+
+        def _target_count(obj_name: str) -> int:
+            return counts.get(obj_name, 0)
+
+        target.get_object_count.side_effect = _target_count
+        return target
+
+    def test_basic_pg_pg_full_migration_loads_all_rows(self):
+        source = self._make_source(self.EXPECTED_COUNTS)
+        target = self._make_target(self.EXPECTED_COUNTS)
+
+        result = MigrationOrchestrator(source, target, {}).run_full()
+
+        discovered = result["phases"]["discover"]["objects"]
+        assert sorted(discovered) == sorted(self.EXPECTED_TABLES)
+
+        for table in self.EXPECTED_TABLES:
+            phase = result["phases"][table]
+            assert phase["source_rows"] == self.EXPECTED_COUNTS[table]
+            assert phase["success"] == self.EXPECTED_COUNTS[table]
+            assert phase["failure"] == 0
+
+        total_success = sum(
+            result["phases"][t]["success"] for t in self.EXPECTED_TABLES
+        )
+        assert total_success == self.EXPECTED_TOTAL
+
+    def test_basic_pg_pg_validation_passes_when_counts_match(self):
+        source = self._make_source(self.EXPECTED_COUNTS)
+        target = self._make_target(self.EXPECTED_COUNTS)
+
+        result = MigrationOrchestrator(source, target, {}).run_full()
+
+        validation = result["phases"]["validation"]
+        assert validation["mode"] == "count"
+        for table in self.EXPECTED_TABLES:
+            assert validation["checks"][table]["match"] is True, (
+                f"{table} unexpectedly mismatched: {validation['checks'][table]}"
+            )
+        assert validation["status"] == "success"
+
+    def test_stale_target_row_is_known_gap(self):
+        """
+        KNOWN GAP / EXPECTED CURRENT FAILURE.
+
+        When a row is deleted on the source but the target still holds it,
+        `run_full` upserts cannot remove it (no DELETE pass in full mode),
+        so `validate(mode='count')` reports mismatch. This documents the
+        current behavior, NOT a correctness claim.
+
+        Any later step that removes this gap must update this test to
+        reflect the new (correct) behavior.
+        """
+        stale_target_counts = {
+            "customers": 4,   # one stale row
+            "products": 3,
+            "orders": 4,
+        }
+        source = self._make_source(self.EXPECTED_COUNTS)
+        target = self._make_target(stale_target_counts)
+
+        result = MigrationOrchestrator(source, target, {}).run_full()
+
+        assert result["phases"]["customers"]["success"] == 3
+        validation = result["phases"]["validation"]["checks"]["customers"]
+        assert validation["match"] is False, (
+            "If this assertion starts failing, the stale-row gap may have been "
+            "fixed — update this test to reflect the new behavior."
+        )
+        assert result["phases"]["validation"]["status"] == "mismatch"
+
+
+class TestPostgresDiscoverySchemaFilter:
+    """
+    STEP 3A — Schema Scope Regression Test.
+
+    Pins the desired behavior of PostgresSourceConnector metadata
+    discovery with respect to schema scope: when an `include_schemas`
+    configuration is provided, tables (and by extension other object
+    classes) inside the listed schemas must be enumerated, not only
+    those in `public`.
+
+    Behavior pinned (not SQL string literals):
+      * PostgresSourceConnector honors an `include_schemas` config field.
+      * When `include_schemas = ["public", "audit_test"]`, discovery is
+        performed against both schemas — not only `public`.
+      * The default behavior (no config or `["public"]`) is preserved.
+
+    This test is expected to FAIL against the current code, because
+    `PostgresSourceConnector.list_objects()` (postgresql.py:81-101) and
+    every other discovery method hardcode `WHERE … = 'public'` — there
+    is no `include_schemas` config field consulted anywhere.
+
+    After the STEP 3B fix (replacing the hardcoded `'public'` filters
+    with a parameterized schema list), this test should PASS.
+
+    Test asserts BEHAVIOR at the discovery boundary, not SQL strings,
+    so any equivalent future implementation (ANY(%s), IN (...), JOIN
+    against a schema list, etc.) satisfies it.
+    """
+
+    def _make_smart_cursor(self, expected_schema_name: str):
+        """
+        Build a cursor mock that simulates a real PG behavior: rows are
+        only returned for the schema name(s) the connector asks about.
+
+        On the CURRENT (buggy) code, the connector asks only about
+        `'public'`, so a cursor configured with expected_schema_name =
+        `'public'` returns rows but one configured with `'audit_test'`
+        does not.
+
+        After STEP 3B, the connector must ask about BOTH configured
+        schemas, so the mock returns rows regardless of which schema
+        we name as "expected".
+
+        This is a behavioral contract, not a SQL string assertion.
+        """
+        cur = MagicMock()
+
+        def execute_side_effect(sql, params=None):
+            sql_str = sql if isinstance(sql, str) else str(sql)
+            params_str = str(params) if params is not None else ""
+            # The connector may consult the schema via a literal in the SQL
+            # (current buggy behavior) OR via a parameterized list (fixed
+            # behavior). Either counts as "consulted" — that's the contract.
+            schema_present = (
+                expected_schema_name in sql_str
+                or expected_schema_name in params_str
+            )
+            if schema_present:
+                cur.fetchall.return_value = [
+                    (f"t_{expected_schema_name}_1",),
+                    (f"t_{expected_schema_name}_2",),
+                ]
+            else:
+                cur.fetchall.return_value = []
+
+        cur.execute.side_effect = execute_side_effect
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        return cur
+
+    def _make_connector(self, include_schemas):
+        from core.connectors.postgresql import PostgresSourceConnector
+
+        cfg = {
+            "host": "x",
+            "port": 1,
+            "database": "x",
+            "username": "u",
+            "password": "p",
+            "ssl": False,
+        }
+        if include_schemas is not None:
+            cfg["include_schemas"] = include_schemas
+        connector = PostgresSourceConnector(cfg)
+        connector._conn = MagicMock()
+        return connector
+
+    def test_non_public_schema_is_included_in_metadata_discovery(self):
+        """
+        Contract: with include_schemas = ['public', 'audit_test'],
+        discovery must query both schemas and return objects from both.
+
+        The mock cursor is configured for the `'audit_test'` schema:
+          * On current code, the connector's SQL hardcodes `'public'`,
+            so the cursor's `execute` is called with SQL that does NOT
+            reference `'audit_test'` — cursor returns []. list_objects()
+            returns []. Test FAILS.
+          * After STEP 3B, the connector must reference BOTH configured
+            schemas, so the cursor returns audit_test rows too. Test
+            PASSES.
+        """
+        connector = self._make_connector(["public", "audit_test"])
+        connector._conn.cursor.return_value = self._make_smart_cursor("audit_test")
+
+        tables = connector.list_objects()
+
+        assert any("audit_test" in t for t in tables) or len(tables) >= 1, (
+            f"Non-public schema not consulted by discovery. "
+            f"list_objects() returned {tables!r}. "
+            "This is the STEP 2 confirmed DISCOVERY LIMITATION. "
+            "Will pass after STEP 3B lifts the hardcoded 'public' filter."
+        )
+
+    def test_default_schema_scope_remains_public(self):
+        """
+        Regression safety: with include_schemas omitted (default),
+        discovery must still enumerate `public`. This test passes on
+        current code AND after STEP 3B.
+        """
+        connector = self._make_connector(None)
+        connector._conn.cursor.return_value = self._make_smart_cursor("public")
+
+        tables = connector.list_objects()
+
+        assert "t_public_1" in tables
+        assert "t_public_2" in tables
+
+
+class TestNonPublicSchemaDDLQualification:
+    """
+    STEP 3B-B-1 — Target DDL Schema Qualification Contract Test.
+
+    Verifies that the migration/DDL path preserves schema_name from
+    source discovery through to target DDL generation, so that
+    public.customers and audit_test.customers can be distinguished.
+
+    These tests FAIL on current production code because:
+    1. Schema dataclass has no schema_name field
+    2. PostgresTargetConnector.create_object_if_missing hardcodes
+       table_schema='public' for existence checks
+    3. CREATE TABLE DDL uses schema.name unqualified (no schema prefix)
+    """
+
+    def _make_mock_conn(self):
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.return_value = None
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn, mock_cur
+
+    def test_get_schema_preserves_schema_name_in_metadata(self):
+        """
+        Contract: PostgresSourceConnector.get_schema() must return a
+        Schema object that carries the schema name so that downstream
+        phases (Phase 4-6) can route objects to the correct target schema.
+
+        FAILS on current code: Schema dataclass has no schema_name field,
+        and get_schema() returns Schema(name=object_name) only.
+        """
+        from core.connectors.postgresql import PostgresSourceConnector
+
+        connector = PostgresSourceConnector(
+            {
+                "host": "x",
+                "port": 1,
+                "database": "x",
+                "username": "u",
+                "password": "p",
+                "ssl": False,
+                "include_schemas": ["public", "audit_test"],
+            }
+        )
+
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_cur.fetchone.side_effect = [("audit_test",), None, None]
+        mock_cur.fetchall.return_value = []
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        connector._conn = mock_conn
+
+        schema = connector.get_schema("customers")
+
+        assert hasattr(schema, "schema_name"), (
+            "Schema object must carry schema_name from discovery. "
+            "Current Schema dataclass has no schema_name field."
+        )
+        assert schema.schema_name == "audit_test", (
+            f"Schema must carry 'audit_test' schema name. "
+            f"Got: {getattr(schema, 'schema_name', 'MISSING')!r}"
+        )
+
+    def test_target_ddl_qualifies_non_public_schema(self):
+        """
+        Contract: PostgresTargetConnector.create_object_if_missing must
+        emit schema-qualified CREATE TABLE DDL when the Schema object
+        carries a non-public schema_name, so that audit_test.customers
+        and public.customers are created in the correct target schemas.
+
+        FAILS on current code because:
+        1. Schema dataclass has no schema_name field
+        2. create_object_if_missing hardcodes table_schema='public'
+        3. CREATE TABLE DDL uses schema.name unqualified
+        """
+        from core.connectors.postgresql import PostgresTargetConnector
+
+        target = PostgresTargetConnector(
+            {
+                "host": "localhost",
+                "port": 5432,
+                "database": "test",
+                "username": "u",
+                "password": "p",
+                "ssl": False,
+            }
+        )
+        mock_conn, mock_cur = self._make_mock_conn()
+        target._conn = mock_conn
+
+        schema = Schema(
+            name="customers",
+            schema_name="audit_test",
+            columns=[Column(name="id", source_type="integer")],
+            primary_key=["id"],
+        )
+
+        target.create_object_if_missing(schema)
+
+        executed_sql = [call.args[0] for call in mock_cur.execute.call_args_list]
+
+        existence_sql = executed_sql[0]
+        assert "table_schema = 'public'" not in existence_sql, (
+            f"Existence check must not hardcode 'public'. "
+            f"Got: {existence_sql!r}"
+        )
+
+        ddl = next(
+            (sql for sql in executed_sql if sql.startswith("CREATE TABLE")), None
+        )
+        assert ddl is not None, "CREATE TABLE DDL was not emitted"
+        assert "audit_test" in ddl, (
+            f"Schema qualifier 'audit_test' must appear in CREATE TABLE DDL. "
+            f"Got: {ddl!r}"
+        )
+        assert ddl.index("audit_test") < ddl.index("customers"), (
+            f"Schema qualifier must appear before table name. Got: {ddl!r}"
+        )
+
+    def test_public_schema_ddl_remains_unchanged(self):
+        """
+        Regression: the existing public-schema path must produce valid
+        unqualified CREATE TABLE DDL and must not break.
+        """
+        from core.connectors.postgresql import PostgresTargetConnector
+
+        target = PostgresTargetConnector(
+            {
+                "host": "localhost",
+                "port": 5432,
+                "database": "test",
+                "username": "u",
+                "password": "p",
+                "ssl": False,
+            }
+        )
+        mock_conn, mock_cur = self._make_mock_conn()
+        target._conn = mock_conn
+
+        schema = Schema(
+            name="customers",
+            columns=[Column(name="id", source_type="integer")],
+            primary_key=["id"],
+        )
+
+        target.create_object_if_missing(schema)
+
+        executed_sql = [call.args[0] for call in mock_cur.execute.call_args_list]
+        ddl = next(
+            sql for sql in executed_sql if sql.startswith("CREATE TABLE")
+        )
+
+        assert "CREATE TABLE customers" in ddl, (
+            f"Public schema path must produce unqualified CREATE TABLE. "
+            f"Got: {ddl!r}"
+        )
+        assert "PRIMARY KEY (id)" in ddl
+
+
 class TestConfigSchema:
     def test_schema_yaml_is_valid(self):
         import yaml

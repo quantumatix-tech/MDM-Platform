@@ -124,6 +124,7 @@ class MigrationOrchestrator:
             # ---------- Connect ----------
             self._resolve_connector_secrets(self._source, self._config.get("source", {}))
             self._resolve_connector_secrets(self._target, self._config.get("target", {}))
+            self._apply_schema_scope(self._source)
             self._source.connect()
             self._target.connect()
             result["phases"]["connect"] = "success"
@@ -469,6 +470,30 @@ class MigrationOrchestrator:
         if "password_secret" in connection_config:
             connector._config["password"] = self._secret_resolver.resolve(connection_config["password_secret"])
 
+    def _apply_schema_scope(self, source: Any) -> None:
+        """
+        STEP 3B — propagate ``migration.include_schemas`` from the top-level
+        config down to the source connector before ``connect()`` is called.
+
+        Backward compatible: if ``migration.include_schemas`` is not set,
+        the connector falls back to its own default (``["public"]``), which
+        preserves every pre-existing PostgreSQL → PostgreSQL behavior.
+        """
+        include_schemas = self._config.get("migration", {}).get("include_schemas")
+        if include_schemas is None:
+            return
+        if not isinstance(include_schemas, (list, tuple)) or not include_schemas:
+            return
+        cleaned: list[str] = [
+            s for s in include_schemas
+            if isinstance(s, str) and s
+            and s not in {"pg_catalog", "information_schema", "pg_toast"}
+            and not s.startswith("pg_")
+        ]
+        if not cleaned:
+            return
+        source._config["include_schemas"] = cleaned
+
     def _chunked(self, iterable: Iterator[Any], chunk_size: int) -> Iterator[list[Any]]:
         it = iter(iterable)
         while True:
@@ -676,6 +701,7 @@ class MigrationOrchestrator:
             # back for the CDC engine connection below.
             self._resolve_connector_secrets(self._source, self._config.get("source", {}))
             self._resolve_connector_secrets(self._target, self._config.get("target", {}))
+            self._apply_schema_scope(self._source)
             self._source.connect()
             self._target.connect()
             result["phases"]["connect"] = "success"
