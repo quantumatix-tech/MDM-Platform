@@ -618,7 +618,7 @@ The `ViewDefinition` dataclass had no `schema_name` field. As a result:
 ### 15.3 Unit Test Results
 
 ``` text
-63 passed, 0 failed
+66 passed, 0 failed
 ```
 
 Key regression tests added in `tests/unit/test_core.py`:
@@ -665,7 +665,122 @@ and is queryable.
 
 -----------------------------------------------------------------------
 
-## 16. Next Phase
+## 16. Completed PostgreSQL Materialized Views Schema Qualification Milestone
+
+This section documents the completed PostgreSQL materialized views schema
+qualification milestone on the `feature/postgresql-objects` branch.
+
+### 16.1 Root Cause
+
+The `MaterializedViewDef` dataclass had no `schema_name` field. As a result:
+
+1. `PostgresSourceConnector.list_materialized_views()` queried
+   `pg_matviews` filtering by `schemaname = ANY(%s)` (which respects
+   `include_schemas`), but only selected `matviewname` and the view
+   definition via `pg_get_viewdef(matviewname::regclass)`, dropping the
+   `schemaname` value.  In addition, the `pg_get_viewdef(...)` call
+   failed for non-public schemas because `matviewname` is unqualified
+   and the PostgreSQL `search_path` does not include non-public schemas.
+2. `PostgresTargetConnector.create_materialized_view()` always emitted
+   `CREATE MATERIALIZED VIEW {mv.name}` without schema qualification,
+   and its existence check hardcoded `schemaname = 'public'`.
+3. `PostgresTargetConnector.refresh_materialized_view()` emitted
+   `REFRESH MATERIALIZED VIEW {name}` without schema qualification.
+4. Materialized views in non-public schemas (e.g.
+   `audit_test.customer_balance_summary`) were therefore either
+   not discovered, created in the wrong schema, or failed during
+   creation/refresh.
+
+### 16.2 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `schema_name: str = "public"` to the `MaterializedViewDef`
+     dataclass.
+   - Added `schema_name: str | None = None` parameter to
+     `TargetConnector.refresh_materialized_view()` for backward
+     compatibility.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresSourceConnector.list_materialized_views()` to
+     select `schemaname` and use `pg_get_viewdef(c.oid)` (via a join
+     with `pg_class`/`pg_namespace`) so non-public materialized views
+     are discovered correctly regardless of `search_path`.
+   - Updated `PostgresTargetConnector.create_materialized_view()` to
+     emit a schema-qualified `CREATE MATERIALIZED VIEW` when
+     `mv.schema_name != "public"`, using `quote_identifier()` for
+     safety, and to check existence using the correct schema.
+   - Updated `PostgresTargetConnector.refresh_materialized_view()` to
+     accept an optional `schema_name` parameter and schema-qualify the
+     `REFRESH MATERIALIZED VIEW` statement for non-public schemas.
+   - Public-schema materialized views remain unqualified for backward
+     compatibility.
+
+3. **`core/orchestrator.py`**
+   - Updated both `run_full()` and `run_cdc()` to pass
+     `schema_name=mv.schema_name` to `refresh_materialized_view()`.
+
+### 16.3 Unit Test Results
+
+``` text
+66 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresMaterializedViewSchemaQualification.test_list_materialized_views_captures_schema_name`
+- `TestPostgresMaterializedViewSchemaQualification.test_target_create_materialized_view_qualifies_non_public_schema`
+- `TestPostgresMaterializedViewSchemaQualification.test_target_create_materialized_view_remains_unqualified_for_public`
+
+### 16.4 Real PostgreSQL CLI Verification
+
+Run ID: `23e4eb66fa104cc9a8becee773d869fc`
+
+``` text
+Mode: FULL
+Tables migrated: 5
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+The migration report confirms:
+
+``` json
+"materialized_views": {
+  "customer_balance_summary": "created+refreshed"
+}
+```
+
+Target SQL verification:
+
+``` sql
+SELECT c.relname, n.nspname, c.relkind
+FROM pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname = 'audit_test' AND c.relkind = 'm';
+
+  relname           | nspname   | relkind
+--------------------+-----------+--------
+ customer_balance_summary | audit_test | m
+```
+
+``` sql
+SELECT * FROM audit_test.customer_balance_summary;
+
+ customer_id |    full_name    | order_count
+-------------+-----------------+-------------
+         100 | Object Test One |           1
+         101 | Object Test Two |           0
+```
+
+`audit_test.customer_balance_summary` was created in the correct
+non-public schema, is queryable, and `relkind = 'm'` confirms it is a
+MATERIALIZED VIEW (not an ordinary VIEW).
+
+-----------------------------------------------------------------------
+
+## 17. Next Phase
 
 Do not treat this document as a final production-readiness report.
 
@@ -677,8 +792,9 @@ The non-public schema migration milestone is **COMPLETE**:
 - 100% success
 - Schema-qualified sequences verified
 - Schema-qualified views verified
+- Schema-qualified materialized views verified
 - DDL rollback verified
-- 63 unit tests passing
+- 66 unit tests passing
 
 Next phase should focus on the remaining PostgreSQL object categories
 listed in Section 14.5, starting with the first category that has the

@@ -377,7 +377,7 @@ class MigrationOrchestrator:
                 for mv in self._source.list_materialized_views():
                     try:
                         self._target.create_materialized_view(mv)
-                        self._target.refresh_materialized_view(mv.name)
+                        self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
                         mv_results[mv.name] = "created+refreshed"
                     except Exception as exc:
                         mv_results[mv.name] = f"error: {exc}"
@@ -913,7 +913,7 @@ class MigrationOrchestrator:
                 for mv in self._source.list_materialized_views():
                     try:
                         self._target.create_materialized_view(mv)
-                        self._target.refresh_materialized_view(mv.name)
+                        self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
                         mv_results[mv.name] = "created+refreshed"
                     except Exception as exc:
                         mv_results[mv.name] = f"error: {exc}"

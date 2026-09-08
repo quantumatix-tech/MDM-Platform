@@ -1070,6 +1070,94 @@ class TestPostgresViewSchemaQualification:
         assert create_sql.strip().startswith("CREATE OR REPLACE VIEW customer_summary")
 
 
+class TestPostgresMaterializedViewSchemaQualification:
+    """
+    Regression: materialized views in non-public schemas must be discovered
+    with their schema and created in the correct target schema.  Previously
+    the source connector dropped the schema and the target emitted
+    CREATE MATERIALIZED VIEW view_name (always public), causing the object
+    to be created in the wrong schema or fail.
+    """
+
+    def test_list_materialized_views_captures_schema_name(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("public", "public", "SELECT * FROM customers"),
+            ("customer_balance_summary", "audit_test", "SELECT * FROM test_customers"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        mvs = connector.list_materialized_views()
+        by_name = {mv.name: mv for mv in mvs}
+        assert "customer_balance_summary" in by_name
+        assert by_name["customer_balance_summary"].schema_name == "audit_test"
+        assert by_name["public"].schema_name == "public"
+
+    def test_target_create_materialized_view_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        mv = MaterializedViewDef(
+            name="customer_balance_summary",
+            schema_name="audit_test",
+            definition="SELECT * FROM test_customers",
+        )
+        target.create_materialized_view(mv)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE MATERIALIZED VIEW" in s), None)
+        assert create_sql is not None
+        assert '"audit_test"' in create_sql
+        assert '"customer_balance_summary"' in create_sql
+        assert create_sql.index('"audit_test"') < create_sql.index('"customer_balance_summary"')
+
+    def test_target_create_materialized_view_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        mv = MaterializedViewDef(
+            name="public_mv",
+            schema_name="public",
+            definition="SELECT * FROM customers",
+        )
+        target.create_materialized_view(mv)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE MATERIALIZED VIEW" in s), None)
+        assert create_sql is not None
+        assert create_sql.strip().startswith("CREATE MATERIALIZED VIEW public_mv")
+
+
 class TestConfigSchema:
     def test_schema_yaml_is_valid(self):
         import yaml

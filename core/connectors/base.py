@@ -150,6 +150,7 @@ class MaterializedViewDef:
     """A materialized view — stored like a table, refreshed on demand."""
     name: str
     definition: str     # raw SELECT definition
+    schema_name: str = "public"
 
 
 @dataclass
@@ -371,7 +372,7 @@ class TargetConnector(abc.ABC):
     def create_materialized_view(self, mv: MaterializedViewDef) -> None:
         pass
 
-    def refresh_materialized_view(self, name: str) -> None:
+    def refresh_materialized_view(self, name: str, schema_name: str | None = None) -> None:
         pass
 
     def create_function(self, func: FunctionDef) -> None:

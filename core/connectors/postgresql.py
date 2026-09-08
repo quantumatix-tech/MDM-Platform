@@ -573,13 +573,15 @@ class PostgresSourceConnector(SourceConnector):
     def list_materialized_views(self) -> list[MaterializedViewDef]:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT matviewname, pg_get_viewdef(matviewname::regclass) "
-                "FROM pg_matviews "
-                "WHERE schemaname = ANY(%s) "
-                "ORDER BY matviewname",
+                "SELECT m.matviewname, m.schemaname, pg_get_viewdef(c.oid) "
+                "FROM pg_matviews m "
+                "JOIN pg_class c ON c.relname = m.matviewname "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = m.schemaname "
+                "WHERE m.schemaname = ANY(%s) "
+                "ORDER BY m.matviewname",
                 (list(self._include_schemas),),
             )
-            return [MaterializedViewDef(name=row[0], definition=row[1]) for row in cur.fetchall()]
+            return [MaterializedViewDef(name=row[0], schema_name=row[1], definition=row[2]) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Functions & Stored Procedures (Phase 13)
@@ -1232,11 +1234,16 @@ class PostgresTargetConnector(TargetConnector):
 
     def create_materialized_view(self, mv: MaterializedViewDef) -> None:
         validate_identifier(mv.name, "materialized view")
+        mv_schema = mv.schema_name or "public"
+        mv_qname = (
+            mv.name if mv_schema == "public"
+            else f"{quote_identifier(mv_schema)}.{quote_identifier(mv.name)}"
+        )
         with self._conn.cursor() as cur:
             try:
                 cur.execute(
-                    "SELECT 1 FROM pg_matviews WHERE matviewname = %s AND schemaname = 'public'",
-                    (mv.name,),
+                    "SELECT 1 FROM pg_matviews WHERE matviewname = %s AND schemaname = %s",
+                    (mv.name, mv_schema),
                 )
                 if cur.fetchone() is not None:
                     return
@@ -1244,27 +1251,31 @@ class PostgresTargetConnector(TargetConnector):
                 # appending WITH NO DATA (which must be the last clause)
                 clean_def = mv.definition.rstrip().rstrip(";")
                 cur.execute(
-                    f"CREATE MATERIALIZED VIEW {mv.name} AS {clean_def} WITH NO DATA"
+                    f"CREATE MATERIALIZED VIEW {mv_qname} AS {clean_def} WITH NO DATA"
                 )
                 self._conn.commit()
-                audit_log(phase="create_matview", status="created", details={"matview": mv.name})
+                audit_log(phase="create_matview", status="created", details={"matview": mv_qname})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_matview", status="failed",
-                          details={"matview": mv.name, "reason": str(exc)})
+                          details={"matview": mv_qname, "reason": str(exc)})
                 raise
 
-    def refresh_materialized_view(self, name: str) -> None:
+    def refresh_materialized_view(self, name: str, schema_name: str | None = None) -> None:
         validate_identifier(name, "materialized view")
+        mv_qname = (
+            name if not schema_name or schema_name == "public"
+            else f"{quote_identifier(schema_name)}.{quote_identifier(name)}"
+        )
         with self._conn.cursor() as cur:
             try:
-                cur.execute(f"REFRESH MATERIALIZED VIEW {name}")
+                cur.execute(f"REFRESH MATERIALIZED VIEW {mv_qname}")
                 self._conn.commit()
-                audit_log(phase="refresh_matview", status="refreshed", details={"matview": name})
+                audit_log(phase="refresh_matview", status="refreshed", details={"matview": mv_qname})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="refresh_matview", status="failed",
-                          details={"matview": name, "reason": str(exc)})
+                          details={"matview": mv_qname, "reason": str(exc)})
 
     # ------------------------------------------------------------------
     # Phase 13 — Functions & Stored Procedures
