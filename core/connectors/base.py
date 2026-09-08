@@ -169,6 +169,7 @@ class TriggerDef:
     name: str
     table: str
     ddl: str            # complete DDL from pg_get_triggerdef — ready to execute
+    schema_name: str = "public"
 
 
 @dataclass

@@ -619,7 +619,7 @@ class PostgresSourceConnector(SourceConnector):
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT t.tgname, c.relname, pg_get_triggerdef(t.oid) "
+                    "SELECT t.tgname, c.relname, n.nspname, pg_get_triggerdef(t.oid) "
                     "FROM pg_trigger t "
                     "JOIN pg_class c ON t.tgrelid = c.oid "
                     "JOIN pg_namespace n ON c.relnamespace = n.oid "
@@ -628,8 +628,8 @@ class PostgresSourceConnector(SourceConnector):
                     (list(self._include_schemas),),
                 )
                 for row in cur.fetchall():
-                    trig_name, table_name, ddl = row
-                    triggers.append(TriggerDef(name=trig_name, table=table_name, ddl=ddl))
+                    trig_name, table_name, schema_name, ddl = row
+                    triggers.append(TriggerDef(name=trig_name, table=table_name, schema_name=schema_name, ddl=ddl))
         except Exception:
             self._conn.rollback()   # keep source connection clean for subsequent phases
             raise
@@ -1302,17 +1302,22 @@ class PostgresTargetConnector(TargetConnector):
     # ------------------------------------------------------------------
 
     def create_trigger(self, trigger: TriggerDef) -> None:
+        validate_identifier(trigger.name, "trigger")
+        trigger_schema = trigger.schema_name or "public"
+        table_qname = (
+            trigger.table if trigger_schema == "public"
+            else f"{quote_identifier(trigger_schema)}.{quote_identifier(trigger.table)}"
+        )
         with self._conn.cursor() as cur:
             try:
-                # Drop existing trigger first (idempotent)
                 cur.execute(
-                    f"DROP TRIGGER IF EXISTS {trigger.name} ON {trigger.table}"
+                    f"DROP TRIGGER IF EXISTS {quote_identifier(trigger.name)} ON {table_qname}"
                 )
                 self._conn.commit()
                 cur.execute(trigger.ddl)
                 self._conn.commit()
                 audit_log(phase="create_trigger", status="created",
-                          details={"trigger": trigger.name, "table": trigger.table})
+                          details={"trigger": trigger.name, "table": table_qname})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_trigger", status="skipped",

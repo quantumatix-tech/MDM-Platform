@@ -409,11 +409,16 @@ class MigrationOrchestrator:
             trigger_results: dict[str, str] = {}
             try:
                 for trigger in self._source.get_all_triggers():
+                    trigger_key = (
+                        f"{trigger.table}.{trigger.name}"
+                        if trigger.schema_name == "public"
+                        else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
+                    )
                     try:
                         self._target.create_trigger(trigger)
-                        trigger_results[f"{trigger.table}.{trigger.name}"] = "created"
+                        trigger_results[trigger_key] = "created"
                     except Exception as exc:
-                        trigger_results[f"{trigger.table}.{trigger.name}"] = f"skipped: {exc}"
+                        trigger_results[trigger_key] = f"skipped: {exc}"
             except Exception as exc:
                 trigger_results["_error"] = str(exc)
             result["phases"]["triggers"] = trigger_results
@@ -948,11 +953,16 @@ class MigrationOrchestrator:
             trigger_results: dict[str, str] = {}
             try:
                 for trigger in self._source.get_all_triggers():
+                    trigger_key = (
+                        f"{trigger.table}.{trigger.name}"
+                        if trigger.schema_name == "public"
+                        else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
+                    )
                     try:
                         self._target.create_trigger(trigger)
-                        trigger_results[f"{trigger.table}.{trigger.name}"] = "created"
+                        trigger_results[trigger_key] = "created"
                     except Exception as exc:
-                        trigger_results[f"{trigger.table}.{trigger.name}"] = f"skipped: {exc}"
+                        trigger_results[trigger_key] = f"skipped: {exc}"
             except Exception as exc:
                 trigger_results["_error"] = str(exc)
             result["phases"]["triggers"] = trigger_results

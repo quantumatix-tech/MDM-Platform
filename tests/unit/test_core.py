@@ -15,6 +15,7 @@ from core.connectors.base import (
     ViewDefinition,
     MaterializedViewDef,
     FunctionDef,
+    TriggerDef,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -1237,6 +1238,92 @@ class TestPostgresFunctionSchemaQualification:
         ddl_call = next((s for s in executed if "CREATE OR REPLACE FUNCTION" in s), None)
         assert ddl_call is not None
         assert ddl_call.strip().startswith("CREATE OR REPLACE FUNCTION public_func")
+
+
+class TestPostgresTriggerSchemaQualification:
+    """
+    Regression: triggers in non-public schemas must be discovered with
+    their table schema and created in the correct target schema.  Previously
+    the source connector dropped the schema and the target emitted
+    DROP TRIGGER / CREATE TRIGGER without schema qualification, causing
+    failures for non-public tables.
+    """
+
+    def test_get_all_triggers_captures_schema_name(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("trg_customer_timestamp", "test_customers", "audit_test",
+             "CREATE TRIGGER trg_customer_timestamp BEFORE UPDATE ON audit_test.test_customers FOR EACH ROW EXECUTE FUNCTION audit_test.update_customer_timestamp()"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        triggers = connector.get_all_triggers()
+        by_name = {t.name: t for t in triggers}
+        assert "trg_customer_timestamp" in by_name
+        assert by_name["trg_customer_timestamp"].schema_name == "audit_test"
+        assert by_name["trg_customer_timestamp"].table == "test_customers"
+
+    def test_target_create_trigger_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        trigger = TriggerDef(
+            name="trg_customer_timestamp",
+            table="test_customers",
+            schema_name="audit_test",
+            ddl="CREATE TRIGGER trg_customer_timestamp BEFORE UPDATE ON audit_test.test_customers FOR EACH ROW EXECUTE FUNCTION audit_test.update_customer_timestamp()",
+        )
+        target.create_trigger(trigger)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        drop_sql = next((s for s in executed if "DROP TRIGGER" in s), None)
+        assert drop_sql is not None
+        assert '"audit_test"."test_customers"' in drop_sql
+
+    def test_target_create_trigger_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        trigger = TriggerDef(
+            name="trg_public",
+            table="customers",
+            schema_name="public",
+            ddl="CREATE TRIGGER trg_public BEFORE UPDATE ON customers FOR EACH ROW EXECUTE FUNCTION public_func()",
+        )
+        target.create_trigger(trigger)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        drop_sql = next((s for s in executed if "DROP TRIGGER" in s), None)
+        assert drop_sql is not None
+        assert drop_sql.strip().startswith('DROP TRIGGER IF EXISTS "trg_public" ON customers')
 
 
 class TestConfigSchema:

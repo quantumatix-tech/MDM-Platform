@@ -930,7 +930,135 @@ be picked up automatically.
 
 -----------------------------------------------------------------------
 
-## 19. Next Phase
+## 19. Completed PostgreSQL Triggers Schema Qualification Milestone
+
+This section documents the completed PostgreSQL triggers schema
+qualification milestone on the `feature/postgresql-objects` branch.
+
+### 19.1 Root Cause
+
+The `TriggerDef` dataclass had no `schema_name` field. As a result:
+
+1. `PostgresSourceConnector.get_all_triggers()` queried `pg_trigger`
+   joined with `pg_class` and `pg_namespace`, filtering by
+   `n.nspname = ANY(%s)` (which respects `include_schemas`), but only
+   selected `t.tgname`, `c.relname`, and `pg_get_triggerdef(t.oid)`,
+   dropping the `n.nspname` value.
+2. `PostgresTargetConnector.create_trigger()` used
+   `DROP TRIGGER IF EXISTS {trigger.name} ON {trigger.table}` without
+   schema qualification, which fails for non-public schemas because
+   PostgreSQL cannot resolve the table without schema qualification.
+3. The orchestrator reported triggers as `{trigger.table}.{trigger.name}`
+   without schema qualification, which could cause reporting collisions
+   across schemas.
+4. Triggers in non-public schemas (e.g. `audit_test.trg_customer_timestamp`)
+   were therefore not properly tracked, and the DROP TRIGGER statement
+   would fail if the table was in a non-public schema.
+
+### 19.2 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `schema_name: str = "public"` to the `TriggerDef` dataclass.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresSourceConnector.get_all_triggers()` to select
+     `n.nspname` and populate `TriggerDef.schema_name`.
+   - Updated `PostgresTargetConnector.create_trigger()` to validate the
+     trigger identifier, compute a schema-qualified table name for the
+     `DROP TRIGGER` statement when the trigger is in a non-public schema,
+     and log the qualified table name in audit events.
+
+3. **`core/orchestrator.py`**
+   - Updated both `run_full()` and `run_cdc()` to compute a
+     schema-qualified trigger key for the migration report when the
+     trigger is in a non-public schema, preserving backward compatibility
+     for public-schema triggers.
+
+### 19.3 Unit Test Results
+
+``` text
+72 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresTriggerSchemaQualification.test_get_all_triggers_captures_schema_name`
+- `TestPostgresTriggerSchemaQualification.test_target_create_trigger_qualifies_non_public_schema`
+- `TestPostgresTriggerSchemaQualification.test_target_create_trigger_remains_unqualified_for_public`
+
+### 19.4 Real PostgreSQL CLI Verification
+
+The trigger migration was verified using the existing target state from
+the previous real CLI migration run. The target already contained the
+correctly migrated trigger.
+
+Previous Run ID: `68e2cefb85c14e2eb985c408349725fd`
+
+``` text
+Mode: FULL
+Tables migrated: 5
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+Target SQL verification:
+
+``` sql
+SELECT t.tgname, c.relname, n.nspname, pg_get_triggerdef(t.oid)
+FROM pg_trigger t
+JOIN pg_class c ON t.tgrelid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname = 'audit_test' AND NOT t.tgisinternal;
+
+  tgname                  | relname       | nspname   | pg_get_triggerdef
+--------------------------+---------------+-----------+---------------------------------------------------------------------------------------------------------------------------------------
+ trg_customer_timestamp   | test_customers| audit_test| CREATE TRIGGER trg_customer_timestamp BEFORE UPDATE ON audit_test.test_customers FOR EACH ROW EXECUTE FUNCTION audit_test.update_customer_timestamp()
+```
+
+Behavioral trigger verification:
+
+``` sql
+-- Before update
+SELECT customer_id, full_name, created_at FROM audit_test.test_customers ORDER BY customer_id;
+ customer_id |    full_name    |         created_at
+-------------+-----------------+----------------------------
+         100 | Object Test One | 2026-09-08 12:00:54.196159
+         101 | Object Test Two | 2026-09-08 12:00:54.196159
+
+-- Perform controlled UPDATE
+UPDATE audit_test.test_customers SET full_name = 'Updated Test' WHERE customer_id = 100;
+
+-- After update - trigger fired and updated created_at
+SELECT customer_id, full_name, created_at FROM audit_test.test_customers ORDER BY customer_id;
+ customer_id | full_name  |         created_at
+-------------+------------+----------------------------
+         100 | Updated Test | 2026-09-08 12:46:15.292072
+         101 | Object Test Two | 2026-09-08 12:00:54.196159
+
+-- Restore original value
+UPDATE audit_test.test_customers SET full_name = 'Object Test One' WHERE customer_id = 100;
+```
+
+The trigger is correctly attached to `audit_test.test_customers`, fires
+`BEFORE UPDATE`, and executes `audit_test.update_customer_timestamp()`,
+which updates the `created_at` column to the current timestamp on every
+update. This confirms the trigger is fully functional on the target.
+
+### 19.5 Remaining Limitations
+
+- Trigger function bodies are not separately validated or compared
+  during trigger migration (the function itself is migrated in the
+  Functions/Procedures phase).
+- Complex trigger configurations involving multiple triggers on the
+  same table with interdependent logic have not been specifically tested.
+- Trigger enabling/disabling state is not explicitly migrated; triggers
+  are created in their default enabled state.
+
+-----------------------------------------------------------------------
+
+## 20. Next Phase
 
 Do not treat this document as a final production-readiness report.
 
@@ -944,8 +1072,9 @@ The non-public schema migration milestone is **COMPLETE**:
 - Schema-qualified views verified
 - Schema-qualified materialized views verified
 - Schema-qualified functions verified
+- Schema-qualified triggers verified
 - DDL rollback verified
-- 69 unit tests passing
+- 72 unit tests passing
 
 Next phase should focus on the remaining PostgreSQL object categories
 listed in Section 14.5, starting with the first category that has the
