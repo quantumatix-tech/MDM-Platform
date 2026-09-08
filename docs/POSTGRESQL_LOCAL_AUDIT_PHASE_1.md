@@ -920,13 +920,86 @@ Both functions were created in the correct `audit_test` schema, are
 queryable, and return correct results. `prokind = 'f'` confirms they are
 standard PostgreSQL functions.
 
-### 18.5 Procedure Support Status
+### 18.5 Procedure End-to-End Verification
 
-The current source database contains **no stored procedures** (`prokind = 'p'`)
-in the configured schemas. The implementation already filters `prokind IN ('f', 'p')`
-in `list_functions()`, so procedures are architecturally supported for
-discovery and migration. If procedures are added to the source, they will
-be picked up automatically.
+A controlled non-public PostgreSQL procedure was created in the audit
+environment to verify procedure migration end-to-end.
+
+**Controlled procedure created:**
+
+- Name: `audit_test.test_procedure`
+- Schema: `audit_test`
+- Type: Stored procedure (`prokind = 'p'`)
+- Arguments: `IN p_message text`
+- Body: Inserts the message into `audit_test.procedure_test_log`
+
+Source catalog verification:
+
+``` sql
+SELECT p.proname, n.nspname, p.prokind, pg_get_function_arguments(p.oid) AS args
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE p.proname = 'test_procedure' AND n.nspname = 'audit_test';
+
+  proname     | nspname   | prokind |    args     | definition
+--------------+-----------+---------+-------------+-----------
+ test_procedure | audit_test | p       | IN p_message text | CREATE OR REPLACE PROCEDURE audit_test.test_procedure(IN p_message text) LANGUAGE plpgsql AS $procedure$BEGIN INSERT INTO audit_test.procedure_test_log (message, created_at) VALUES (p_message, CURRENT_TIMESTAMP); END;$procedure$
+```
+
+Real CLI migration verified:
+
+Run ID: `4ab05f71de9947738b35c162db79ea7f`
+
+``` text
+Mode: FULL
+Tables migrated: 8
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+Migration report confirms procedure creation:
+
+``` json
+"functions": {
+  "audit_test.test_procedure": "created"
+}
+```
+
+Target catalog verification:
+
+``` sql
+SELECT p.proname, n.nspname, p.prokind, pg_get_function_arguments(p.oid) AS args
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE p.proname = 'test_procedure' AND n.nspname = 'audit_test';
+
+  proname     | nspname   | prokind |    args     | definition
+--------------+-----------+---------+-------------+-----------
+ test_procedure | audit_test | p       | IN p_message text | CREATE OR REPLACE PROCEDURE audit_test.test_procedure(IN p_message text) LANGUAGE plpgsql AS $procedure$BEGIN INSERT INTO audit_test.procedure_test_log (message, created_at) VALUES (p_message, CURRENT_TIMESTAMP); END;$procedure$
+```
+
+Procedure execution verification:
+
+``` sql
+CALL audit_test.test_procedure('E2E verification test');
+
+SELECT * FROM audit_test.procedure_test_log ORDER BY id DESC LIMIT 1;
+
+  id |        message        |         created_at
+-----+-----------------------+----------------------------
+   1 | E2E verification test | 2026-09-08 15:45:06.311398
+```
+
+**Result:** Procedure `CALL` succeeded. Expected effect (insert into
+`procedure_test_log`) occurred. Actual behavior matches expected
+behavior.
+
+The implementation already supports procedures via `prokind IN ('f', 'p')`
+in `list_functions()` and `create_function()` executes the raw DDL from
+`pg_get_functiondef()`, which correctly handles both functions and
+procedures.
 
 -----------------------------------------------------------------------
 
