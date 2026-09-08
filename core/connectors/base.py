@@ -196,9 +196,10 @@ class CommentDef:
 class GrantDef:
     """A GRANT privilege statement."""
     privileges: str     # SELECT, INSERT, ALL, etc.
-    object_type: str    # TABLE, SEQUENCE, FUNCTION, SCHEMA
-    object_name: str
+    object_type: str    # TABLE, SEQUENCE, FUNCTION, SCHEMA, COLUMN
+    object_name: str    # schema-qualified when applicable
     grantee: str
+    schema_name: str = "public"
 
 
 # ---------------------------------------------------------------------------

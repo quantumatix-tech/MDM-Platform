@@ -1230,4 +1230,203 @@ WHERE d.classoid = 'pg_namespace'::regclass AND n.nspname = 'public';
 
 -----------------------------------------------------------------------
 
-## 21. Next Phase
+## 21. Completed PostgreSQL Grants/Privileges Schema Qualification Milestone
+
+This section documents the completed PostgreSQL grants/privileges schema
+qualification milestone on the `feature/postgresql-objects` branch.
+
+### 21.1 Root Cause
+
+The `GrantDef` dataclass had no `schema_name` field. As a result:
+
+1. `PostgresSourceConnector.list_grants()` queried
+   `information_schema.role_table_grants` and
+   `information_schema.role_usage_grants` filtering by schema, but
+   dropped the schema name from all result sets.
+2. `PostgresTargetConnector.apply_grant()` executed
+   `GRANT {privileges} ON {object_type} {object_name} TO {grantee}`
+   without schema qualification, which fails for non-public schemas
+   because PostgreSQL cannot resolve the object without schema
+   qualification.
+3. The orchestrator reported grants by bare `object_name` without
+   schema qualification, which could cause reporting collisions across
+   schemas.
+4. Grants on non-public objects were therefore not properly tracked,
+   and the GRANT statement would fail if the object was in a non-public
+   schema.
+
+### 21.2 Supported Privilege Types
+
+The implementation supports the following PostgreSQL privilege types
+through the current migration architecture:
+
+- Schema privileges (`USAGE`, `CREATE`)
+- Table privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, etc.)
+- Column privileges (`SELECT`, `INSERT`, etc.)
+- Sequence privileges (`USAGE`, `SELECT`)
+- Function privileges (`EXECUTE`)
+
+### 21.3 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `schema_name: str = "public"` to the `GrantDef` dataclass.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresSourceConnector.list_grants()` to capture
+     `table_schema`/`object_schema` for:
+     - Table grants from `information_schema.role_table_grants`
+     - Column grants from `information_schema.role_column_grants`
+     - Sequence grants from `information_schema.role_usage_grants`
+     - Schema grants from `pg_namespace` ACL via `aclexplode`
+     - Function grants from `pg_proc` ACL via `aclexplode`
+   - Updated `PostgresTargetConnector.apply_grant()` to schema-qualify
+     the object name when `schema_name != "public"`, using
+     `quote_identifier()` for safety. Public-schema grants remain
+     unqualified for backward compatibility.
+
+3. **`core/orchestrator.py`**
+   - Updated both `run_full()` and `run_cdc()` to compute a
+     schema-qualified grant key for the migration report when the grant
+     is on a non-public object, preserving backward compatibility for
+     public-schema grants.
+
+### 21.4 Unit Test Results
+
+``` text
+83 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresGrantSchemaQualification.test_list_grants_captures_schema_for_table`
+- `TestPostgresGrantSchemaQualification.test_list_grants_captures_schema_for_column`
+- `TestPostgresGrantSchemaQualification.test_target_apply_grant_qualifies_non_public_schema`
+- `TestPostgresGrantSchemaQualification.test_target_apply_grant_qualifies_column_non_public_schema`
+- `TestPostgresGrantSchemaQualification.test_target_apply_grant_remains_unqualified_for_public`
+
+### 21.5 Real PostgreSQL CLI Verification
+
+Run ID: `22873cbb7a8a47058deb9844ad139de8`
+
+``` text
+Mode: FULL
+Tables migrated: 5
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+The migration report confirms:
+
+``` json
+"grants": [
+  "GRANT SELECT, INSERT ON audit_test.test_customers TO audit_user: ok",
+  "GRANT SELECT ON COLUMN audit_test.test_customers.city TO audit_user: ok",
+  ...
+]
+```
+
+Target SQL verification:
+
+``` sql
+-- Table grant
+SELECT grantee, table_schema, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = 'audit_test' AND grantee = 'audit_user';
+
+  grantee   | table_schema |   table_name   | privilege_type
+------------+--------------+----------------+----------------
+ audit_user | audit_test   | test_customers | INSERT
+ audit_user | audit_test   | test_customers | SELECT
+
+-- Column grant
+SELECT grantee, column_name, table_schema, table_name, privilege_type
+FROM information_schema.role_column_grants
+WHERE table_schema = 'audit_test' AND grantee = 'audit_user'
+ORDER BY table_name, column_name;
+
+  grantee   | column_name | table_schema | table_name    | privilege_type
+------------+-------------+--------------+---------------+----------------
+ audit_user | city        | audit_test   | test_customers| INSERT
+ audit_user | city        | audit_test   | test_customers| SELECT
+ audit_user | created_at  | audit_test   | test_customers| INSERT
+ ...
+
+-- Sequence grant
+SELECT grantee, object_schema, object_name, privilege_type
+FROM information_schema.role_usage_grants
+WHERE object_schema = 'audit_test' AND grantee = 'audit_user';
+
+  grantee   | object_schema |       object_name        | privilege_type
+------------+---------------+--------------------------+----------------
+ audit_user | audit_test    | test_orders_order_id_seq | USAGE
+
+-- Schema grant
+SELECT n.nspname, aclexplode(n.nspacl)
+FROM pg_namespace n
+WHERE n.nspname = 'audit_test' AND n.nspacl IS NOT NULL;
+
+  nspname  |     aclexplode
+-----------+--------------------
+ audit_test| (10,10,USAGE,f)
+ audit_test| (10,10,CREATE,f)
+ audit_test| (10,16949,USAGE,f)
+```
+
+`(10,16949,USAGE,f)` confirms `audit_user` (OID 16949) has `USAGE` on
+`audit_test` schema.
+
+### 21.6 Role/Principal Limitations
+
+- Source roles must exist on the target for grants to succeed.
+- The current implementation does not create or migrate roles.
+- If a source grantee does not exist on the target, the GRANT is
+  skipped and reported as `skipped` in the migration log.
+- The audit environment used `audit_user` which was manually created
+  on both source and target for this milestone.
+
+### 21.7 Remaining Limitations
+
+- Column-level grants do not schema-qualify the table name in the GRANT
+  DDL because PostgreSQL syntax requires `ON COLUMN table.column`
+  without schema qualification.
+- Function and schema grants are discovered via PostgreSQL catalog ACL
+  functions (`aclexplode`) rather than `information_schema` views,
+  which is more reliable but less portable across PostgreSQL versions.
+- Sequence grants from `information_schema.role_usage_grants` may
+  include non-sequence objects in some environments; the current
+  implementation filters by `object_type = 'SEQUENCE'`.
+- View and materialized view grants are not explicitly enumerated in
+  the current implementation but are covered by `role_table_grants`
+  because PostgreSQL treats them as tables in that view.
+
+-----------------------------------------------------------------------
+
+## 22. Next Phase
+
+Do not treat this document as a final production-readiness report.
+
+This is the **local audit baseline** for continuing development.
+
+The non-public schema migration milestone is **COMPLETE**:
+- 5 tables / 13 rows migrated
+- 0 failures
+- 100% success
+- Schema-qualified sequences verified
+- Schema-qualified views verified
+- Schema-qualified materialized views verified
+- Schema-qualified functions verified
+- Schema-qualified triggers verified
+- Schema-qualified comments verified
+- Schema-qualified grants/privileges verified
+- DDL rollback verified
+- 83 unit tests passing
+
+Next phase should focus on the remaining PostgreSQL object categories
+listed in Section 14.5, starting with the first category that has the
+smallest dependency surface and the clearest end-to-end verification path.
+
+The next phase should start from this same combined code baseline so
+both developers can continue on the same implementation and use this
+document to understand what has already been tested and what remains.

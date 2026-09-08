@@ -447,11 +447,16 @@ class MigrationOrchestrator:
             grant_results: list[str] = []
             try:
                 for grant in self._source.list_grants():
+                    grant_key = (
+                        f"{grant.object_name} TO {grant.grantee}"
+                        if grant.schema_name == "public"
+                        else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+                    )
                     try:
                         self._target.apply_grant(grant)
-                        grant_results.append(f"GRANT {grant.privileges} ON {grant.object_name} TO {grant.grantee}: ok")
+                        grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
                     except Exception as exc:
-                        grant_results.append(f"GRANT ... TO {grant.grantee}: skipped ({exc})")
+                        grant_results.append(f"GRANT ... ON {grant_key}: skipped ({exc})")
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results
@@ -996,13 +1001,16 @@ class MigrationOrchestrator:
             grant_results: list[str] = []
             try:
                 for grant in self._source.list_grants():
+                    grant_key = (
+                        f"{grant.object_name} TO {grant.grantee}"
+                        if grant.schema_name == "public"
+                        else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+                    )
                     try:
                         self._target.apply_grant(grant)
-                        grant_results.append(
-                            f"GRANT {grant.privileges} ON {grant.object_name} TO {grant.grantee}: ok"
-                        )
+                        grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
                     except Exception as exc:
-                        grant_results.append(f"GRANT ... TO {grant.grantee}: skipped ({exc})")
+                        grant_results.append(f"GRANT ... ON {grant_key}: skipped ({exc})")
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results

@@ -17,6 +17,7 @@ from core.connectors.base import (
     FunctionDef,
     TriggerDef,
     CommentDef,
+    GrantDef,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -1487,6 +1488,150 @@ class TestPostgresCommentSchemaQualification:
         comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
         assert comment_sql is not None
         assert comment_sql.strip().startswith("COMMENT ON TABLE customers")
+
+
+class TestPostgresGrantSchemaQualification:
+    """
+    Regression: grants on non-public objects must preserve schema
+    information and be applied with correct schema qualification.
+    """
+
+    def test_list_grants_captures_schema_for_table(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [("audit_user", "audit_test", "test_customers", "SELECT, INSERT")],
+            [],
+            [],
+            [],
+            [],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+        by_grantee = {(g.grantee, g.object_name): g for g in grants}
+        assert ("audit_user", "test_customers") in by_grantee
+        assert by_grantee[("audit_user", "test_customers")].schema_name == "audit_test"
+        assert by_grantee[("audit_user", "test_customers")].privileges == "SELECT, INSERT"
+
+    def test_list_grants_captures_schema_for_column(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [],
+            [("audit_user", "audit_test", "test_customers", "email", "SELECT")],
+            [],
+            [],
+            [],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+        by_grantee = {(g.grantee, g.object_name): g for g in grants}
+        assert ("audit_user", "test_customers.email") in by_grantee
+        assert by_grantee[("audit_user", "test_customers.email")].schema_name == "audit_test"
+        assert by_grantee[("audit_user", "test_customers.email")].object_type == "COLUMN"
+
+    def test_target_apply_grant_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="SELECT, INSERT",
+            object_type="TABLE",
+            object_name="test_customers",
+            schema_name="audit_test",
+            grantee="audit_user",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert '"audit_test"."test_customers"' in grant_sql
+        assert "TO audit_user" in grant_sql
+
+    def test_target_apply_grant_qualifies_column_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="SELECT",
+            object_type="COLUMN",
+            object_name="test_customers.email",
+            schema_name="audit_test",
+            grantee="audit_user",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert '"test_customers"."email"' in grant_sql
+        assert "TO audit_user" in grant_sql
+
+    def test_target_apply_grant_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="SELECT",
+            object_type="TABLE",
+            object_name="customers",
+            schema_name="public",
+            grantee="public",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert grant_sql.strip().startswith("GRANT SELECT ON TABLE customers TO public")
 
 
 class TestConfigSchema:

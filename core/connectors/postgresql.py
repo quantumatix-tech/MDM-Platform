@@ -754,40 +754,102 @@ class PostgresSourceConnector(SourceConnector):
             schemas = list(self._include_schemas)
             # Table grants
             cur.execute(
-                "SELECT grantee, table_name, "
+                "SELECT grantee, table_schema, table_name, "
                 "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
                 "FROM information_schema.role_table_grants "
                 "WHERE table_schema = ANY(%s) "
                 "  AND grantee NOT IN ('PUBLIC') "
                 "  AND grantor != grantee "
-                "GROUP BY grantee, table_name "
-                "ORDER BY table_name, grantee",
+                "GROUP BY grantee, table_schema, table_name "
+                "ORDER BY table_schema, table_name, grantee",
                 (schemas,),
             )
             for row in cur.fetchall():
-                grantee, table_name, privs = row
+                grantee, schema_name, table_name, privs = row
                 grants.append(GrantDef(
                     privileges=privs, object_type="TABLE",
-                    object_name=table_name, grantee=grantee,
+                    object_name=table_name, grantee=grantee, schema_name=schema_name,
+                ))
+
+            # Column grants
+            cur.execute(
+                "SELECT grantee, table_schema, table_name, column_name, "
+                "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
+                "FROM information_schema.role_column_grants "
+                "WHERE table_schema = ANY(%s) "
+                "  AND grantee NOT IN ('PUBLIC') "
+                "  AND grantor != grantee "
+                "GROUP BY grantee, table_schema, table_name, column_name "
+                "ORDER BY table_schema, table_name, column_name, grantee",
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                grantee, schema_name, table_name, column_name, privs = row
+                grants.append(GrantDef(
+                    privileges=privs, object_type="COLUMN",
+                    object_name=f"{table_name}.{column_name}", grantee=grantee, schema_name=schema_name,
                 ))
 
             # Sequence grants
             cur.execute(
-                "SELECT grantee, object_name, "
+                "SELECT grantee, object_schema, object_name, "
                 "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
                 "FROM information_schema.role_usage_grants "
                 "WHERE object_schema = ANY(%s) "
                 "  AND object_type = 'SEQUENCE' "
                 "  AND grantee NOT IN ('PUBLIC') "
-                "GROUP BY grantee, object_name "
-                "ORDER BY object_name, grantee",
+                "GROUP BY grantee, object_schema, object_name "
+                "ORDER BY object_schema, object_name, grantee",
                 (schemas,),
             )
             for row in cur.fetchall():
-                grantee, seq_name, privs = row
+                grantee, schema_name, seq_name, privs = row
                 grants.append(GrantDef(
                     privileges=privs, object_type="SEQUENCE",
-                    object_name=seq_name, grantee=grantee,
+                    object_name=seq_name, grantee=grantee, schema_name=schema_name,
+                ))
+
+            # Schema grants
+            cur.execute(
+                "SELECT n.nspname, r.rolname AS grantee, acl.privilege_type "
+                "FROM pg_namespace n "
+                "JOIN aclexplode(n.nspacl) acl ON true "
+                "JOIN pg_roles r ON r.oid = acl.grantee "
+                "WHERE n.nspname = ANY(%s) "
+                "  AND n.nspacl IS NOT NULL "
+                "  AND r.rolname NOT IN ('PUBLIC') "
+                "  AND acl.grantee != (SELECT oid FROM pg_roles WHERE rolname = current_user)",
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                schema_name, grantee, privilege_type = row
+                grants.append(GrantDef(
+                    privileges=privilege_type,
+                    object_type="SCHEMA",
+                    object_name=schema_name, grantee=grantee, schema_name=schema_name,
+                ))
+
+            # Function grants
+            cur.execute(
+                "SELECT n.nspname, p.proname || '(' || "
+                "  pg_get_function_arguments(p.oid) || ')', r.rolname AS grantee, acl.privilege_type "
+                "FROM pg_proc p "
+                "JOIN pg_namespace n ON p.pronamespace = n.oid "
+                "JOIN aclexplode(p.proacl) acl ON true "
+                "JOIN pg_roles r ON r.oid = acl.grantee "
+                "WHERE n.nspname = ANY(%s) "
+                "  AND p.prokind IN ('f', 'p') "
+                "  AND p.proacl IS NOT NULL "
+                "  AND r.rolname NOT IN ('PUBLIC') "
+                "  AND acl.grantee != (SELECT oid FROM pg_roles WHERE rolname = current_user)",
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                schema_name, func_sig, grantee, privilege_type = row
+                grants.append(GrantDef(
+                    privileges=privilege_type,
+                    object_type="FUNCTION",
+                    object_name=func_sig, grantee=grantee, schema_name=schema_name,
                 ))
 
         return grants
@@ -1378,17 +1440,28 @@ class PostgresTargetConnector(TargetConnector):
     def apply_grant(self, grant: GrantDef) -> None:
         with self._conn.cursor() as cur:
             try:
+                if grant.object_type == "SCHEMA":
+                    qualified_name = quote_identifier(grant.schema_name)
+                elif grant.object_type == "COLUMN":
+                    parts = grant.object_name.split(".")
+                    qualified_name = f"{quote_identifier(parts[0])}.{quote_identifier(parts[1])}"
+                elif grant.object_type == "FUNCTION":
+                    qualified_name = f"{quote_identifier(grant.schema_name)}.{grant.object_name}"
+                elif grant.schema_name == "public":
+                    qualified_name = grant.object_name
+                else:
+                    qualified_name = f"{quote_identifier(grant.schema_name)}.{quote_identifier(grant.object_name)}"
                 cur.execute(
                     f"GRANT {grant.privileges} ON {grant.object_type} "
-                    f"{grant.object_name} TO {grant.grantee}"
+                    f"{qualified_name} TO {grant.grantee}"
                 )
                 self._conn.commit()
                 audit_log(phase="apply_grant", status="applied",
-                          details={"object": grant.object_name, "grantee": grant.grantee})
+                          details={"object": qualified_name, "grantee": grant.grantee})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="apply_grant", status="skipped",
-                          details={"object": grant.object_name, "reason": str(exc)})
+                          details={"object": grant.object_name, "grantee": grant.grantee, "reason": str(exc)})
 
     # ------------------------------------------------------------------
     # Misc
