@@ -142,6 +142,7 @@ class ViewDefinition:
     """A regular SQL view."""
     name: str
     definition: str     # raw SELECT definition
+    schema_name: str = "public"
 
 
 @dataclass

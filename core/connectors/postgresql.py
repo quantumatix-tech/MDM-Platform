@@ -558,13 +558,13 @@ class PostgresSourceConnector(SourceConnector):
     def list_views(self) -> list[ViewDefinition]:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT table_name, view_definition "
+                "SELECT table_name, table_schema, view_definition "
                 "FROM information_schema.views "
                 "WHERE table_schema = ANY(%s) "
                 "ORDER BY table_name",
                 (list(self._include_schemas),),
             )
-            return [ViewDefinition(name=row[0], definition=row[1]) for row in cur.fetchall()]
+            return [ViewDefinition(name=row[0], schema_name=row[1], definition=row[2]) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Materialized Views (Phase 12)
@@ -1211,9 +1211,13 @@ class PostgresTargetConnector(TargetConnector):
 
     def create_view(self, view: ViewDefinition) -> None:
         validate_identifier(view.name, "view")
+        view_name = (
+            view.name if view.schema_name == "public"
+            else f"{quote_identifier(view.schema_name)}.{quote_identifier(view.name)}"
+        )
         with self._conn.cursor() as cur:
             try:
-                cur.execute(f"CREATE OR REPLACE VIEW {view.name} AS {view.definition}")
+                cur.execute(f"CREATE OR REPLACE VIEW {view_name} AS {view.definition}")
                 self._conn.commit()
                 audit_log(phase="create_view", status="created", details={"view": view.name})
             except Exception as exc:

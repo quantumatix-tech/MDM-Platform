@@ -9,6 +9,11 @@ from core.connectors.base import (
     CDCEngine,
     Schema,
     Column,
+    Index,
+    ForeignKey,
+    CheckConstraint,
+    ViewDefinition,
+    MaterializedViewDef,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -977,6 +982,92 @@ class TestPostgresCreateObjectTransactionIsolation:
         target.create_object_if_missing(schema)
         conn.commit.assert_called()
         conn.rollback.assert_not_called()
+
+
+class TestPostgresViewSchemaQualification:
+    """
+    Regression: views in non-public schemas must be discovered with
+    their schema and created in the correct target schema.  Previously
+    the source connector dropped the schema and the target emitted
+    CREATE VIEW view_name (always public), causing the view to be
+    created in the wrong schema or fail.
+    """
+
+    def test_list_views_captures_schema_name(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("customer_summary", "public", "SELECT * FROM customers"),
+            ("order_summary", "audit_test", "SELECT * FROM test_orders"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        views = connector.list_views()
+        by_name = {v.name: v for v in views}
+        assert "order_summary" in by_name
+        assert by_name["order_summary"].schema_name == "audit_test"
+        assert by_name["customer_summary"].schema_name == "public"
+
+    def test_target_create_view_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        view = ViewDefinition(
+            name="order_summary",
+            schema_name="audit_test",
+            definition="SELECT * FROM test_orders",
+        )
+        target.create_view(view)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE OR REPLACE VIEW" in s), None)
+        assert create_sql is not None
+        assert '"audit_test"' in create_sql
+        assert '"order_summary"' in create_sql
+        assert create_sql.index('"audit_test"') < create_sql.index('"order_summary"')
+
+    def test_target_create_view_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        view = ViewDefinition(
+            name="customer_summary",
+            schema_name="public",
+            definition="SELECT * FROM customers",
+        )
+        target.create_view(view)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE OR REPLACE VIEW" in s), None)
+        assert create_sql is not None
+        assert create_sql.strip().startswith("CREATE OR REPLACE VIEW customer_summary")
 
 
 class TestConfigSchema:

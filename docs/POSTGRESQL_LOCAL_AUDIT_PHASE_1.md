@@ -564,7 +564,6 @@ Key regression tests added:
 The following areas are **NOT** part of this milestone and remain
 pending for a subsequent phase:
 
-- Views
 - Materialized views
 - Functions / procedures
 - Triggers
@@ -583,7 +582,90 @@ the completed schema-qualification milestone.
 
 -----------------------------------------------------------------------
 
-## 15. Next Phase
+## 15. Completed PostgreSQL Views Schema Qualification Milestone
+
+This section documents the completed PostgreSQL views schema
+qualification milestone on the `feature/postgresql-objects` branch.
+
+### 15.1 Root Cause
+
+The `ViewDefinition` dataclass had no `schema_name` field. As a result:
+
+1. `PostgresSourceConnector.list_views()` queried only `table_name` and
+   `view_definition` from `information_schema.views`, dropping the
+   `table_schema` value.
+2. `PostgresTargetConnector.create_view()` always emitted
+   `CREATE VIEW view_name AS ...` without schema qualification.
+3. Views in non-public schemas (e.g. `audit_test.order_summary`) were
+   therefore created in the target's `public` schema or failed if the
+   view referenced non-existent tables in `public`.
+
+### 15.2 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `schema_name: str = "public"` to the `ViewDefinition`
+     dataclass.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresSourceConnector.list_views()` to select
+     `table_schema` from `information_schema.views` and populate
+     `ViewDefinition.schema_name`.
+   - Updated `PostgresTargetConnector.create_view()` to emit a
+     schema-qualified `CREATE VIEW` when `view.schema_name != "public"`,
+     using `quote_identifier()` for safety.
+   - Public-schema views remain unqualified for backward compatibility.
+
+### 15.3 Unit Test Results
+
+``` text
+63 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresViewSchemaQualification.test_list_views_captures_schema_name`
+- `TestPostgresViewSchemaQualification.test_target_create_view_qualifies_non_public_schema`
+- `TestPostgresViewSchemaQualification.test_target_create_view_remains_unqualified_for_public`
+
+### 15.4 Real PostgreSQL CLI Verification
+
+Run ID: `2a994975c33248d0bd2b5ec145dd8dfe`
+
+``` text
+Mode: FULL
+Tables migrated: 5
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+The migration report confirms:
+
+``` json
+"views": {
+  "order_summary": "created"
+}
+```
+
+Target SQL verification:
+
+``` sql
+SELECT table_name, table_schema
+FROM information_schema.views
+WHERE table_schema = 'audit_test';
+
+  table_name   | table_schema
+---------------+--------------
+ order_summary | audit_test
+```
+
+`audit_test.order_summary` was created in the correct non-public schema
+and is queryable.
+
+-----------------------------------------------------------------------
+
+## 16. Next Phase
 
 Do not treat this document as a final production-readiness report.
 
@@ -594,8 +676,9 @@ The non-public schema migration milestone is **COMPLETE**:
 - 0 failures
 - 100% success
 - Schema-qualified sequences verified
+- Schema-qualified views verified
 - DDL rollback verified
-- 60 unit tests passing
+- 63 unit tests passing
 
 Next phase should focus on the remaining PostgreSQL object categories
 listed in Section 14.5, starting with the first category that has the
