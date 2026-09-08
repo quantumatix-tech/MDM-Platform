@@ -1735,6 +1735,121 @@ class TestPostgresRLSSchemaQualification:
         assert create_sql.strip().startswith("CREATE POLICY public_policy ON customers")
 
 
+class TestPostgresCrossSchemaForeignKey:
+    """
+    Regression: foreign keys referencing tables in non-public schemas
+    must preserve the referenced schema and generate schema-qualified
+    REFERENCES DDL.
+    """
+
+    def test_apply_constraints_generates_cross_schema_fk_ddl(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="fk_child",
+            schema_name="audit_test",
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_child_to_public_customers",
+                    columns=["parent_id"],
+                    ref_table="customers",
+                    ref_columns=["customer_id"],
+                    ref_schema="public",
+                    on_delete="CASCADE",
+                    on_update="CASCADE",
+                )
+            ],
+        )
+        target.apply_constraints(schema)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        fk_sql = next((s for s in executed if "FOREIGN KEY" in s), None)
+        assert fk_sql is not None
+        assert "REFERENCES customers" in fk_sql
+        assert "ON DELETE CASCADE ON UPDATE CASCADE" in fk_sql
+
+    def test_apply_constraints_generates_non_public_to_non_public_fk_ddl(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="fk_child",
+            schema_name="audit_test",
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_child_to_audit_parent",
+                    columns=["parent_id"],
+                    ref_table="fk_parent",
+                    ref_columns=["id"],
+                    ref_schema="audit_test",
+                    on_delete="NO ACTION",
+                    on_update="NO ACTION",
+                )
+            ],
+        )
+        target.apply_constraints(schema)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        fk_sql = next((s for s in executed if "FOREIGN KEY" in s), None)
+        assert fk_sql is not None
+        assert '"audit_test"."fk_parent"' in fk_sql
+
+    def test_apply_constraints_generates_non_public_to_public_fk_ddl(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="fk_child",
+            schema_name="audit_test",
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_child_to_public_parent",
+                    columns=["parent_id"],
+                    ref_table="public_parent",
+                    ref_columns=["id"],
+                    ref_schema="public",
+                    on_delete="SET NULL",
+                    on_update="RESTRICT",
+                )
+            ],
+        )
+        target.apply_constraints(schema)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        fk_sql = next((s for s in executed if "FOREIGN KEY" in s), None)
+        assert fk_sql is not None
+        assert "REFERENCES public_parent" in fk_sql
+        assert "ON DELETE SET NULL ON UPDATE RESTRICT" in fk_sql
+
+
 class TestConfigSchema:
     def test_schema_yaml_is_valid(self):
         import yaml

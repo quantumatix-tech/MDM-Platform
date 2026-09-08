@@ -1601,8 +1601,175 @@ The non-public schema migration milestone is **COMPLETE**:
 - Schema-qualified comments verified
 - Schema-qualified grants/privileges verified
 - Schema-qualified RLS/policies verified
+- Cross-schema foreign keys verified
 - DDL rollback verified
-- 86 unit tests passing
+- 89 unit tests passing
+
+-----------------------------------------------------------------------
+
+## 23. Completed Cross-Schema Foreign Key / Dependency Handling Milestone
+
+This section documents the completed cross-schema foreign key schema
+qualification milestone on the `feature/postgresql-objects` branch.
+
+### 23.1 Root Cause
+
+The `ForeignKey` dataclass had no `ref_schema` field. As a result:
+
+1. `PostgresSourceConnector.get_schema()` queried
+   `information_schema.table_constraints` joined with
+   `information_schema.constraint_column_usage`, but only selected
+   `ccu.table_name AS ref_table`, dropping the `ccu.table_schema` value.
+2. `PostgresTargetConnector.apply_constraints()` executed
+   `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (...) REFERENCES
+   {fk.ref_table} (...)` without schema qualification, which fails for
+   non-public referenced schemas because PostgreSQL cannot resolve the
+   table without schema qualification.
+3. Foreign keys referencing tables in non-public schemas were therefore
+   not properly tracked, and the constraint DDL would fail if the
+   referenced table was in a non-public schema.
+
+### 23.2 Supported FK Configurations
+
+The implementation supports the following foreign key configurations:
+
+- Same-schema FKs (public → public)
+- Non-public → public cross-schema FKs
+- Non-public → non-public cross-schema FKs
+- Public → non-public FKs (schema-qualified discovery preserves the
+  referenced schema)
+
+All FK properties are preserved:
+- Constraint name
+- Referencing schema/table
+- Referencing column(s)
+- Referenced schema/table
+- Referenced column(s)
+- ON DELETE behavior
+- ON UPDATE behavior
+
+### 23.3 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `ref_schema: str = "public"` to the `ForeignKey` dataclass.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresSourceConnector.get_schema()` to select
+     `ccu.table_schema AS ref_schema` in the foreign key discovery
+     query and populate `ForeignKey.ref_schema`.
+   - Updated `PostgresTargetConnector.apply_constraints()` to
+     schema-qualify the referenced table name when `ref_schema !=
+     "public"`, using `quote_identifier()` for safety. Public-schema
+     referenced tables remain unqualified for backward compatibility.
+
+### 23.4 Unit Test Results
+
+``` text
+89 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresCrossSchemaForeignKey.test_apply_constraints_generates_cross_schema_fk_ddl`
+- `TestPostgresCrossSchemaForeignKey.test_apply_constraints_generates_non_public_to_non_public_fk_ddl`
+- `TestPostgresCrossSchemaForeignKey.test_apply_constraints_generates_non_public_to_public_fk_ddl`
+
+### 23.5 Real PostgreSQL CLI Verification
+
+Run ID: `73ab4f7af6354bda9205d5f3b5c775ff`
+
+``` text
+Mode: FULL
+Tables migrated: 7
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+The migration report confirms:
+
+``` json
+"create_fk": {"table": "fk_child", "fk": "fk_child_to_public_customers", "ref_table": "customers"}
+```
+
+### 23.6 SQL Verification
+
+Source FK definition:
+
+``` sql
+SELECT tc.constraint_name, kcu.column_name, ccu.table_schema, ccu.table_name AS ref_table,
+       ccu.column_name AS ref_col, rc.delete_rule, rc.update_rule
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+JOIN information_schema.referential_constraints rc ON tc.constraint_name = rc.constraint_name
+JOIN information_schema.constraint_column_usage ccu ON rc.unique_constraint_name = ccu.constraint_name
+WHERE tc.table_schema = 'audit_test' AND tc.table_name = 'fk_child'
+  AND tc.constraint_type = 'FOREIGN KEY';
+
+  constraint_name              | column_name | table_schema | ref_table | ref_col | delete_rule | update_rule
+-------------------------------+-------------+--------------+-----------+---------+-------------+-------------
+ fk_child_to_public_customers  | parent_id   | public       | customers | customer_id | CASCADE     | CASCADE
+```
+
+Target FK definition:
+
+``` sql
+SELECT tc.constraint_name, kcu.column_name, ccu.table_schema, ccu.table_name AS ref_table,
+       ccu.column_name AS ref_col, rc.delete_rule, rc.update_rule
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+JOIN information_schema.referential_constraints rc ON tc.constraint_name = rc.constraint_name
+JOIN information_schema.constraint_column_usage ccu ON rc.unique_constraint_name = ccu.constraint_name
+WHERE tc.table_schema = 'audit_test' AND tc.table_name = 'fk_child'
+  AND tc.constraint_type = 'FOREIGN KEY';
+
+  constraint_name              | column_name | table_schema | ref_table | ref_col | delete_rule | update_rule
+-------------------------------+-------------+--------------+-----------+---------+-------------+-------------
+ fk_child_to_public_customers  | parent_id   | public       | customers | customer_id | CASCADE     | CASCADE
+```
+
+Source and target FK definitions match exactly.
+
+### 23.7 Schemas Tested
+
+- `audit_test.fk_child` → `public.customers` (cross-schema, tested)
+- `audit_test.fk_child` → `audit_test.fk_parent` (same non-public schema, unit tested)
+- `public.orders` → `public.customers` (same public schema, pre-existing)
+
+### 23.8 Remaining Limitations
+
+- Cross-schema FK validation is not explicitly tested end-to-end with
+  actual referential data; the current test uses empty tables.
+- Circular cross-schema dependencies are not specifically addressed by
+  this milestone; the existing constraint phase runs after all tables
+  are created, which handles most ordering issues.
+- Deferrable FK options are preserved if present in the source catalog
+  but are not explicitly tested for cross-schema cases.
+
+-----------------------------------------------------------------------
+
+## 24. Next Phase
+
+Do not treat this document as a final production-readiness report.
+
+This is the **local audit baseline** for continuing development.
+
+The non-public schema migration milestone is **COMPLETE**:
+- 5 tables / 13 rows migrated
+- 0 failures
+- 100% success
+- Schema-qualified sequences verified
+- Schema-qualified views verified
+- Schema-qualified materialized views verified
+- Schema-qualified functions verified
+- Schema-qualified triggers verified
+- Schema-qualified comments verified
+- Schema-qualified grants/privileges verified
+- Schema-qualified RLS/policies verified
+- Cross-schema foreign keys verified
+- DDL rollback verified
+- 89 unit tests passing
 
 Next phase should focus on the remaining PostgreSQL object categories
 listed in Section 14.5, starting with the first category that has the

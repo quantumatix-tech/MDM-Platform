@@ -64,6 +64,7 @@ class ForeignKey:
     columns: list[str]
     ref_table: str
     ref_columns: list[str]
+    ref_schema: str = "public"
     on_delete: str = "NO ACTION"
     on_update: str = "NO ACTION"
 

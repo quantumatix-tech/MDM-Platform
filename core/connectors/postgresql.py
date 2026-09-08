@@ -300,7 +300,7 @@ class PostgresSourceConnector(SourceConnector):
             # --- Foreign Keys ---
             cur.execute(
                 "SELECT tc.constraint_name, kcu.column_name, "
-                "ccu.table_name AS ref_table, ccu.column_name AS ref_col, "
+                "ccu.table_schema AS ref_schema, ccu.table_name AS ref_table, ccu.column_name AS ref_col, "
                 "rc.delete_rule, rc.update_rule "
                 "FROM information_schema.table_constraints tc "
                 "JOIN information_schema.key_column_usage kcu "
@@ -314,11 +314,12 @@ class PostgresSourceConnector(SourceConnector):
             )
             fk_map: dict[str, ForeignKey] = {}
             for row in cur.fetchall():
-                fk_name, col, ref_table, ref_col, on_delete, on_update = row
+                fk_name, col, ref_schema, ref_table, ref_col, on_delete, on_update = row
                 if fk_name not in fk_map:
                     fk_map[fk_name] = ForeignKey(
                         name=fk_name, columns=[], ref_table=ref_table,
-                        ref_columns=[], on_delete=on_delete, on_update=on_update,
+                        ref_columns=[], ref_schema=ref_schema,
+                        on_delete=on_delete, on_update=on_update,
                     )
                 fk_map[fk_name].columns.append(col)
                 fk_map[fk_name].ref_columns.append(ref_col)
@@ -1218,17 +1219,21 @@ class PostgresTargetConnector(TargetConnector):
             for fk in schema.foreign_keys:
                 col_list = ", ".join(fk.columns)
                 ref_col_list = ", ".join(fk.ref_columns)
+                ref_table_qname = (
+                    fk.ref_table if fk.ref_schema == "public"
+                    else f"{quote_identifier(fk.ref_schema)}.{quote_identifier(fk.ref_table)}"
+                )
                 try:
                     cur.execute(
                         f"ALTER TABLE {table_qname} "
                         f"ADD CONSTRAINT {fk.name} "
                         f"FOREIGN KEY ({col_list}) "
-                        f"REFERENCES {fk.ref_table} ({ref_col_list}) "
+                        f"REFERENCES {ref_table_qname} ({ref_col_list}) "
                         f"ON DELETE {fk.on_delete} ON UPDATE {fk.on_update}"
                     )
                     self._conn.commit()
                     audit_log(phase="create_fk", status="created",
-                              details={"table": schema.name, "fk": fk.name, "ref_table": fk.ref_table})
+                              details={"table": schema.name, "fk": fk.name, "ref_table": ref_table_qname})
                 except Exception as exc:
                     self._conn.rollback()
                     audit_log(phase="create_fk", status="skipped",
