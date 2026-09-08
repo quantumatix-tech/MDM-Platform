@@ -1403,7 +1403,187 @@ WHERE n.nspname = 'audit_test' AND n.nspacl IS NOT NULL;
 
 -----------------------------------------------------------------------
 
-## 22. Next Phase
+## 22. Completed PostgreSQL Row Level Security / Policies Milestone
+
+This section documents the completed PostgreSQL row level security
+policies schema qualification milestone on the
+`feature/postgresql-objects` branch.
+
+### 22.1 Root Cause
+
+The `RLSPolicy` dataclass had no `schema_name` field. As a result:
+
+1. `PostgresSourceConnector.get_rls_policies()` queried `pg_policy`
+   joined with `pg_class` and `pg_namespace`, filtering by
+   `n.nspname = ANY(%s)` (which respects `include_schemas`), but
+   dropped the `n.nspname` value from the result set.
+2. `PostgresTargetConnector.apply_rls_policy()` executed
+   `ALTER TABLE {table} ENABLE ROW LEVEL SECURITY` and
+   `CREATE POLICY {name} ON {table}` without schema qualification,
+   which fails for non-public schemas because PostgreSQL cannot
+   resolve the table without schema qualification.
+3. The orchestrator reported policies by bare `table` name without
+   schema qualification.
+4. Policies on non-public tables (e.g. `audit_test.test_customers`)
+   were therefore not properly tracked, and the DDL statements would
+   fail if the table was in a non-public schema.
+
+### 22.2 Supported RLS/Policy Properties
+
+The implementation supports the following PostgreSQL RLS/policy
+properties through the current migration architecture:
+
+- RLS enabled state (`relrowsecurity`)
+- Policy name
+- Policy command (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `ALL`)
+- Permissive/restrictive behavior
+- USING expression
+- WITH CHECK expression
+- Schema-qualified target table
+
+### 22.3 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `schema_name: str = "public"` to the `RLSPolicy` dataclass.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresSourceConnector.get_rls_policies()` to select
+     `n.nspname` and populate `RLSPolicy.schema_name`.
+   - Updated `PostgresTargetConnector.apply_rls_policy()` to
+     schema-qualify the table name when `schema_name != "public"`,
+     using `quote_identifier()` for safety. Public-schema tables
+     remain unqualified for backward compatibility.
+
+3. **`core/orchestrator.py`**
+   - Updated both `run_full()` and `run_cdc()` to pass
+     `schema_name=schema.schema_name` to `get_rls_policies()`.
+
+### 22.4 Unit Test Results
+
+``` text
+86 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresRLSSchemaQualification.test_get_rls_policies_captures_schema`
+- `TestPostgresRLSSchemaQualification.test_target_apply_rls_policy_qualifies_non_public_schema`
+- `TestPostgresRLSSchemaQualification.test_target_apply_rls_policy_remains_unqualified_for_public`
+
+### 22.5 Real PostgreSQL CLI Verification
+
+Run ID: `65e3b49d188144be955880da98d69f3c`
+
+``` text
+Mode: FULL
+Tables migrated: 5
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+The migration report confirms:
+
+``` json
+"create_rls_policy": {"table": "\"audit_test\".\"test_customers\"", "policy": "test_customer_policy"}
+```
+
+Target SQL verification:
+
+``` sql
+-- RLS enabled state
+SELECT c.relname, n.nspname, c.relrowsecurity, c.relforcerowsecurity
+FROM pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname = 'audit_test' AND c.relname = 'test_customers';
+
+  relname     | nspname   | relrowsecurity | relforcerowsecurity
+-------------+-----------+-----------------+---------------------
+ test_customers | audit_test | t               | f
+
+-- Policy definition
+SELECT pol.polname, n.nspname,
+  CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT'
+    WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE' ELSE 'ALL' END AS cmd,
+  CASE pol.polpermissive WHEN true THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END AS permissive,
+  pg_get_expr(pol.polqual, pol.polrelid) AS using_expr,
+  pg_get_expr(pol.polwithcheck, pol.polrelid) AS check_expr
+FROM pg_policy pol
+JOIN pg_class c ON c.oid = pol.polrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'audit_test' AND c.relname = 'test_customers';
+
+  polname              | nspname   | cmd   | permissive | using_expr | check_expr
+-----------------------+-----------+-------+------------+------------+------------
+ test_customer_policy  | audit_test | SELECT | PERMISSIVE | true       |
+```
+
+### 22.6 Behavioral RLS Verification
+
+Test role: `audit_user` (manually created on source and target)
+
+``` sql
+-- Allowed operation: permissive policy USING (true) allows all rows
+SET search_path TO audit_test, public;
+SELECT * FROM test_customers;
+
+ customer_id |    full_name    |      email       |  city  |         created_at
+-------------+-----------------+------------------+--------+----------------------------
+         100 | Object Test One | object1@test.com | Indore | 2026-09-03 18:09:13.812237
+         101 | Object Test Two | object2@test.com | Bhopal | 2026-09-03 18:09:13.812237
+(2 rows)
+```
+
+Restricted operation verification (temporary test policy):
+
+``` sql
+-- As superuser: add temporary RESTRICTIVE policy
+CREATE POLICY temp_restrictive_policy ON audit_test.test_customers
+  AS RESTRICTIVE FOR SELECT USING (false);
+
+-- As audit_user: rows are now restricted
+SET search_path TO audit_test, public;
+SELECT * FROM test_customers;
+(0 rows)
+
+-- As superuser: remove temporary policy
+DROP POLICY temp_restrictive_policy ON audit_test.test_customers;
+
+-- As audit_user: rows visible again
+SET search_path TO audit_test, public;
+SELECT * FROM test_customers;
+
+ customer_id |    full_name    |      email       |  city  |         created_at
+-------------+-----------------+------------------+--------+----------------------------
+         100 | Object Test One | object1@test.com | Indore | 2026-09-03 18:09:13.812237
+         101 | Object Test Two | object2@test.com | Bhopal | 2026-09-03 18:09:13.812237
+(2 rows)
+```
+
+### 22.7 Role/Principal Limitations
+
+- Source roles must exist on the target for RLS policies to function.
+- The current implementation does not create or migrate roles.
+- If a policy references a role that does not exist on the target,
+  the policy is still created, but enforcement behavior depends on
+  PostgreSQL role resolution.
+- The audit environment used `audit_user` which was manually created
+  on both source and target for behavioral verification.
+
+### 22.8 Remaining Limitations
+
+- RLS policies on views and materialized views are not explicitly
+  tested; PostgreSQL supports RLS on views in newer versions but the
+  current implementation discovers policies only for base tables.
+- `relforcerowsecurity` is not explicitly migrated; policies are
+  created in their default state.
+- Policy roles (`polroles`) are not explicitly migrated; policies
+  apply to all roles by default unless restricted.
+
+-----------------------------------------------------------------------
+
+## 23. Next Phase
 
 Do not treat this document as a final production-readiness report.
 
@@ -1420,8 +1600,9 @@ The non-public schema migration milestone is **COMPLETE**:
 - Schema-qualified triggers verified
 - Schema-qualified comments verified
 - Schema-qualified grants/privileges verified
+- Schema-qualified RLS/policies verified
 - DDL rollback verified
-- 83 unit tests passing
+- 86 unit tests passing
 
 Next phase should focus on the remaining PostgreSQL object categories
 listed in Section 14.5, starting with the first category that has the

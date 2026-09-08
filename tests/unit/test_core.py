@@ -18,6 +18,7 @@ from core.connectors.base import (
     TriggerDef,
     CommentDef,
     GrantDef,
+    RLSPolicy,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -1632,6 +1633,106 @@ class TestPostgresGrantSchemaQualification:
         grant_sql = next((s for s in executed if "GRANT" in s), None)
         assert grant_sql is not None
         assert grant_sql.strip().startswith("GRANT SELECT ON TABLE customers TO public")
+
+
+class TestPostgresRLSSchemaQualification:
+    """
+    Regression: RLS policies on non-public tables must preserve schema
+    information and be applied with correct schema qualification.
+    """
+
+    def test_get_rls_policies_captures_schema(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("test_customer_policy", "SELECT", "PERMISSIVE", "true", None, "audit_test"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        policies = connector.get_rls_policies("test_customers")
+        assert len(policies) == 1
+        assert policies[0].schema_name == "audit_test"
+        assert policies[0].table == "test_customers"
+        assert policies[0].cmd == "SELECT"
+        assert policies[0].permissive == "PERMISSIVE"
+        assert policies[0].using_expr == "true"
+        assert policies[0].check_expr is None
+
+    def test_target_apply_rls_policy_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        policy = RLSPolicy(
+            name="test_customer_policy",
+            table="test_customers",
+            schema_name="audit_test",
+            cmd="SELECT",
+            permissive="PERMISSIVE",
+            using_expr="true",
+        )
+        target.apply_rls_policy(policy)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER TABLE" in s), None)
+        assert alter_sql is not None
+        assert '"audit_test"."test_customers"' in alter_sql
+
+        create_sql = next((s for s in executed if "CREATE POLICY" in s), None)
+        assert create_sql is not None
+        assert '"audit_test"."test_customers"' in create_sql
+        assert "AS PERMISSIVE FOR SELECT" in create_sql
+        assert "USING (true)" in create_sql
+
+    def test_target_apply_rls_policy_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        policy = RLSPolicy(
+            name="public_policy",
+            table="customers",
+            schema_name="public",
+            cmd="ALL",
+            permissive="RESTRICTIVE",
+            using_expr="false",
+            check_expr="true",
+        )
+        target.apply_rls_policy(policy)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER TABLE" in s), None)
+        assert alter_sql is not None
+        assert alter_sql.strip().startswith("ALTER TABLE customers ENABLE ROW LEVEL SECURITY")
+
+        create_sql = next((s for s in executed if "CREATE POLICY" in s), None)
+        assert create_sql is not None
+        assert create_sql.strip().startswith("CREATE POLICY public_policy ON customers")
 
 
 class TestConfigSchema:

@@ -181,6 +181,7 @@ class RLSPolicy:
     permissive: str     # PERMISSIVE or RESTRICTIVE
     using_expr: str | None = None
     check_expr: str | None = None
+    schema_name: str = "public"
 
 
 @dataclass
@@ -322,7 +323,7 @@ class SourceConnector(abc.ABC):
     def get_all_triggers(self) -> list[TriggerDef]:
         return []
 
-    def get_rls_policies(self, table: str) -> list[RLSPolicy]:
+    def get_rls_policies(self, table: str, schema_name: str | None = None) -> list[RLSPolicy]:
         return []
 
     def list_comments(self) -> list[CommentDef]:

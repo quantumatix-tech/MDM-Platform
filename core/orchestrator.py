@@ -316,7 +316,7 @@ class MigrationOrchestrator:
                 for obj_name, schema in all_schemas.items():
                     if schema.rls_enabled:
                         rls_results[obj_name] = []
-                        for policy in self._source.get_rls_policies(obj_name):
+                        for policy in self._source.get_rls_policies(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None):
                             try:
                                 self._target.apply_rls_policy(policy)
                                 rls_results[obj_name].append(f"{policy.name}: created")
@@ -877,7 +877,7 @@ class MigrationOrchestrator:
                 for obj_name, schema in all_schemas.items():
                     if schema.rls_enabled:
                         rls_results[obj_name] = []
-                        for policy in self._source.get_rls_policies(obj_name):
+                        for policy in self._source.get_rls_policies(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None):
                             try:
                                 self._target.apply_rls_policy(policy)
                                 rls_results[obj_name].append(f"{policy.name}: created")

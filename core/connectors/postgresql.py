@@ -639,7 +639,7 @@ class PostgresSourceConnector(SourceConnector):
     # Row-Level Security (Phase 9)
     # ------------------------------------------------------------------
 
-    def get_rls_policies(self, table: str) -> list[RLSPolicy]:
+    def get_rls_policies(self, table: str, schema_name: str | None = None) -> list[RLSPolicy]:
         policies: list[RLSPolicy] = []
         with self._conn.cursor() as cur:
             cur.execute(
@@ -650,7 +650,8 @@ class PostgresSourceConnector(SourceConnector):
                 "    ELSE 'ALL' END AS cmd, "
                 "  CASE pol.polpermissive WHEN true THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END, "
                 "  pg_get_expr(pol.polqual, pol.polrelid) AS using_expr, "
-                "  pg_get_expr(pol.polwithcheck, pol.polrelid) AS check_expr "
+                "  pg_get_expr(pol.polwithcheck, pol.polrelid) AS check_expr, "
+                "  n.nspname "
                 "FROM pg_policy pol "
                 "JOIN pg_class c ON c.oid = pol.polrelid "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -658,12 +659,13 @@ class PostgresSourceConnector(SourceConnector):
                 (list(self._include_schemas), table),
             )
             for row in cur.fetchall():
-                pol_name, cmd, permissive, using_expr, check_expr = row
+                pol_name, cmd, permissive, using_expr, check_expr, nspname = row
                 policies.append(RLSPolicy(
                     name=pol_name, table=table, cmd=cmd,
                     permissive=permissive,
                     using_expr=using_expr,
                     check_expr=check_expr,
+                    schema_name=nspname or schema_name or "public",
                 ))
         return policies
 
@@ -1238,9 +1240,13 @@ class PostgresTargetConnector(TargetConnector):
 
     def apply_rls_policy(self, policy: RLSPolicy) -> None:
         validate_identifier(policy.table, "table")
+        table_qname = (
+            policy.table if policy.schema_name == "public"
+            else f"{quote_identifier(policy.schema_name)}.{quote_identifier(policy.table)}"
+        )
         with self._conn.cursor() as cur:
             try:
-                cur.execute(f"ALTER TABLE {policy.table} ENABLE ROW LEVEL SECURITY")
+                cur.execute(f"ALTER TABLE {table_qname} ENABLE ROW LEVEL SECURITY")
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -1249,13 +1255,13 @@ class PostgresTargetConnector(TargetConnector):
                 using_clause = f" USING ({policy.using_expr})" if policy.using_expr else ""
                 check_clause = f" WITH CHECK ({policy.check_expr})" if policy.check_expr else ""
                 cur.execute(
-                    f"CREATE POLICY {policy.name} ON {policy.table} "
+                    f"CREATE POLICY {policy.name} ON {table_qname} "
                     f"AS {policy.permissive} FOR {policy.cmd}"
                     f"{using_clause}{check_clause}"
                 )
                 self._conn.commit()
                 audit_log(phase="create_rls_policy", status="created",
-                          details={"table": policy.table, "policy": policy.name})
+                          details={"table": table_qname, "policy": policy.name})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_rls_policy", status="skipped",
