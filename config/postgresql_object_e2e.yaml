@@ -1,0 +1,44 @@
+source:
+  engine: postgresql
+  connection:
+    host: 127.0.0.1
+    port: 55432
+    database: migration_source
+    username: postgres
+    password_secret: source_db_pass
+    ssl: false
+
+target:
+  engine: postgresql
+  connection:
+    host: 127.0.0.1
+    port: 55432
+    database: migration_target
+    username: postgres
+    password_secret: target_db_pass
+    ssl: false
+
+migration:
+  mode: full
+  batch_size: 1000
+  include_schemas:
+    - public
+    - audit_test
+
+retry:
+  max_retries: 3
+  base_delay_seconds: 1.0
+  max_delay_seconds: 30.0
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO
