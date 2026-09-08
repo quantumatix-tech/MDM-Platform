@@ -793,8 +793,159 @@ The non-public schema migration milestone is **COMPLETE**:
 - Schema-qualified sequences verified
 - Schema-qualified views verified
 - Schema-qualified materialized views verified
+- Schema-qualified functions verified
 - DDL rollback verified
-- 66 unit tests passing
+- 69 unit tests passing
+
+-----------------------------------------------------------------------
+
+## 18. Completed PostgreSQL Functions/Procedures Schema Qualification Milestone
+
+This section documents the completed PostgreSQL functions/procedures schema
+qualification milestone on the `feature/postgresql-objects` branch.
+
+### 18.1 Root Cause
+
+The `FunctionDef` dataclass had no `schema_name` field. As a result:
+
+1. `PostgresSourceConnector.list_functions()` queried `pg_proc` joined with
+   `pg_namespace` filtering by `n.nspname = ANY(%s)` (which respects
+   `include_schemas`), but only selected `p.proname` and
+   `pg_get_functiondef(p.oid)`, dropping the `n.nspname` value.
+2. `PostgresTargetConnector.create_function()` executed the raw DDL from
+   `pg_get_functiondef`, which includes the schema-qualified function name
+   (e.g. `CREATE OR REPLACE FUNCTION audit_test.get_customer_count()`).
+   However, the orchestrator had no way to track or report functions by
+   schema because `FunctionDef` lacked `schema_name`, and the audit log
+   only recorded the bare function name.
+3. Functions in non-public schemas (e.g. `audit_test.get_customer_count()`)
+   were therefore created correctly by accident because `pg_get_functiondef`
+   preserves the schema in the DDL, but discovery, reporting, and schema
+   tracking were incomplete.
+
+### 18.2 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `schema_name: str = "public"` to the `FunctionDef` dataclass.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresSourceConnector.list_functions()` to select
+     `n.nspname` from `pg_namespace` and populate `FunctionDef.schema_name`.
+   - Updated `PostgresTargetConnector.create_function()` to validate the
+     function identifier, compute a schema-qualified name for audit logging
+     when the function is in a non-public schema, and log the qualified
+     name in audit events.
+
+3. **`core/orchestrator.py`**
+   - Updated both `run_full()` and `run_cdc()` to compute a schema-qualified
+     function key for the migration report when the function is in a
+     non-public schema, preserving backward compatibility for public-schema
+     functions.
+
+### 18.3 Unit Test Results
+
+``` text
+69 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresFunctionSchemaQualification.test_list_functions_captures_schema_name`
+- `TestPostgresFunctionSchemaQualification.test_target_create_function_qualifies_non_public_schema`
+- `TestPostgresFunctionSchemaQualification.test_target_create_function_remains_unqualified_for_public`
+
+### 18.4 Real PostgreSQL CLI Verification
+
+Run ID: `68e2cefb85c14e2eb985c408349725fd`
+
+``` text
+Mode: FULL
+Tables migrated: 5
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+The migration report confirms:
+
+``` json
+"functions": {
+  "audit_test.get_customer_count": "created",
+  "audit_test.update_customer_timestamp": "created"
+}
+```
+
+Target SQL verification:
+
+``` sql
+SELECT p.proname, n.nspname, pg_get_function_identity_arguments(p.oid) AS args, pg_get_function_result(p.oid) AS result_type, p.prokind
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE n.nspname IN ('public', 'audit_test') AND p.prokind IN ('f', 'p')
+ORDER BY p.proname, n.nspname;
+
+  proname           | nspname   | args | result_type | prokind
+--------------------+-----------+------+-------------+---------
+ get_customer_count | audit_test |      | integer     | f
+ update_customer_timestamp | audit_test |      | trigger     | f
+```
+
+Function execution verification:
+
+``` sql
+SELECT audit_test.get_customer_count() AS customer_count;
+
+ customer_count
+----------------
+              2
+```
+
+``` sql
+SELECT pg_get_functiondef(p.oid)
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE p.proname = 'get_customer_count' AND n.nspname = 'audit_test';
+
+CREATE OR REPLACE FUNCTION audit_test.get_customer_count()
+  RETURNS integer
+  LANGUAGE sql
+AS $function$
+    SELECT COUNT(*)::INTEGER
+    FROM audit_test.test_customers;
+$function$
+```
+
+Both functions were created in the correct `audit_test` schema, are
+queryable, and return correct results. `prokind = 'f'` confirms they are
+standard PostgreSQL functions.
+
+### 18.5 Procedure Support Status
+
+The current source database contains **no stored procedures** (`prokind = 'p'`)
+in the configured schemas. The implementation already filters `prokind IN ('f', 'p')`
+in `list_functions()`, so procedures are architecturally supported for
+discovery and migration. If procedures are added to the source, they will
+be picked up automatically.
+
+-----------------------------------------------------------------------
+
+## 19. Next Phase
+
+Do not treat this document as a final production-readiness report.
+
+This is the **local audit baseline** for continuing development.
+
+The non-public schema migration milestone is **COMPLETE**:
+- 5 tables / 13 rows migrated
+- 0 failures
+- 100% success
+- Schema-qualified sequences verified
+- Schema-qualified views verified
+- Schema-qualified materialized views verified
+- Schema-qualified functions verified
+- DDL rollback verified
+- 69 unit tests passing
 
 Next phase should focus on the remaining PostgreSQL object categories
 listed in Section 14.5, starting with the first category that has the

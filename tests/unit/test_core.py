@@ -14,6 +14,7 @@ from core.connectors.base import (
     CheckConstraint,
     ViewDefinition,
     MaterializedViewDef,
+    FunctionDef,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -1156,6 +1157,86 @@ class TestPostgresMaterializedViewSchemaQualification:
         create_sql = next((s for s in executed if "CREATE MATERIALIZED VIEW" in s), None)
         assert create_sql is not None
         assert create_sql.strip().startswith("CREATE MATERIALIZED VIEW public_mv")
+
+
+class TestPostgresFunctionSchemaQualification:
+    """
+    Regression: functions in non-public schemas must be discovered with
+    their schema and created in the correct target schema.  Previously
+    the source connector dropped the schema and the target had no way
+    to track or qualify the function schema.
+    """
+
+    def test_list_functions_captures_schema_name(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("get_customer_count", "audit_test", "CREATE OR REPLACE FUNCTION audit_test.get_customer_count() RETURNS integer LANGUAGE sql AS $function$ SELECT COUNT(*)::INTEGER FROM audit_test.test_customers; $function$"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        funcs = connector.list_functions()
+        by_name = {f.name: f for f in funcs}
+        assert "get_customer_count" in by_name
+        assert by_name["get_customer_count"].schema_name == "audit_test"
+
+    def test_target_create_function_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        func = FunctionDef(
+            name="get_customer_count",
+            schema_name="audit_test",
+            ddl="CREATE OR REPLACE FUNCTION audit_test.get_customer_count() RETURNS integer LANGUAGE sql AS $function$ SELECT 1; $function$",
+        )
+        target.create_function(func)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        audit_log_call = next((c for c in executed if "audit_test.get_customer_count" in c), None)
+        assert audit_log_call is not None
+
+    def test_target_create_function_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        func = FunctionDef(
+            name="public_func",
+            schema_name="public",
+            ddl="CREATE OR REPLACE FUNCTION public_func() RETURNS integer LANGUAGE sql AS $function$ SELECT 1; $function$",
+        )
+        target.create_function(func)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        ddl_call = next((s for s in executed if "CREATE OR REPLACE FUNCTION" in s), None)
+        assert ddl_call is not None
+        assert ddl_call.strip().startswith("CREATE OR REPLACE FUNCTION public_func")
 
 
 class TestConfigSchema:

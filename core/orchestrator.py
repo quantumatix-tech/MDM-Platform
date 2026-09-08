@@ -391,11 +391,15 @@ class MigrationOrchestrator:
             func_results: dict[str, str] = {}
             try:
                 for func in self._source.list_functions():
+                    func_key = (
+                        func.name if func.schema_name == "public"
+                        else f"{func.schema_name}.{func.name}"
+                    )
                     try:
                         self._target.create_function(func)
-                        func_results[func.name] = "created"
+                        func_results[func_key] = "created"
                     except Exception as exc:
-                        func_results[func.name] = f"skipped: {exc}"
+                        func_results[func_key] = f"skipped: {exc}"
             except Exception as exc:
                 func_results["_error"] = str(exc)
             result["phases"]["functions"] = func_results
@@ -926,11 +930,15 @@ class MigrationOrchestrator:
             func_results: dict[str, str] = {}
             try:
                 for func in self._source.list_functions():
+                    func_key = (
+                        func.name if func.schema_name == "public"
+                        else f"{func.schema_name}.{func.name}"
+                    )
                     try:
                         self._target.create_function(func)
-                        func_results[func.name] = "created"
+                        func_results[func_key] = "created"
                     except Exception as exc:
-                        func_results[func.name] = f"skipped: {exc}"
+                        func_results[func_key] = f"skipped: {exc}"
             except Exception as exc:
                 func_results["_error"] = str(exc)
             result["phases"]["functions"] = func_results

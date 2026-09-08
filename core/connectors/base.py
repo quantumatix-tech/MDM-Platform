@@ -159,6 +159,7 @@ class FunctionDef:
     ddl contains the complete CREATE OR REPLACE FUNCTION / PROCEDURE statement."""
     name: str
     ddl: str            # complete DDL from pg_get_functiondef — ready to execute
+    schema_name: str = "public"
 
 
 @dataclass

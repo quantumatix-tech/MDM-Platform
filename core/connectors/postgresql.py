@@ -594,7 +594,7 @@ class PostgresSourceConnector(SourceConnector):
                 # prokind 'f'=function 'p'=procedure 'a'=aggregate 'w'=window
                 # IN ('f','p') already excludes aggregates — no need for proisagg (PG10 only)
                 cur.execute(
-                    "SELECT p.proname, pg_get_functiondef(p.oid) "
+                    "SELECT p.proname, n.nspname, pg_get_functiondef(p.oid) "
                     "FROM pg_proc p "
                     "JOIN pg_namespace n ON p.pronamespace = n.oid "
                     "WHERE n.nspname = ANY(%s) "
@@ -603,8 +603,8 @@ class PostgresSourceConnector(SourceConnector):
                     (list(self._include_schemas),),
                 )
                 for row in cur.fetchall():
-                    func_name, ddl = row
-                    funcs.append(FunctionDef(name=func_name, ddl=ddl))
+                    func_name, schema_name, ddl = row
+                    funcs.append(FunctionDef(name=func_name, schema_name=schema_name, ddl=ddl))
         except Exception:
             self._conn.rollback()   # keep source connection clean for subsequent phases
             raise
@@ -1282,15 +1282,20 @@ class PostgresTargetConnector(TargetConnector):
     # ------------------------------------------------------------------
 
     def create_function(self, func: FunctionDef) -> None:
+        validate_identifier(func.name, "function")
+        func_qname = (
+            func.name if func.schema_name == "public"
+            else f"{quote_identifier(func.schema_name)}.{quote_identifier(func.name)}"
+        )
         with self._conn.cursor() as cur:
             try:
                 cur.execute(func.ddl)
                 self._conn.commit()
-                audit_log(phase="create_function", status="created", details={"function": func.name})
+                audit_log(phase="create_function", status="created", details={"function": func_qname})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_function", status="skipped",
-                          details={"function": func.name, "reason": str(exc)})
+                          details={"function": func_qname, "reason": str(exc)})
 
     # ------------------------------------------------------------------
     # Phase 14 — Triggers
