@@ -428,11 +428,16 @@ class MigrationOrchestrator:
             comment_results: dict[str, str] = {}
             try:
                 for comment in self._source.list_comments():
+                    comment_key = (
+                        comment.object_name
+                        if comment.schema_name == "public"
+                        else f"{comment.schema_name}.{comment.object_name}"
+                    )
                     try:
                         self._target.apply_comment(comment)
-                        comment_results[comment.object_name] = "applied"
+                        comment_results[comment_key] = "applied"
                     except Exception as exc:
-                        comment_results[comment.object_name] = f"skipped: {exc}"
+                        comment_results[comment_key] = f"skipped: {exc}"
             except Exception as exc:
                 comment_results["_error"] = str(exc)
             result["phases"]["comments"] = comment_results
@@ -972,11 +977,16 @@ class MigrationOrchestrator:
             comment_results: dict[str, str] = {}
             try:
                 for comment in self._source.list_comments():
+                    comment_key = (
+                        comment.object_name
+                        if comment.schema_name == "public"
+                        else f"{comment.schema_name}.{comment.object_name}"
+                    )
                     try:
                         self._target.apply_comment(comment)
-                        comment_results[comment.object_name] = "applied"
+                        comment_results[comment_key] = "applied"
                     except Exception as exc:
-                        comment_results[comment.object_name] = f"skipped: {exc}"
+                        comment_results[comment_key] = f"skipped: {exc}"
             except Exception as exc:
                 comment_results["_error"] = str(exc)
             result["phases"]["comments"] = comment_results

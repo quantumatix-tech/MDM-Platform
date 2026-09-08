@@ -680,7 +680,7 @@ class PostgresSourceConnector(SourceConnector):
                 "SELECT CASE c.relkind "
                 "  WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' "
                 "  WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END, "
-                "  c.relname, d.description "
+                "  n.nspname, c.relname, d.description "
                 "FROM pg_description d "
                 "JOIN pg_class c ON d.objoid = c.oid "
                 "JOIN pg_namespace n ON c.relnamespace = n.oid "
@@ -690,12 +690,12 @@ class PostgresSourceConnector(SourceConnector):
                 (schemas,),
             )
             for row in cur.fetchall():
-                obj_type, obj_name, comment = row
-                comments.append(CommentDef(object_type=obj_type, object_name=obj_name, comment=comment))
+                obj_type, schema_name, obj_name, comment = row
+                comments.append(CommentDef(object_type=obj_type, object_name=obj_name, comment=comment, schema_name=schema_name))
 
             # Column comments
             cur.execute(
-                "SELECT c.relname, a.attname, d.description "
+                "SELECT n.nspname, c.relname, a.attname, d.description "
                 "FROM pg_description d "
                 "JOIN pg_attribute a ON d.objoid = a.attrelid AND d.objsubid = a.attnum "
                 "JOIN pg_class c ON a.attrelid = c.oid "
@@ -705,16 +705,17 @@ class PostgresSourceConnector(SourceConnector):
                 (schemas,),
             )
             for row in cur.fetchall():
-                table_name, col_name, comment = row
+                schema_name, table_name, col_name, comment = row
                 comments.append(CommentDef(
                     object_type="COLUMN",
                     object_name=f"{table_name}.{col_name}",
                     comment=comment,
+                    schema_name=schema_name,
                 ))
 
             # Function comments
             cur.execute(
-                "SELECT p.proname || '(' || "
+                "SELECT n.nspname, p.proname || '(' || "
                 "  pg_get_function_arguments(p.oid) || ')', d.description "
                 "FROM pg_description d "
                 "JOIN pg_proc p ON d.objoid = p.oid "
@@ -724,8 +725,22 @@ class PostgresSourceConnector(SourceConnector):
                 (schemas,),
             )
             for row in cur.fetchall():
-                func_sig, comment = row
-                comments.append(CommentDef(object_type="FUNCTION", object_name=func_sig, comment=comment))
+                schema_name, func_sig, comment = row
+                comments.append(CommentDef(object_type="FUNCTION", object_name=func_sig, comment=comment, schema_name=schema_name))
+
+            # Schema comments
+            cur.execute(
+                "SELECT n.nspname, d.description "
+                "FROM pg_description d "
+                "JOIN pg_namespace n ON d.objoid = n.oid "
+                "WHERE d.classoid = 'pg_namespace'::regclass "
+                "  AND n.nspname = ANY(%s) "
+                "ORDER BY n.nspname",
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                schema_name, comment = row
+                comments.append(CommentDef(object_type="SCHEMA", object_name=schema_name, comment=comment, schema_name=schema_name))
 
         return comments
 
@@ -1331,12 +1346,26 @@ class PostgresTargetConnector(TargetConnector):
         with self._conn.cursor() as cur:
             try:
                 escaped = comment.comment.replace("'", "''")
+                if comment.object_type == "SCHEMA":
+                    qualified_name = quote_identifier(comment.schema_name)
+                elif comment.schema_name == "public":
+                    qualified_name = comment.object_name
+                elif comment.object_type == "COLUMN":
+                    parts = comment.object_name.split(".")
+                    qualified_name = (
+                        f"{quote_identifier(comment.schema_name)}.{quote_identifier(parts[0])}"
+                        f".{quote_identifier(parts[1])}"
+                    )
+                elif comment.object_type == "FUNCTION":
+                    qualified_name = f"{quote_identifier(comment.schema_name)}.{comment.object_name}"
+                else:
+                    qualified_name = f"{quote_identifier(comment.schema_name)}.{quote_identifier(comment.object_name)}"
                 cur.execute(
-                    f"COMMENT ON {comment.object_type} {comment.object_name} IS '{escaped}'"
+                    f"COMMENT ON {comment.object_type} {qualified_name} IS '{escaped}'"
                 )
                 self._conn.commit()
                 audit_log(phase="apply_comment", status="applied",
-                          details={"object": comment.object_name})
+                          details={"object": qualified_name})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="apply_comment", status="skipped",

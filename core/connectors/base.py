@@ -187,8 +187,9 @@ class RLSPolicy:
 class CommentDef:
     """A COMMENT ON ... IS '...' statement."""
     object_type: str    # TABLE, COLUMN, VIEW, MATERIALIZED VIEW, FUNCTION, etc.
-    object_name: str    # For columns: 'table.column'
+    object_name: str    # For columns: 'table.column'; schema is tracked separately
     comment: str
+    schema_name: str = "public"
 
 
 @dataclass

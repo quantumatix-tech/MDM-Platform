@@ -1073,13 +1073,161 @@ The non-public schema migration milestone is **COMPLETE**:
 - Schema-qualified materialized views verified
 - Schema-qualified functions verified
 - Schema-qualified triggers verified
+- Schema-qualified comments verified
 - DDL rollback verified
-- 72 unit tests passing
+- 78 unit tests passing
 
-Next phase should focus on the remaining PostgreSQL object categories
-listed in Section 14.5, starting with the first category that has the
-smallest dependency surface and the clearest end-to-end verification path.
+-----------------------------------------------------------------------
 
-The next phase should start from this same combined code baseline so
-both developers can continue on the same implementation and use this
-document to understand what has already been tested and what remains.
+## 20. Completed PostgreSQL Comments Schema Qualification Milestone
+
+This section documents the completed PostgreSQL comments schema
+qualification milestone on the `feature/postgresql-objects` branch.
+
+### 20.1 Root Cause
+
+The `CommentDef` dataclass had no `schema_name` field. As a result:
+
+1. `PostgresSourceConnector.list_comments()` queried `pg_description`
+   joined with `pg_class`/`pg_attribute`/`pg_proc` and `pg_namespace`,
+   filtering by `n.nspname = ANY(%s)` (which respects `include_schemas`),
+   but dropped the `n.nspname` value from all result sets.
+2. `PostgresTargetConnector.apply_comment()` executed
+   `COMMENT ON {object_type} {object_name} IS '...'` without schema
+   qualification, which fails for non-public schemas because PostgreSQL
+   cannot resolve the object without schema qualification.
+3. The orchestrator reported comments by bare `object_name` without
+   schema qualification, which could cause reporting collisions across
+   schemas.
+4. Comments on non-public objects (e.g. `audit_test.test_customers`,
+   `audit_test.test_customers.email`) were therefore not properly
+   tracked, and the `COMMENT ON` statement would fail if the object was
+   in a non-public schema.
+
+### 20.2 Supported Comment Types
+
+The implementation supports the following PostgreSQL comment types
+through the current migration architecture:
+
+- `COMMENT ON SCHEMA`
+- `COMMENT ON TABLE`
+- `COMMENT ON COLUMN`
+- `COMMENT ON VIEW`
+- `COMMENT ON MATERIALIZED VIEW`
+- `COMMENT ON FUNCTION` (signature-aware via `pg_get_function_arguments`)
+- `COMMENT ON SEQUENCE`
+
+### 20.3 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `schema_name: str = "public"` to the `CommentDef` dataclass.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresSourceConnector.list_comments()` to select
+     `n.nspname` and populate `CommentDef.schema_name` for:
+     - Table/view/materialized view comments
+     - Column comments
+     - Function comments (preserving signature via
+       `pg_get_function_arguments`)
+     - Schema comments (via `pg_description` with
+       `classoid = 'pg_namespace'::regclass`)
+   - Updated `PostgresTargetConnector.apply_comment()` to schema-qualify
+     the object name when `schema_name != "public"`, using
+     `quote_identifier()` for safety. Public-schema comments remain
+     unqualified for backward compatibility.
+
+3. **`core/orchestrator.py`**
+   - Updated both `run_full()` and `run_cdc()` to compute a
+     schema-qualified comment key for the migration report when the
+     comment is on a non-public object, preserving backward compatibility
+     for public-schema comments.
+
+### 20.4 Unit Test Results
+
+``` text
+78 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresCommentSchemaQualification.test_list_comments_captures_schema_for_table`
+- `TestPostgresCommentSchemaQualification.test_list_comments_captures_schema_for_column`
+- `TestPostgresCommentSchemaQualification.test_target_apply_comment_qualifies_non_public_schema`
+- `TestPostgresCommentSchemaQualification.test_target_apply_comment_qualifies_column_non_public_schema`
+- `TestPostgresCommentSchemaQualification.test_target_apply_comment_qualifies_function_non_public_schema`
+- `TestPostgresCommentSchemaQualification.test_target_apply_comment_remains_unqualified_for_public`
+
+### 20.5 Real PostgreSQL CLI Verification
+
+Run ID: `4d4dc2cc6a2d4fcba0a60614c842b169`
+
+``` text
+Mode: FULL
+Tables migrated: 5
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+The migration report confirms:
+
+``` json
+"comments": {
+  "audit_test.test_customers": "applied",
+  "audit_test.test_customers.email": "applied",
+  "public": "applied"
+}
+```
+
+Target SQL verification:
+
+``` sql
+-- Table comment
+SELECT n.nspname, c.relname, d.description
+FROM pg_description d
+JOIN pg_class c ON d.objoid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname = 'audit_test' AND c.relname = 'test_customers' AND d.objsubid = 0;
+
+  nspname  |   relname    |        description
+-----------+--------------+-------------------------------
+ audit_test| test_customers| Migration platform object testing table
+
+-- Column comment
+SELECT n.nspname, c.relname, a.attname, d.description
+FROM pg_description d
+JOIN pg_attribute a ON d.objoid = a.attrelid AND d.objsubid = a.attnum
+JOIN pg_class c ON a.attrelid = c.oid
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname = 'audit_test' AND c.relname = 'test_customers' AND a.attname = 'email';
+
+  nspname  |   relname    | attname |      description
+-----------+--------------+---------+------------------------
+ audit_test| test_customers| email   | Unique customer email
+
+-- Schema comment
+SELECT n.nspname, d.description
+FROM pg_description d
+JOIN pg_namespace n ON d.objoid = n.oid
+WHERE d.classoid = 'pg_namespace'::regclass AND n.nspname = 'public';
+
+  nspname |      description
+----------+------------------------
+ public   | standard public schema
+```
+
+### 20.6 Remaining Limitations
+
+- Comments on indexes, constraints, and other minor object types are
+  not explicitly enumerated in the current implementation but can be
+  added by extending `list_comments()` with additional catalog queries.
+- Comment migration is best-effort; if a source comment is NULL, no
+  comment is applied on the target (consistent with existing behavior).
+- Function comments rely on `pg_get_function_arguments` for signature
+  disambiguation, which is safe for overloaded functions but does not
+  migrate the exact internal `proargtypes` representation.
+
+-----------------------------------------------------------------------
+
+## 21. Next Phase

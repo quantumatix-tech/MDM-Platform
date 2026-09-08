@@ -16,6 +16,7 @@ from core.connectors.base import (
     MaterializedViewDef,
     FunctionDef,
     TriggerDef,
+    CommentDef,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -1324,6 +1325,168 @@ class TestPostgresTriggerSchemaQualification:
         drop_sql = next((s for s in executed if "DROP TRIGGER" in s), None)
         assert drop_sql is not None
         assert drop_sql.strip().startswith('DROP TRIGGER IF EXISTS "trg_public" ON customers')
+
+
+class TestPostgresCommentSchemaQualification:
+    """
+    Regression: comments on non-public objects must preserve schema
+    information and be applied with correct schema qualification.
+    """
+
+    def test_list_comments_captures_schema_for_table(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [("TABLE", "audit_test", "test_customers", "Migration platform object testing table")],
+            [],
+            [],
+            [],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        comments = connector.list_comments()
+        by_type_name = {(c.object_type, c.object_name): c for c in comments}
+        assert ("TABLE", "test_customers") in by_type_name
+        assert by_type_name[("TABLE", "test_customers")].schema_name == "audit_test"
+        assert by_type_name[("TABLE", "test_customers")].comment == "Migration platform object testing table"
+
+    def test_list_comments_captures_schema_for_column(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [],
+            [("audit_test", "test_customers", "email", "Unique customer email")],
+            [],
+            [],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        comments = connector.list_comments()
+        by_type_name = {(c.object_type, c.object_name): c for c in comments}
+        assert ("COLUMN", "test_customers.email") in by_type_name
+        assert by_type_name[("COLUMN", "test_customers.email")].schema_name == "audit_test"
+
+    def test_target_apply_comment_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        comment = CommentDef(
+            object_type="TABLE",
+            object_name="test_customers",
+            schema_name="audit_test",
+            comment="Migration platform object testing table",
+        )
+        target.apply_comment(comment)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
+        assert comment_sql is not None
+        assert '"audit_test"."test_customers"' in comment_sql
+
+    def test_target_apply_comment_qualifies_column_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        comment = CommentDef(
+            object_type="COLUMN",
+            object_name="test_customers.email",
+            schema_name="audit_test",
+            comment="Unique customer email",
+        )
+        target.apply_comment(comment)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
+        assert comment_sql is not None
+        assert '"audit_test"."test_customers"."email"' in comment_sql
+
+    def test_target_apply_comment_qualifies_function_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        comment = CommentDef(
+            object_type="FUNCTION",
+            object_name="get_customer_count()",
+            schema_name="audit_test",
+            comment="Returns customer count",
+        )
+        target.apply_comment(comment)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
+        assert comment_sql is not None
+        assert '"audit_test".get_customer_count()' in comment_sql
+
+    def test_target_apply_comment_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        comment = CommentDef(
+            object_type="TABLE",
+            object_name="customers",
+            schema_name="public",
+            comment="Public customers table",
+        )
+        target.apply_comment(comment)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
+        assert comment_sql is not None
+        assert comment_sql.strip().startswith("COMMENT ON TABLE customers")
 
 
 class TestConfigSchema:
