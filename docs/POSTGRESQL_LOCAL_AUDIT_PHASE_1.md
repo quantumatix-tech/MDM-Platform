@@ -1954,6 +1954,74 @@ column default references it by name.
 
 -----------------------------------------------------------------------
 
+## 24a. Completed PostgreSQL Sequence Synchronization Schema Qualification Fix
+
+This section documents the fix for the `sync_sequence()` schema
+qualification gap identified in the final PostgreSQL gap audit.
+
+### 24a.1 Root Cause
+
+`PostgresTargetConnector.sync_sequence()` was not schema-qualified.
+It used:
+
+```sql
+pg_get_serial_sequence('{table}', '{column}')
+```
+
+and:
+
+```sql
+COALESCE((SELECT MAX({column}) FROM {table}), 1)
+```
+
+For non-public schemas, `pg_get_serial_sequence()` relies on
+`search_path` to resolve the table name. If the non-public schema is
+not on the `search_path`, PostgreSQL either returns NULL or resolves to
+the wrong table. The `MAX({column}) FROM {table}` query has the same
+problem.
+
+### 24a.2 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `schema_name: str | None = None` parameter to
+     `TargetConnector.sync_sequence()`.
+
+2. **`core/connectors/postgresql.py`**
+   - Updated `PostgresTargetConnector.sync_sequence()` to accept
+     `schema_name` and schema-qualify the table reference using
+     `quote_identifier()` when the schema is non-public.
+   - Public-schema behavior remains unchanged for backward
+     compatibility.
+
+### 24a.3 Unit Test Results
+
+``` text
+94 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresSyncSequenceSchemaQualification.test_sync_sequence_qualifies_non_public_schema`
+- `TestPostgresSyncSequenceSchemaQualification.test_sync_sequence_remains_unqualified_for_public`
+
+### 24a.4 Real PostgreSQL Verification
+
+Verified directly against `migration_target`:
+
+- `audit_test.test_orders_order_id_seq` synchronized against
+  `audit_test.test_orders.order_id` (schema-qualified)
+- `public.customers_customer_id_seq` synchronized against
+  `public.customers.customer_id` (unqualified, backward compatible)
+
+Sequence values after synchronization:
+
+``` text
+audit_test.test_orders_order_id_seq  → 1  (matches MAX(order_id))
+public.customers_customer_id_seq     → 3  (matches MAX(customer_id))
+```
+
+-----------------------------------------------------------------------
+
 ## 25. Next Phase
 
 Do not treat this document as a final production-readiness report.

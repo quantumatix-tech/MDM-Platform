@@ -390,7 +390,7 @@ class TargetConnector(abc.ABC):
     def apply_rls_policy(self, policy: RLSPolicy) -> None:
         pass
 
-    def sync_sequence(self, table: str, column: str) -> None:
+    def sync_sequence(self, table: str, column: str, schema_name: str | None = None) -> None:
         pass
 
     def apply_sequence_ownership(self, seq: "SequenceDef") -> None:

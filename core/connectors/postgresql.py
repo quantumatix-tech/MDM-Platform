@@ -1276,24 +1276,30 @@ class PostgresTargetConnector(TargetConnector):
     # Phase 10 — Sequences
     # ------------------------------------------------------------------
 
-    def sync_sequence(self, table: str, column: str) -> None:
+    def sync_sequence(self, table: str, column: str, schema_name: str | None = None) -> None:
         validate_identifier(table, "table")
         validate_identifier(column, "column")
+        schema = schema_name or "public"
+        table_qname = (
+            table if schema == "public"
+            else f"{quote_identifier(schema)}.{quote_identifier(table)}"
+        )
         with self._conn.cursor() as cur:
             try:
                 cur.execute(
                     f"SELECT setval("
-                    f"  pg_get_serial_sequence('{table}', '{column}'), "
-                    f"  COALESCE((SELECT MAX({column}) FROM {table}), 1)"
-                    f")"
+                    f"  pg_get_serial_sequence(%s, %s), "
+                    f"  COALESCE((SELECT MAX({column}) FROM {table_qname}), 1)"
+                    f")",
+                    (table_qname, column),
                 )
                 self._conn.commit()
                 audit_log(phase="sync_sequence", status="synced",
-                          details={"table": table, "column": column})
+                          details={"table": table_qname, "column": column})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="sync_sequence", status="skipped",
-                          details={"table": table, "column": column, "reason": str(exc)})
+                          details={"table": table_qname, "column": column, "reason": str(exc)})
 
     def apply_sequence_ownership(self, seq: "SequenceDef") -> None:
         """Apply ALTER SEQUENCE ... OWNED BY after the owning table/column exists."""

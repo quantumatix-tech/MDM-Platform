@@ -1014,6 +1014,59 @@ class TestPostgresSequenceOwnership:
         assert alter_sql is None, "Unowned sequence must not emit ALTER SEQUENCE"
 
 
+class TestPostgresSyncSequenceSchemaQualification:
+    """
+    Regression: sync_sequence must schema-qualify the table reference
+    so pg_get_serial_sequence() and the MAX() query resolve correctly
+    for non-public schemas.
+    """
+
+    def test_sync_sequence_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = [1]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        target.sync_sequence("test_orders", "order_id", schema_name="audit_test")
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        sync_sql = next((s for s in executed if "pg_get_serial_sequence" in s), None)
+        assert sync_sql is not None
+        assert '"audit_test"."test_orders"' in sync_sql
+        assert 'FROM "audit_test"."test_orders"' in sync_sql
+
+    def test_sync_sequence_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = [1]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        target.sync_sequence("customers", "customer_id")
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        sync_sql = next((s for s in executed if "pg_get_serial_sequence" in s), None)
+        assert sync_sql is not None
+        assert '"' not in sync_sql, (
+            f"Public schema sequences must stay unquoted. Got: {sync_sql!r}"
+        )
+
+
 class TestPostgresCreateObjectTransactionIsolation:
     """
     Regression: a single failed CREATE TABLE DDL must not leave the
