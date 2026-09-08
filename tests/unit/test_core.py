@@ -923,6 +923,97 @@ class TestPostgresSequenceSchemaQualification:
         )
 
 
+class TestPostgresSequenceOwnership:
+    """
+    Regression: sequence OWNED BY relationships must be preserved across
+    migration, including schema-qualified ownership for non-public schemas.
+    """
+
+    def test_apply_sequence_ownership_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        from core.connectors.base import SequenceDef
+        seq = SequenceDef(
+            name="test_orders_order_id_seq",
+            schema="audit_test",
+            start_value=1, min_value=1, max_value=10**18,
+            increment=1, cycle=False,
+            owned_by="audit_test.test_orders.order_id",
+        )
+        target.apply_sequence_ownership(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER SEQUENCE" in s), None)
+        assert alter_sql is not None
+        assert '"audit_test"."test_orders_order_id_seq"' in alter_sql
+        assert "OWNED BY \"audit_test\".\"test_orders\".\"order_id\"" in alter_sql
+
+    def test_apply_sequence_ownership_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        from core.connectors.base import SequenceDef
+        seq = SequenceDef(
+            name="customers_customer_id_seq",
+            schema="public",
+            start_value=1, min_value=1, max_value=2147483647,
+            increment=1, cycle=False,
+            owned_by="public.customers.customer_id",
+        )
+        target.apply_sequence_ownership(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER SEQUENCE" in s), None)
+        assert alter_sql is not None
+        assert alter_sql.strip().startswith('ALTER SEQUENCE customers_customer_id_seq OWNED BY customers."customer_id"')
+
+    def test_apply_sequence_ownership_skips_unowned_sequence(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        from core.connectors.base import SequenceDef
+        seq = SequenceDef(
+            name="test_sequence",
+            schema="audit_test",
+            start_value=1, min_value=1, max_value=10**18,
+            increment=1, cycle=False,
+            owned_by=None,
+        )
+        target.apply_sequence_ownership(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER SEQUENCE" in s), None)
+        assert alter_sql is None, "Unowned sequence must not emit ALTER SEQUENCE"
+
+
 class TestPostgresCreateObjectTransactionIsolation:
     """
     Regression: a single failed CREATE TABLE DDL must not leave the

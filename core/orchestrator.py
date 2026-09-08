@@ -310,7 +310,23 @@ class MigrationOrchestrator:
             result["phases"]["apply_constraints"] = constraint_results
             self._update_status("apply_constraints", 60, all_errors)
 
-            # ---------- Phase 9: Row-Level Security ----------
+            # ---------- Phase 9: Sequence Ownership ----------
+            seq_owner_results: dict[str, str] = {}
+            try:
+                all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
+                for seq in all_sequences:
+                    if seq.owned_by:
+                        try:
+                            self._target.apply_sequence_ownership(seq)
+                            seq_owner_results[seq.name] = f"owned: {seq.owned_by}"
+                        except Exception as exc:
+                            seq_owner_results[seq.name] = f"skipped: {exc}"
+            except Exception as exc:
+                seq_owner_results["_error"] = str(exc)
+            result["phases"]["apply_sequence_ownership"] = seq_owner_results
+            self._update_status("apply_sequence_ownership", 65, all_errors)
+
+            # ---------- Phase 10: Row-Level Security ----------
             rls_results: dict[str, Any] = {}
             try:
                 for obj_name, schema in all_schemas.items():
@@ -871,7 +887,23 @@ class MigrationOrchestrator:
             result["phases"]["apply_constraints"] = constraint_results
             self._update_status("apply_constraints", 50, all_errors)
 
-            # Phase 9: Row-Level Security
+            # Phase 9: Sequence Ownership
+            seq_owner_results: dict[str, str] = {}
+            try:
+                all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
+                for seq in all_sequences:
+                    if seq.owned_by:
+                        try:
+                            self._target.apply_sequence_ownership(seq)
+                            seq_owner_results[seq.name] = f"owned: {seq.owned_by}"
+                        except Exception as exc:
+                            seq_owner_results[seq.name] = f"skipped: {exc}"
+            except Exception as exc:
+                seq_owner_results["_error"] = str(exc)
+            result["phases"]["apply_sequence_ownership"] = seq_owner_results
+            self._update_status("apply_sequence_ownership", 55, all_errors)
+
+            # Phase 10: Row-Level Security
             rls_results: dict[str, Any] = {}
             try:
                 for obj_name, schema in all_schemas.items():

@@ -393,6 +393,9 @@ class TargetConnector(abc.ABC):
     def sync_sequence(self, table: str, column: str) -> None:
         pass
 
+    def apply_sequence_ownership(self, seq: "SequenceDef") -> None:
+        pass
+
     def apply_comment(self, comment: CommentDef) -> None:
         pass
 

@@ -1295,6 +1295,44 @@ class PostgresTargetConnector(TargetConnector):
                 audit_log(phase="sync_sequence", status="skipped",
                           details={"table": table, "column": column, "reason": str(exc)})
 
+    def apply_sequence_ownership(self, seq: "SequenceDef") -> None:
+        """Apply ALTER SEQUENCE ... OWNED BY after the owning table/column exists."""
+        if not seq.owned_by:
+            return
+        parts = seq.owned_by.split(".")
+        if len(parts) not in (2, 3):
+            return
+        seq_schema = seq.schema or "public"
+        if len(parts) == 3:
+            owned_schema, table_name, column_name = parts
+            if owned_schema != seq_schema:
+                return
+        else:
+            table_name, column_name = parts
+            if seq_schema != "public":
+                return
+        seq_qname = (
+            seq.name if seq_schema == "public"
+            else f"{quote_identifier(seq_schema)}.{quote_identifier(seq.name)}"
+        )
+        table_qname = (
+            table_name if seq_schema == "public"
+            else f"{quote_identifier(seq_schema)}.{quote_identifier(table_name)}"
+        )
+        column_qname = quote_identifier(column_name)
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(
+                    f"ALTER SEQUENCE {seq_qname} OWNED BY {table_qname}.{column_qname}"
+                )
+                self._conn.commit()
+                audit_log(phase="apply_sequence_ownership", status="owned",
+                          details={"sequence": seq.name, "owned_by": f"{table_qname}.{column_qname}"})
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(phase="apply_sequence_ownership", status="skipped",
+                          details={"sequence": seq.name, "reason": str(exc)})
+
     # ------------------------------------------------------------------
     # Phase 11 — Views
     # ------------------------------------------------------------------

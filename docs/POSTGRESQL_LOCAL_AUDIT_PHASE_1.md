@@ -1768,8 +1768,141 @@ The non-public schema migration milestone is **COMPLETE**:
 - Schema-qualified grants/privileges verified
 - Schema-qualified RLS/policies verified
 - Cross-schema foreign keys verified
+- Sequence ownership verified
 - DDL rollback verified
-- 89 unit tests passing
+- 92 unit tests passing
+
+-----------------------------------------------------------------------
+
+## 24. Completed PostgreSQL Sequence Ownership Milestone
+
+This section documents the completed PostgreSQL sequence ownership
+milestone on the `feature/postgresql-objects` branch.
+
+### 24.1 Root Cause
+
+The `SequenceDef` dataclass already had `owned_by` and `schema` fields,
+and `create_sequence()` intentionally deferred `OWNED BY` because Phase
+3.5 runs before tables exist. However, no subsequent phase actually
+reattached ownership after the owning table/column was created. The
+orchestrator comment in `create_sequence()` claimed "Ownership is
+reattached later by `apply_constraints` / `advance_sequence`", but
+neither method implemented this.
+
+As a result, sequences were created on the target with correct names
+and schemas, but their `OWNED BY` relationships were lost.
+
+### 24.2 Implementation
+
+1. **`core/connectors/base.py`**
+   - Added `apply_sequence_ownership(self, seq: SequenceDef) -> None`
+     abstract method to `TargetConnector`.
+
+2. **`core/connectors/postgresql.py`**
+   - Implemented `PostgresTargetConnector.apply_sequence_ownership()`
+     to emit `ALTER SEQUENCE ... OWNED BY schema.table.column` after
+     the owning table exists.
+   - Parses `owned_by` (format: `schema.table.column` or
+     `table.column`) and schema-qualifies the DDL for non-public
+     schemas.
+   - Skips sequences with no `owned_by` (standalone sequences).
+
+3. **`core/orchestrator.py`**
+   - Added Phase 9 (`apply_sequence_ownership`) in both `run_full()`
+     and `run_cdc()`, executed after constraints (Phase 6-8) and
+     before RLS (Phase 10).
+
+### 24.3 Unit Test Results
+
+``` text
+92 passed, 0 failed
+```
+
+Key regression tests added in `tests/unit/test_core.py`:
+
+- `TestPostgresSequenceOwnership.test_apply_sequence_ownership_qualifies_non_public_schema`
+- `TestPostgresSequenceOwnership.test_apply_sequence_ownership_remains_unqualified_for_public`
+- `TestPostgresSequenceOwnership.test_apply_sequence_ownership_skips_unowned_sequence`
+
+### 24.4 Real PostgreSQL CLI Verification
+
+Run ID: `550cbd3f678a45edb4387e6e3fa7b15b`
+
+``` text
+Mode: FULL
+Tables migrated: 7
+Total rows: 13
+Migrated: 13
+Failed: 0
+Success rate: 100%
+```
+
+The migration report confirms:
+
+``` json
+"apply_sequence_ownership": {
+  "fk_child_id_seq": "owned: audit_test.fk_child.id",
+  "fk_parent_id_seq": "owned: audit_test.fk_parent.id",
+  "test_orders_order_id_seq": "owned: audit_test.test_orders.order_id",
+  "customers_customer_id_seq": "owned: public.customers.customer_id",
+  "orders_order_id_seq": "owned: public.orders.order_id",
+  "products_product_id_seq": "owned: public.products.product_id"
+}
+```
+
+### 24.5 SQL Verification
+
+Source vs target sequence ownership:
+
+``` text
+audit_test.fk_child_id_seq           → audit_test.fk_child.id
+audit_test.fk_parent_id_seq          → audit_test.fk_parent.id
+audit_test.test_orders_order_id_seq  → audit_test.test_orders.order_id
+audit_test.test_sequence             → (unowned)
+public.customers_customer_id_seq     → public.customers.customer_id
+public.orders_order_id_seq           → public.orders.order_id
+public.products_product_id_seq       → public.products.product_id
+```
+
+All ownership relationships match exactly between source and target.
+
+### 24.6 Sequence Default Verification
+
+Column defaults using `nextval()` continue to work correctly after
+ownership is applied, because the sequence already exists and the
+column default references it by name.
+
+### 24.7 Remaining Limitations
+
+- Sequence value/state synchronization is handled separately by
+  `advance_sequence()` (Phase 10) and is not part of this milestone.
+- `ALTER SEQUENCE ... OWNED BY` is idempotent; re-running migration
+  on an already-owned sequence does not fail.
+
+-----------------------------------------------------------------------
+
+## 25. Next Phase
+
+Do not treat this document as a final production-readiness report.
+
+This is the **local audit baseline** for continuing development.
+
+The non-public schema migration milestone is **COMPLETE**:
+- 5 tables / 13 rows migrated
+- 0 failures
+- 100% success
+- Schema-qualified sequences verified
+- Schema-qualified views verified
+- Schema-qualified materialized views verified
+- Schema-qualified functions verified
+- Schema-qualified triggers verified
+- Schema-qualified comments verified
+- Schema-qualified grants/privileges verified
+- Schema-qualified RLS/policies verified
+- Cross-schema foreign keys verified
+- Sequence ownership verified
+- DDL rollback verified
+- 92 unit tests passing
 
 Next phase should focus on the remaining PostgreSQL object categories
 listed in Section 14.5, starting with the first category that has the
