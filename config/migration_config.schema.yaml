@@ -38,6 +38,9 @@ migration:
   stop_on_error:
     type: boolean
     default: false
+  dry_run:
+    type: boolean
+    default: false
   field_mappings:
     type: array
     items:

@@ -31,6 +31,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 _PHASE_LABELS: list[tuple[str, str]] = [
     ("connect",            "Connect"),
+    ("preflight",          "PostgreSQL Preflight"),
     ("ensure_database",    "Ensure Database"),
     ("extensions",         "Extensions"),
     ("schemas",            "Schemas"),
@@ -52,6 +53,42 @@ _PHASE_LABELS: list[tuple[str, str]] = [
 ]
 _PHASE_KEYS = [k for k, _ in _PHASE_LABELS]
 
+_SCHEMA_STATUS_LABELS = {
+    "COMPATIBLE": "Compatible",
+    "TARGET_MISSING": "Target Missing",
+    "MISMATCH": "Schema Mismatch",
+}
+_ACTION_LABELS = {
+    "MIGRATE": "Update & Migrate",
+    "CREATE_AND_MIGRATE": "Create & Migrate",
+    "BLOCK": "Blocked",
+}
+
+
+def _preflight_rows(preflight: dict[str, Any]) -> list[tuple[str, str, int | str, int, str]]:
+    rows: list[tuple[str, str, int | str, int, str]] = []
+    for object_plan in preflight.get("objects", []):
+        comparison = object_plan.get("schema_comparison") or {}
+        source_rows = object_plan.get("source_row_count")
+        target_rows = object_plan.get("target_row_count")
+        rows.append(
+            (
+                object_plan.get("object_name") or "—",
+                _SCHEMA_STATUS_LABELS.get(comparison.get("status"), "Unavailable"),
+                source_rows if source_rows is not None else "—",
+                target_rows if target_rows is not None else 0,
+                _ACTION_LABELS.get(object_plan.get("action"), "Blocked"),
+            )
+        )
+    return rows
+
+
+def _preflight_blockers(preflight: dict[str, Any]) -> list[str]:
+    blockers = [issue.get("message", "Preflight blocked.") for issue in preflight.get("blockers", [])]
+    for object_plan in preflight.get("objects", []):
+        blockers.extend(object_plan.get("blockers", []))
+    return blockers
+
 
 class RichProgressDisplay:
     """
@@ -68,6 +105,7 @@ class RichProgressDisplay:
         self._errors: list[str] = []
         self._table_stats: dict[str, dict[str, int]] = {}
         self._phases_done: list[str] = []
+        self._preflight: dict[str, Any] | None = None
         self._live: Any = None
         self._console: Any = None
 
@@ -89,6 +127,10 @@ class RichProgressDisplay:
         self._table_stats[table] = {"source": source_rows, "success": success, "failure": failure}
         if self._live and _RICH_AVAILABLE:
             self._live.update(self._render())
+
+    def record_preflight(self, preflight: dict[str, Any]) -> None:
+        self._preflight = preflight
+        self.update_status("preflight", 3, _preflight_blockers(preflight))
 
     # ------------------------------------------------------------------ context manager
     def __enter__(self) -> "RichProgressDisplay":
@@ -174,6 +216,57 @@ class RichProgressDisplay:
         phase_panel = Panel(phase_table, title="[bold]Phases[/bold]",
                             border_style="bright_black", padding=(0, 1))
 
+        preflight_panel = None
+        if self._preflight is not None:
+            preflight_rows = _preflight_rows(self._preflight)
+            object_plans = self._preflight.get("objects", [])
+            target_tables = sum(1 for plan in object_plans if plan.get("target_exists"))
+            comparisons_complete = all(plan.get("schema_comparison") for plan in object_plans)
+            row_counts_captured = all(
+                plan.get("source_row_count") is not None
+                and (not plan.get("target_exists") or plan.get("target_row_count") is not None)
+                for plan in object_plans
+            )
+            preflight_table = Table(show_header=True, header_style="bold dim", box=None,
+                                    padding=(0, 1), show_edge=False)
+            preflight_table.add_column("Table", style="white", no_wrap=True)
+            preflight_table.add_column("Schema Status")
+            preflight_table.add_column("Source Rows", justify="right")
+            preflight_table.add_column("Target Rows", justify="right")
+            preflight_table.add_column("Migration Action")
+            for table_name, schema_status, source_rows, target_rows, action in preflight_rows:
+                preflight_table.add_row(
+                    table_name,
+                    schema_status,
+                    str(source_rows),
+                    str(target_rows),
+                    action,
+                )
+            summary = (
+                f"Source Connected: {'Yes' if self._preflight.get('source_connected') else 'No'}  |  "
+                f"Target Connected: {'Yes' if self._preflight.get('target_connected') else 'No'}  |  "
+                f"Source Tables: {len(preflight_rows)}  |  "
+                f"Target Tables: {target_tables}\n"
+                f"Schema Comparison: {'Complete' if comparisons_complete else 'Blocked'}  |  "
+                f"Row Counts: {'Captured' if row_counts_captured else 'Blocked'}  |  "
+                f"Migration Plan: {'Ready' if self._preflight.get('ready') else 'Blocked'}"
+            )
+            blockers = _preflight_blockers(self._preflight)
+            if blockers:
+                summary += "\nBlockers: " + "; ".join(blockers)
+            preflight_ready = self._preflight.get("ready", False)
+            preflight_panel = Panel(
+                preflight_table,
+                title=(
+                    "[bold green]PostgreSQL Preflight Ready[/bold green]"
+                    if preflight_ready
+                    else "[bold red]PostgreSQL Preflight Blocked[/bold red]"
+                ),
+                subtitle=summary,
+                border_style="green" if preflight_ready else "red",
+                padding=(0, 1),
+            )
+
         # ---- Table stats ----
         stats_table = Table(show_header=True, header_style="bold dim", box=None,
                             padding=(0, 1), show_edge=False)
@@ -208,7 +301,11 @@ class RichProgressDisplay:
         bottom = RColumns([phase_panel, stats_panel], equal=False, expand=True)
 
         from rich.console import Group
-        return Group(header, progress_panel, bottom)
+        renderables = [header, progress_panel]
+        if preflight_panel is not None:
+            renderables.append(preflight_panel)
+        renderables.append(bottom)
+        return Group(*renderables)
 
     def _print_final_summary(self) -> None:
         if not _RICH_AVAILABLE or not self._console:
@@ -248,6 +345,13 @@ class NoopProgressDisplay:
 
     def record_table_stats(self, table: str, source_rows: int, success: int, failure: int) -> None:
         print(f"  → {table}: {success}/{source_rows} rows migrated, {failure} failed")
+
+    def record_preflight(self, preflight: dict[str, Any]) -> None:
+        print("PostgreSQL Preflight")
+        for table_name, schema_status, source_rows, target_rows, action in _preflight_rows(preflight):
+            print(f"  {table_name}: {schema_status}; source={source_rows}; target={target_rows}; {action}")
+        for blocker in _preflight_blockers(preflight):
+            print(f"  Blocked: {blocker}")
 
     def __enter__(self) -> "NoopProgressDisplay":
         return self

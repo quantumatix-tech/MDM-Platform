@@ -20,6 +20,7 @@ from core.connectors.base import (
     TargetConnector,
     UpsertResult,
 )
+from core.migration_plan import MigrationPlan, PostgresMigrationPlanner
 from core.schema_mapping.registry import TypeMappingRegistry
 from core.secrets import create_secret_provider
 from core.status_server import StatusServer
@@ -61,6 +62,10 @@ class MigrationOrchestrator:
     def _update_status(self, phase: str, progress: int, errors: list[str]) -> None:
         if self._status is not None:
             self._status.update_status(phase, progress, errors)
+
+    def _record_preflight(self, preflight: dict[str, Any]) -> None:
+        if self._status is not None and hasattr(self._status, "record_preflight"):
+            self._status.record_preflight(preflight)
 
     def _estimate_total_rows(self, objects: list[str]) -> int:
         total = 0
@@ -122,13 +127,29 @@ class MigrationOrchestrator:
 
         try:
             # ---------- Connect ----------
-            self._resolve_connector_secrets(self._source, self._config.get("source", {}))
-            self._resolve_connector_secrets(self._target, self._config.get("target", {}))
-            self._apply_schema_scope(self._source)
-            self._source.connect()
-            self._target.connect()
+            plan = self._build_postgresql_plan()
+            if plan is not None:
+                result["preflight"] = plan.to_dict()
+            else:
+                self._resolve_connector_secrets(self._source, self._config.get("source", {}))
+                self._resolve_connector_secrets(self._target, self._config.get("target", {}))
+                self._apply_schema_scope(self._source)
+                self._source.connect()
+                self._target.connect()
             result["phases"]["connect"] = "success"
             self._update_status("connect", 2, [])
+
+            if plan is not None:
+                self._record_preflight(plan.to_dict())
+                if not plan.ready:
+                    result["status"] = "blocked"
+                    result["error"] = "Migration preflight contains blockers; no DDL or DML was performed."
+                    audit_log(
+                        phase="preflight",
+                        status="blocked",
+                        details={"plan": plan.to_dict()},
+                    )
+                    return result
 
             self._target.ensure_database_exists()
             result["phases"]["ensure_database"] = "success"
@@ -461,6 +482,48 @@ class MigrationOrchestrator:
             "duration_s": round(end_time - start_time, 2),
         })
         return result
+
+    def run_dry_run(self) -> dict[str, Any]:
+        """Build and report a PostgreSQL full-migration plan without writing data."""
+        run_id = get_run_id()
+        set_run_id(run_id)
+        audit_log(phase="dry_run", status="started", details={"run_id": run_id})
+
+        plan = self._build_postgresql_plan()
+        if plan is None:
+            return {
+                "run_id": run_id,
+                "mode": "dry-run",
+                "status": "blocked",
+                "phases": {},
+                "error": "Dry-run planning is currently supported only for PostgreSQL-to-PostgreSQL full migrations.",
+            }
+
+        status = "ready" if plan.ready else "blocked"
+        result = {
+            "run_id": run_id,
+            "mode": "dry-run",
+            "status": status,
+            "phases": {"discover": {"objects": [obj.object_name for obj in plan.objects]}},
+            "preflight": plan.to_dict(),
+        }
+        audit_log(phase="dry_run", status=status, details={"plan": plan.to_dict()})
+        self._update_status("dry-run complete", 100, [])
+        return result
+
+    def _is_postgresql_full_migration(self) -> bool:
+        return (
+            self._config.get("source", {}).get("engine") == "postgresql"
+            and self._config.get("target", {}).get("engine") == "postgresql"
+        )
+
+    def _build_postgresql_plan(self) -> MigrationPlan | None:
+        if not self._is_postgresql_full_migration():
+            return None
+        self._resolve_connector_secrets(self._source, self._config.get("source", {}))
+        self._resolve_connector_secrets(self._target, self._config.get("target", {}))
+        self._apply_schema_scope(self._source)
+        return PostgresMigrationPlanner(self._source, self._target, self._config).build()
 
     def _resolve_connector_secrets(self, connector: Any, config: dict[str, Any]) -> None:
         if self._secret_resolver is None:

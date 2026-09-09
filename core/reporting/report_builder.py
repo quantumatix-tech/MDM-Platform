@@ -158,6 +158,7 @@ class ReportBuilder:
             "duration_seconds": self._duration(),
             "status": self._result.get("status"),
             "phases": self._result.get("phases", {}),
+            "preflight": self._result.get("preflight"),
             "error": self._result.get("error") or self._result.get("cdc_error"),
         }
 
@@ -272,6 +273,41 @@ class ReportBuilder:
         <h2 class="section-title">✅ Validation <span class="section-sub">({v_mode})</span></h2>
         <table class="data-table"><thead><tr><th>Table</th><th>Source</th><th>Target</th><th>Result</th></tr></thead>
         <tbody>{rows_val or '<tr><td colspan=4 style="text-align:center;color:#4b5563">No validation data</td></tr>'}</tbody></table>
+      </section>"""
+
+        # ---- PostgreSQL preflight / migration plan ----
+        preflight = data.get("preflight")
+        preflight_html = ""
+        if isinstance(preflight, dict):
+            schema_status_labels = {
+                "COMPATIBLE": "Compatible",
+                "TARGET_MISSING": "Target Missing",
+                "MISMATCH": "Schema Mismatch",
+            }
+            action_labels = {
+                "MIGRATE": "Update & Migrate",
+                "CREATE_AND_MIGRATE": "Create & Migrate",
+                "BLOCK": "Migration Blocked",
+            }
+            plan_rows = ""
+            for object_plan in preflight.get("objects", []):
+                details = object_plan.get("blockers") or object_plan.get("warnings") or ["—"]
+                schema_status = (object_plan.get("schema_comparison") or {}).get("status")
+                target_rows = object_plan.get("target_row_count")
+                plan_rows += f"""<tr>
+          <td class="td-table">{object_plan.get('object_name') or '—'}</td>
+          <td>{schema_status_labels.get(schema_status, '—')}</td>
+          <td class="td-num">{object_plan.get('source_row_count') if object_plan.get('source_row_count') is not None else '—'}</td>
+          <td class="td-num">{target_rows if target_rows is not None else 0}</td>
+          <td><span class="badge-small {'badge-success' if object_plan.get('readiness') == 'READY' else 'badge-error'}">{action_labels.get(object_plan.get('action'), 'Migration Blocked')}</span></td>
+          <td>{'<br>'.join(str(detail) for detail in details)}</td>
+        </tr>"""
+            plan_blockers = preflight.get("blockers", [])
+            preflight_html = f"""<section class="section">
+        <h2 class="section-title">🧭 PostgreSQL Migration Plan <span class="section-sub">{'READY' if preflight.get('ready') else 'BLOCKED'}</span></h2>
+        <p class="section-sub">Source connected: {preflight.get('source_connected', False)} · Target connected: {preflight.get('target_connected', False)} · Plan blockers: {len(plan_blockers)}</p>
+        <div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Table</th><th>Schema Status</th><th style="text-align:right">Source Rows</th><th style="text-align:right">Target Rows</th><th>Migration Action</th><th>Warnings / Blockers</th></tr></thead>
+        <tbody>{plan_rows or '<tr><td colspan=6 style="text-align:center;color:#4b5563">No objects discovered</td></tr>'}</tbody></table></div>
       </section>"""
 
         # ---- Errors ----
@@ -474,6 +510,9 @@ class ReportBuilder:
 
   <!-- Validation -->
   {val_html}
+
+  <!-- PostgreSQL Preflight / Plan -->
+  {preflight_html}
 
   <!-- Phase Details (accordion) -->
   <section class="section">

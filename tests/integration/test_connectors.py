@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from core.connectors.base import (
@@ -13,26 +15,34 @@ from core.connectors.mssql import MSSQLSourceConnector, MSSQLTargetConnector
 from core.validator import Validator
 
 
+def _postgres_config(role: str) -> dict[str, object]:
+    password = os.getenv(f"INTEGRATION_PG_{role.upper()}_PASSWORD")
+    if not password:
+        pytest.skip(f"Set INTEGRATION_PG_{role.upper()}_PASSWORD to run PostgreSQL integration tests.")
+    database = os.getenv(
+        f"INTEGRATION_PG_{role.upper()}_DATABASE",
+        "migration_test" if role == "source" else "migration_target",
+    )
+    return {
+        "host": os.getenv("INTEGRATION_PG_HOST", "127.0.0.1"),
+        "port": int(os.getenv("INTEGRATION_PG_PORT", "5432")),
+        "database": database,
+        "username": os.getenv("INTEGRATION_PG_USERNAME", "postgres"),
+        "password": password,
+        "ssl": os.getenv("INTEGRATION_PG_SSL", "false").lower() == "true",
+    }
+
+
+def _require_safe_postgres_writes() -> None:
+    if os.getenv("INTEGRATION_PG_SAFE_WRITE_TESTS", "false").lower() != "true":
+        pytest.skip("Set INTEGRATION_PG_SAFE_WRITE_TESTS=true for isolated PostgreSQL write tests.")
+
+
 @pytest.mark.integration
 class TestPostgresFullMigration:
     @pytest.fixture(autouse=True)
     def setup(self):
-        self.source_config = {
-            "host": "localhost",
-            "port": 5432,
-            "database": "migration_test",
-            "username": "test_user",
-            "password": "test_pass",
-            "ssl": False,
-        }
-        self.target_config = {
-            "host": "localhost",
-            "port": 5432,
-            "database": "migration_target",
-            "username": "test_user",
-            "password": "test_pass",
-            "ssl": False,
-        }
+        self.source_config = _postgres_config("source")
 
     def test_source_connect_and_list_tables(self):
         source = PostgresSourceConnector(self.source_config)
@@ -52,8 +62,9 @@ class TestPostgresFullMigration:
         source._conn.close()
 
     def test_target_upsert_batch_never_drops(self):
+        _require_safe_postgres_writes()
         source = PostgresSourceConnector(self.source_config)
-        target = PostgresTargetConnector(self.target_config)
+        target = PostgresTargetConnector(_postgres_config("target"))
         source.connect()
         target.connect()
 
@@ -73,7 +84,8 @@ class TestPostgresFullMigration:
         target._conn.close()
 
     def test_upsert_batch_uses_on_conflict_pk(self):
-        target = PostgresTargetConnector(self.target_config)
+        _require_safe_postgres_writes()
+        target = PostgresTargetConnector(_postgres_config("target"))
         target.connect()
 
         schema = Schema(
@@ -260,17 +272,12 @@ class TestCrossEngineMigration:
 @pytest.mark.integration
 class TestValidatorWithRealConnectors:
     def test_validator_count_match(self):
-        pg_config = {
-            "host": "localhost",
-            "port": 5432,
-            "database": "migration_test",
-            "username": "test_user",
-            "password": "test_pass",
-            "ssl": False,
-        }
+        _require_safe_postgres_writes()
+        source_config = _postgres_config("source")
+        target_config = _postgres_config("target")
 
-        source = PostgresSourceConnector(pg_config)
-        target = PostgresTargetConnector(pg_config)
+        source = PostgresSourceConnector(source_config)
+        target = PostgresTargetConnector(target_config)
         source.connect()
         target.connect()
 
@@ -294,17 +301,12 @@ class TestValidatorWithRealConnectors:
         target._conn.close()
 
     def test_validator_checksum_uses_sha256(self):
-        pg_config = {
-            "host": "localhost",
-            "port": 5432,
-            "database": "migration_test",
-            "username": "test_user",
-            "password": "test_pass",
-            "ssl": False,
-        }
+        _require_safe_postgres_writes()
+        source_config = _postgres_config("source")
+        target_config = _postgres_config("target")
 
-        source = PostgresSourceConnector(pg_config)
-        target = PostgresTargetConnector(pg_config)
+        source = PostgresSourceConnector(source_config)
+        target = PostgresTargetConnector(target_config)
         source.connect()
         target.connect()
 

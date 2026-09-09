@@ -790,6 +790,7 @@ class PostgresTargetConnector(TargetConnector):
     def ensure_database_exists(self) -> None:
         dbname = self._config["database"]
         validate_identifier(dbname, "database")
+        self._conn.rollback()
         self._conn.autocommit = True
         with self._conn.cursor() as cur:
             cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (dbname,))
@@ -801,6 +802,59 @@ class PostgresTargetConnector(TargetConnector):
         import psycopg
         self._conn.close()
         self._conn = psycopg.connect(**_make_conn_kwargs(self._config))
+
+    def list_objects(self, schema_names: list[str]) -> list[tuple[str, str]]:
+        """Read-only target table discovery for PostgreSQL preflight planning."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_schema, table_name FROM information_schema.tables "
+                "WHERE table_schema = ANY(%s) AND table_type = 'BASE TABLE' "
+                "ORDER BY table_schema, table_name",
+                (schema_names,),
+            )
+            return [(row[0], row[1]) for row in cur.fetchall()]
+
+    def inspect_schema(self, object_name: str, schema_name: str = "public") -> Schema | None:
+        """Return read-only target table metadata used for source/target comparison."""
+        validate_identifier(object_name, "table")
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = %s AND table_schema = %s",
+                (object_name, schema_name),
+            )
+            if cur.fetchone() is None:
+                return None
+            cur.execute(
+                "SELECT c.column_name, pg_catalog.format_type(a.atttypid, a.atttypmod), "
+                "c.is_nullable, c.column_default, "
+                "CASE WHEN a.attgenerated = 's' THEN pg_get_expr(ad.adbin, ad.adrelid) END "
+                "FROM information_schema.columns c "
+                "JOIN pg_class pc ON pc.relname = c.table_name "
+                "JOIN pg_namespace pn ON pn.oid = pc.relnamespace AND pn.nspname = c.table_schema "
+                "JOIN pg_attribute a ON a.attrelid = pc.oid AND a.attname = c.column_name "
+                "AND a.attnum > 0 AND NOT a.attisdropped "
+                "LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum "
+                "WHERE c.table_name = %s AND c.table_schema = %s ORDER BY c.ordinal_position",
+                (object_name, schema_name),
+            )
+            columns = [
+                Column(
+                    name=row[0], source_type=row[1], nullable=(row[2] == "YES"),
+                    default=None if row[4] else row[3], generated=row[4],
+                )
+                for row in cur.fetchall()
+            ]
+            cur.execute(
+                "SELECT kcu.column_name FROM information_schema.table_constraints tc "
+                "JOIN information_schema.key_column_usage kcu "
+                "ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+                "WHERE tc.table_name = %s AND tc.table_schema = %s "
+                "AND tc.constraint_type = 'PRIMARY KEY' ORDER BY kcu.ordinal_position",
+                (object_name, schema_name),
+            )
+            primary_key = [row[0] for row in cur.fetchall()]
+        return Schema(name=object_name, schema_name=schema_name, columns=columns, primary_key=primary_key)
 
     # ------------------------------------------------------------------
     # Phase 1 — Extensions

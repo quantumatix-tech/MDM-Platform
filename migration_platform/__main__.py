@@ -68,6 +68,11 @@ class _CompoundReporter:
             if hasattr(r, "record_table_stats"):
                 r.record_table_stats(table, source_rows, success, failure)
 
+    def record_preflight(self, preflight: dict) -> None:
+        for r in self._reporters:
+            if hasattr(r, "record_preflight"):
+                r.record_preflight(preflight)
+
 
 def instantiate_connector(connector_cls, connection_config):
     return connector_cls(connection_config)
@@ -93,6 +98,10 @@ def main():
         "--no-live-ui", action="store_true",
         help="Disable rich terminal UI (raw JSON output)",
     )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Build a PostgreSQL full-migration plan without DDL or DML",
+    )
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
@@ -102,6 +111,9 @@ def main():
     target_cfg = config.get("target", {})
     source_type = source_cfg.get("engine")
     target_type = target_cfg.get("engine")
+    dry_run = args.dry_run or config.get("migration", {}).get("dry_run", False)
+    if dry_run and args.mode != "full":
+        raise SystemExit("--dry-run is supported only with the full migration mode.")
 
     if source_type not in SOURCE_CONNECTORS:
         raise SystemExit(f"Unknown source engine: {source_type!r}. Available: {list(SOURCE_CONNECTORS)}")
@@ -141,7 +153,9 @@ def main():
             print(f"Live dashboard: http://localhost:{args.port}/")
             print(f"Audit log:      {log_path}")
 
-        if args.mode == "full":
+        if dry_run:
+            result = orchestrator.run_dry_run()
+        elif args.mode == "full":
             result = orchestrator.run_full()
         elif args.mode == "cdc-incremental":
             result = orchestrator.run_cdc(max_iterations=1)
