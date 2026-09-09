@@ -269,9 +269,11 @@ class PostgresSourceConnector(SourceConnector):
                 "FROM information_schema.table_constraints tc "
                 "JOIN information_schema.key_column_usage kcu "
                 "  ON tc.constraint_name = kcu.constraint_name "
-                "WHERE tc.table_name = %s AND tc.constraint_type = 'PRIMARY KEY' "
+                "  AND tc.table_schema = kcu.table_schema "
+                "WHERE tc.table_name = %s AND tc.table_schema = %s "
+                "  AND tc.constraint_type = 'PRIMARY KEY' "
                 "ORDER BY kcu.ordinal_position",
-                (object_name,),
+                (object_name, table_schema),
             )
             primary_key = [row[0] for row in cur.fetchall()]
 
@@ -284,9 +286,10 @@ class PostgresSourceConnector(SourceConnector):
                 "JOIN pg_index ix ON t.oid = ix.indrelid "
                 "JOIN pg_class i ON i.oid = ix.indexrelid "
                 "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) "
+                "JOIN pg_namespace n ON n.oid = t.relnamespace AND n.nspname = %s "
                 "WHERE t.relname = %s AND NOT ix.indisprimary "
                 "GROUP BY i.relname, ix.indisunique, i.oid",
-                (object_name,),
+                (table_schema, object_name),
             )
             for row in cur.fetchall():
                 idx_name, is_unique, idx_cols, idx_ddl = row
@@ -305,12 +308,14 @@ class PostgresSourceConnector(SourceConnector):
                 "FROM information_schema.table_constraints tc "
                 "JOIN information_schema.key_column_usage kcu "
                 "  ON tc.constraint_name = kcu.constraint_name "
+                "  AND tc.table_schema = kcu.table_schema "
                 "JOIN information_schema.referential_constraints rc "
                 "  ON tc.constraint_name = rc.constraint_name "
                 "JOIN information_schema.constraint_column_usage ccu "
                 "  ON rc.unique_constraint_name = ccu.constraint_name "
-                "WHERE tc.table_name = %s AND tc.constraint_type = 'FOREIGN KEY'",
-                (object_name,),
+                "WHERE tc.table_name = %s AND tc.table_schema = %s "
+                "  AND tc.constraint_type = 'FOREIGN KEY'",
+                (object_name, table_schema),
             )
             fk_map: dict[str, ForeignKey] = {}
             for row in cur.fetchall():
@@ -331,9 +336,11 @@ class PostgresSourceConnector(SourceConnector):
                 "FROM information_schema.table_constraints tc "
                 "JOIN information_schema.check_constraints cc "
                 "  ON tc.constraint_name = cc.constraint_name "
-                "WHERE tc.table_name = %s AND tc.constraint_type = 'CHECK' "
+                "  AND tc.constraint_schema = cc.constraint_schema "
+                "WHERE tc.table_name = %s AND tc.table_schema = %s "
+                "  AND tc.constraint_type = 'CHECK' "
                 "  AND cc.check_clause NOT LIKE '%%IS NOT NULL%%'",
-                (object_name,),
+                (object_name, table_schema),
             )
             for row in cur.fetchall():
                 chk_name, expression = row

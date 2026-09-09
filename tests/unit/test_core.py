@@ -1994,6 +1994,144 @@ class TestPostgresCrossSchemaForeignKey:
         assert "ON DELETE SET NULL ON UPDATE RESTRICT" in fk_sql
 
 
+class TestPostgresCrossSchemaMetadataIsolation:
+    """
+    Regression: PostgresSourceConnector.get_schema() must scope all
+    metadata queries (PK, indexes, FKs, check constraints) by table_schema
+    so that same-named tables in different schemas do not pollute each
+    other's metadata.
+
+    Example: public.customers and cloud_test.customers both have
+    customer_id as PK. Without schema filtering, the PK query returns
+    customer_id twice, producing PRIMARY KEY (customer_id, customer_id).
+    """
+
+    def _source_conn(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        cfg = {
+            "host": "x", "port": 1, "database": "x",
+            "username": "u", "password": "p", "ssl": False,
+            "include_schemas": ["public", "cloud_test"],
+        }
+        return PostgresSourceConnector(cfg)
+
+    def _mock_cursor_for_schema(self, pk_rows, idx_rows=None, fk_rows=None, check_rows=None):
+        idx_rows = idx_rows if idx_rows is not None else []
+        fk_rows = fk_rows if fk_rows is not None else []
+        check_rows = check_rows if check_rows is not None else []
+        cur = MagicMock()
+        cur.fetchone.side_effect = [
+            ("cloud_test",),  # schema resolution
+            None,             # RLS
+            None,             # partition key
+        ]
+        cur.fetchall.side_effect = [
+            [("customer_id", "integer", "NO", None, None, None)],  # columns
+            pk_rows,                                                 # PK
+            idx_rows,                                                # indexes
+            fk_rows,                                                 # FKs
+            check_rows,                                              # check constraints
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        return conn, cur
+
+    def test_get_schema_pk_query_scoped_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[("customer_id",)],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        pk_sql = next(call.args[0] for call in cur.execute.call_args_list if "PRIMARY KEY" in call.args[0])
+        assert "tc.table_schema = %s" in pk_sql, (
+            f"PK query must filter by table_schema. Got: {pk_sql!r}"
+        )
+        pk_params = next(call.args[1] for call in cur.execute.call_args_list if "PRIMARY KEY" in call.args[0])
+        assert pk_params == ("customers", "cloud_test"), (
+            f"PK query params must include table_schema. Got: {pk_params!r}"
+        )
+        assert schema.primary_key == ["customer_id"]
+
+    def test_get_schema_index_query_scoped_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[],
+            idx_rows=[
+                ("idx_customer_id", True, ["customer_id"],
+                 "CREATE UNIQUE INDEX idx_customer_id ON cloud_test.customers (customer_id)"),
+            ],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        idx_sql = next(call.args[0] for call in cur.execute.call_args_list if "pg_get_indexdef" in call.args[0])
+        assert "n.nspname = %s" in idx_sql, (
+            f"Index query must filter by schema namespace. Got: {idx_sql!r}"
+        )
+        idx_params = next(call.args[1] for call in cur.execute.call_args_list if "pg_get_indexdef" in call.args[0])
+        assert idx_params == ("cloud_test", "customers"), (
+            f"Index query params must include schema then table name. Got: {idx_params!r}"
+        )
+        assert len(schema.indexes) == 1
+        assert schema.indexes[0].name == "idx_customer_id"
+
+    def test_get_schema_fk_query_scoped_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[],
+            fk_rows=[
+                ("fk_customer", "customer_id", "public", "customers", "customer_id", "CASCADE", "CASCADE"),
+            ],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        fk_sql = next(call.args[0] for call in cur.execute.call_args_list if "FOREIGN KEY" in call.args[0])
+        assert "tc.table_schema = %s" in fk_sql, (
+            f"FK query must filter by table_schema. Got: {fk_sql!r}"
+        )
+        assert "tc.table_schema = kcu.table_schema" in fk_sql, (
+            f"FK join must include schema equality. Got: {fk_sql!r}"
+        )
+        fk_params = next(call.args[1] for call in cur.execute.call_args_list if "FOREIGN KEY" in call.args[0])
+        assert fk_params == ("customers", "cloud_test"), (
+            f"FK query params must include table_schema. Got: {fk_params!r}"
+        )
+        assert len(schema.foreign_keys) == 1
+        assert schema.foreign_keys[0].name == "fk_customer"
+
+    def test_get_schema_check_constraint_query_scoped_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[],
+            check_rows=[("chk_customer_active", "active = true")],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        chk_sql = next(call.args[0] for call in cur.execute.call_args_list if "CHECK" in call.args[0])
+        assert "tc.table_schema = %s" in chk_sql, (
+            f"Check constraint query must filter by table_schema. Got: {chk_sql!r}"
+        )
+        assert "tc.constraint_schema = cc.constraint_schema" in chk_sql, (
+            f"Check constraint join must include schema equality. Got: {chk_sql!r}"
+        )
+        chk_params = next(call.args[1] for call in cur.execute.call_args_list if "CHECK" in call.args[0])
+        assert chk_params == ("customers", "cloud_test"), (
+            f"Check constraint query params must include table_schema. Got: {chk_params!r}"
+        )
+        assert len(schema.check_constraints) == 1
+        assert schema.check_constraints[0].name == "chk_customer_active"
+
+
 class TestConfigSchema:
     def test_schema_yaml_is_valid(self):
         import yaml
