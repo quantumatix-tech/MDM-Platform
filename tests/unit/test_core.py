@@ -9,6 +9,16 @@ from core.connectors.base import (
     CDCEngine,
     Schema,
     Column,
+    Index,
+    ForeignKey,
+    CheckConstraint,
+    ViewDefinition,
+    MaterializedViewDef,
+    FunctionDef,
+    TriggerDef,
+    CommentDef,
+    GrantDef,
+    RLSPolicy,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -377,7 +387,7 @@ class TestPostgresToPostgresBaseline:
         source = MagicMock(spec=SourceConnector)
         source.list_objects.return_value = list(self.EXPECTED_TABLES)
 
-        def _count(obj_name: str) -> int:
+        def _count(obj_name: str, **kwargs) -> int:
             return counts.get(obj_name, 0)
 
         source.get_object_count.side_effect = _count
@@ -391,7 +401,7 @@ class TestPostgresToPostgresBaseline:
 
         source.get_schema.side_effect = _schema
 
-        def _export(obj_name: str):
+        def _export(obj_name: str, **kwargs):
             n = counts.get(obj_name, 0)
             for i in range(1, n + 1):
                 yield {"id": i}
@@ -408,7 +418,7 @@ class TestPostgresToPostgresBaseline:
 
         target.upsert_batch.side_effect = _upsert
 
-        def _target_count(obj_name: str) -> int:
+        def _target_count(obj_name: str, **kwargs) -> int:
             return counts.get(obj_name, 0)
 
         target.get_object_count.side_effect = _target_count
@@ -606,6 +616,25 @@ class TestPostgresDiscoverySchemaFilter:
         assert "t_public_1" in tables
         assert "t_public_2" in tables
 
+    def test_orchestrator_style_mutation_reaches_discovery(self):
+        """
+        Regression: in production, the orchestrator constructs the source
+        connector with only the ``connection:`` sub-dict, then later mutates
+        ``source._config['include_schemas']`` inside ``_apply_schema_scope``.
+        Discovery must pick up the mutated value.
+        """
+        connector = self._make_connector(None)
+        connector._conn.cursor.return_value = self._make_smart_cursor("audit_test")
+
+        connector._config["include_schemas"] = ["public", "audit_test"]
+
+        tables = connector.list_objects()
+
+        assert any("audit_test" in t for t in tables) or len(tables) >= 1, (
+            f"Discovery did not see orchestrator's include_schemas mutation. "
+            f"Got: {tables!r}"
+        )
+
 
 class TestNonPublicSchemaDDLQualification:
     """
@@ -766,6 +795,1203 @@ class TestNonPublicSchemaDDLQualification:
             f"Got: {ddl!r}"
         )
         assert "PRIMARY KEY (id)" in ddl
+
+
+class TestPostgresSequenceSchemaQualification:
+    """
+    Regression: free-standing sequences living in non-public schemas
+    (e.g. ``audit_test.test_sequence``) must be discovered with their
+    schema and re-created in the correct target schema.  Previously
+    the source connector dropped the schema and the target emitted
+    ``CREATE SEQUENCE test_sequence`` (wrong schema), which then caused
+    ``relation "audit_test.test_sequence" does not exist`` during
+    CREATE TABLE.
+    """
+
+    def _source_conn(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        cfg = {
+            "host": "x", "port": 1, "database": "x",
+            "username": "u", "password": "p", "ssl": False,
+            "include_schemas": ["public", "audit_test"],
+        }
+        return PostgresSourceConnector(cfg)
+
+    def test_list_all_sequences_captures_schema_name(self):
+        connector = self._source_conn()
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            # (schemaname, sequencename, start, min, max, incr, cycle, last, owned_by)
+            ("public",      "customers_customer_id_seq", 1, 1, 2147483647, 1, False, None, "public.customers.customer_id"),
+            ("audit_test",  "test_sequence",             1, 1, 9223372036854775807, 1, False, None, None),
+        ]
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        seqs = connector.list_all_sequences()
+        by_name = {s.name: s for s in seqs}
+        assert "test_sequence" in by_name
+        assert by_name["test_sequence"].schema == "audit_test", (
+            f"SequenceDef.schema must be populated for non-public sequences. "
+            f"Got: {by_name['test_sequence'].schema!r}"
+        )
+        assert by_name["customers_customer_id_seq"].schema == "public"
+        # owned_by must be schema-qualified so the target can re-attach ownership
+        assert by_name["customers_customer_id_seq"].owned_by == "public.customers.customer_id"
+
+    def test_target_create_sequence_qualifies_non_public_schema(self):
+        """
+        Contract: target ``create_sequence`` must emit a schema-qualified
+        CREATE SEQUENCE for non-public schemas.  OWNED BY is intentionally
+        deferred to ``apply_constraints`` (Phase 6+) because Phase 3.5
+        runs before tables exist — applying it here would fail every
+        sequence that has an owning table.
+        """
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import SequenceDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        seq = SequenceDef(
+            name="test_sequence",
+            schema="audit_test",
+            start_value=1, min_value=1, max_value=10**18,
+            increment=1, cycle=False,
+            owned_by="audit_test.test_customers.customer_id",
+        )
+        target.create_sequence(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE SEQUENCE" in s), None)
+        assert create_sql is not None, "CREATE SEQUENCE was not emitted"
+        assert '"audit_test"' in create_sql, (
+            f"CREATE SEQUENCE must schema-qualify non-public sequences. Got: {create_sql!r}"
+        )
+        assert '"test_sequence"' in create_sql
+        assert create_sql.index('"audit_test"') < create_sql.index('"test_sequence"')
+        # OWNED BY must NOT be emitted here — see docstring.
+        assert not any("OWNED BY" in s for s in executed), (
+            "create_sequence must defer OWNED BY until after the owning table exists"
+        )
+
+    def test_target_create_sequence_remains_unqualified_for_public(self):
+        """
+        Backward-compat regression: sequences in ``public`` (or with
+        no schema) must still produce an unqualified CREATE SEQUENCE.
+        """
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import SequenceDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        seq = SequenceDef(
+            name="customers_customer_id_seq",
+            schema="public",
+            start_value=1, min_value=1, max_value=2147483647,
+            increment=1, cycle=False,
+            owned_by=None,
+        )
+        target.create_sequence(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE SEQUENCE" in s), None)
+        assert create_sql is not None
+        assert create_sql.strip().startswith("CREATE SEQUENCE IF NOT EXISTS customers_customer_id_seq"), (
+            f"Public schema sequences must stay unqualified. Got: {create_sql!r}"
+        )
+
+
+class TestPostgresSequenceOwnership:
+    """
+    Regression: sequence OWNED BY relationships must be preserved across
+    migration, including schema-qualified ownership for non-public schemas.
+    """
+
+    def test_apply_sequence_ownership_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        from core.connectors.base import SequenceDef
+        seq = SequenceDef(
+            name="test_orders_order_id_seq",
+            schema="audit_test",
+            start_value=1, min_value=1, max_value=10**18,
+            increment=1, cycle=False,
+            owned_by="audit_test.test_orders.order_id",
+        )
+        target.apply_sequence_ownership(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER SEQUENCE" in s), None)
+        assert alter_sql is not None
+        assert '"audit_test"."test_orders_order_id_seq"' in alter_sql
+        assert "OWNED BY \"audit_test\".\"test_orders\".\"order_id\"" in alter_sql
+
+    def test_apply_sequence_ownership_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        from core.connectors.base import SequenceDef
+        seq = SequenceDef(
+            name="customers_customer_id_seq",
+            schema="public",
+            start_value=1, min_value=1, max_value=2147483647,
+            increment=1, cycle=False,
+            owned_by="public.customers.customer_id",
+        )
+        target.apply_sequence_ownership(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER SEQUENCE" in s), None)
+        assert alter_sql is not None
+        assert alter_sql.strip().startswith('ALTER SEQUENCE customers_customer_id_seq OWNED BY customers."customer_id"')
+
+    def test_apply_sequence_ownership_skips_unowned_sequence(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        from core.connectors.base import SequenceDef
+        seq = SequenceDef(
+            name="test_sequence",
+            schema="audit_test",
+            start_value=1, min_value=1, max_value=10**18,
+            increment=1, cycle=False,
+            owned_by=None,
+        )
+        target.apply_sequence_ownership(seq)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER SEQUENCE" in s), None)
+        assert alter_sql is None, "Unowned sequence must not emit ALTER SEQUENCE"
+
+
+class TestPostgresSyncSequenceSchemaQualification:
+    """
+    Regression: sync_sequence must schema-qualify the table reference
+    so pg_get_serial_sequence() and the MAX() query resolve correctly
+    for non-public schemas.
+    """
+
+    def test_sync_sequence_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = [1]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        target.sync_sequence("test_orders", "order_id", schema_name="audit_test")
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        sync_sql = next((s for s in executed if "pg_get_serial_sequence" in s), None)
+        assert sync_sql is not None
+        assert '"audit_test"."test_orders"' in sync_sql
+        assert 'FROM "audit_test"."test_orders"' in sync_sql
+
+    def test_sync_sequence_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = [1]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        target.sync_sequence("customers", "customer_id")
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        sync_sql = next((s for s in executed if "pg_get_serial_sequence" in s), None)
+        assert sync_sql is not None
+        assert '"' not in sync_sql, (
+            f"Public schema sequences must stay unquoted. Got: {sync_sql!r}"
+        )
+
+
+class TestPostgresCreateObjectTransactionIsolation:
+    """
+    Regression: a single failed CREATE TABLE DDL must not leave the
+    target connection in ``idle in transaction`` state.  Without a
+    rollback, every subsequent DDL on the connection raises
+    ``current transaction is aborted`` until ROLLBACK is issued.
+    """
+
+    def _target(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        return PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+
+    def test_create_object_if_missing_rolls_back_on_ddl_failure(self):
+        target = self._target()
+        cur = MagicMock()
+        cur.fetchone.return_value = None  # table does not yet exist
+        cur.execute.side_effect = [
+            None,  # existence SELECT
+            RuntimeError("relation \"audit_test.test_sequence\" does not exist"),  # CREATE TABLE
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="test_customers",
+            schema_name="audit_test",
+            columns=[
+                Column(name="customer_id", source_type="integer",
+                       default="nextval('audit_test.test_sequence'::regclass)"),
+            ],
+            primary_key=["customer_id"],
+        )
+
+        with pytest.raises(RuntimeError, match="does not exist"):
+            target.create_object_if_missing(schema)
+
+        # The rollback MUST have been called so the connection is
+        # usable for the next object.
+        conn.rollback.assert_called()
+
+    def test_create_object_if_missing_commits_on_success(self):
+        target = self._target()
+        cur = MagicMock()
+        cur.fetchone.return_value = None  # table does not yet exist
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="customers",
+            columns=[Column(name="id", source_type="integer")],
+            primary_key=["id"],
+        )
+        target.create_object_if_missing(schema)
+        conn.commit.assert_called()
+        conn.rollback.assert_not_called()
+
+
+class TestPostgresViewSchemaQualification:
+    """
+    Regression: views in non-public schemas must be discovered with
+    their schema and created in the correct target schema.  Previously
+    the source connector dropped the schema and the target emitted
+    CREATE VIEW view_name (always public), causing the view to be
+    created in the wrong schema or fail.
+    """
+
+    def test_list_views_captures_schema_name(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("customer_summary", "public", "SELECT * FROM customers"),
+            ("order_summary", "audit_test", "SELECT * FROM test_orders"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        views = connector.list_views()
+        by_name = {v.name: v for v in views}
+        assert "order_summary" in by_name
+        assert by_name["order_summary"].schema_name == "audit_test"
+        assert by_name["customer_summary"].schema_name == "public"
+
+    def test_target_create_view_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        view = ViewDefinition(
+            name="order_summary",
+            schema_name="audit_test",
+            definition="SELECT * FROM test_orders",
+        )
+        target.create_view(view)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE OR REPLACE VIEW" in s), None)
+        assert create_sql is not None
+        assert '"audit_test"' in create_sql
+        assert '"order_summary"' in create_sql
+        assert create_sql.index('"audit_test"') < create_sql.index('"order_summary"')
+
+    def test_target_create_view_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        view = ViewDefinition(
+            name="customer_summary",
+            schema_name="public",
+            definition="SELECT * FROM customers",
+        )
+        target.create_view(view)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE OR REPLACE VIEW" in s), None)
+        assert create_sql is not None
+        assert create_sql.strip().startswith("CREATE OR REPLACE VIEW customer_summary")
+
+
+class TestPostgresMaterializedViewSchemaQualification:
+    """
+    Regression: materialized views in non-public schemas must be discovered
+    with their schema and created in the correct target schema.  Previously
+    the source connector dropped the schema and the target emitted
+    CREATE MATERIALIZED VIEW view_name (always public), causing the object
+    to be created in the wrong schema or fail.
+    """
+
+    def test_list_materialized_views_captures_schema_name(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("public", "public", "SELECT * FROM customers"),
+            ("customer_balance_summary", "audit_test", "SELECT * FROM test_customers"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        mvs = connector.list_materialized_views()
+        by_name = {mv.name: mv for mv in mvs}
+        assert "customer_balance_summary" in by_name
+        assert by_name["customer_balance_summary"].schema_name == "audit_test"
+        assert by_name["public"].schema_name == "public"
+
+    def test_target_create_materialized_view_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        mv = MaterializedViewDef(
+            name="customer_balance_summary",
+            schema_name="audit_test",
+            definition="SELECT * FROM test_customers",
+        )
+        target.create_materialized_view(mv)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE MATERIALIZED VIEW" in s), None)
+        assert create_sql is not None
+        assert '"audit_test"' in create_sql
+        assert '"customer_balance_summary"' in create_sql
+        assert create_sql.index('"audit_test"') < create_sql.index('"customer_balance_summary"')
+
+    def test_target_create_materialized_view_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        mv = MaterializedViewDef(
+            name="public_mv",
+            schema_name="public",
+            definition="SELECT * FROM customers",
+        )
+        target.create_materialized_view(mv)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        create_sql = next((s for s in executed if "CREATE MATERIALIZED VIEW" in s), None)
+        assert create_sql is not None
+        assert create_sql.strip().startswith("CREATE MATERIALIZED VIEW public_mv")
+
+
+class TestPostgresFunctionSchemaQualification:
+    """
+    Regression: functions in non-public schemas must be discovered with
+    their schema and created in the correct target schema.  Previously
+    the source connector dropped the schema and the target had no way
+    to track or qualify the function schema.
+    """
+
+    def test_list_functions_captures_schema_name(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("get_customer_count", "audit_test", "CREATE OR REPLACE FUNCTION audit_test.get_customer_count() RETURNS integer LANGUAGE sql AS $function$ SELECT COUNT(*)::INTEGER FROM audit_test.test_customers; $function$"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        funcs = connector.list_functions()
+        by_name = {f.name: f for f in funcs}
+        assert "get_customer_count" in by_name
+        assert by_name["get_customer_count"].schema_name == "audit_test"
+
+    def test_target_create_function_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        func = FunctionDef(
+            name="get_customer_count",
+            schema_name="audit_test",
+            ddl="CREATE OR REPLACE FUNCTION audit_test.get_customer_count() RETURNS integer LANGUAGE sql AS $function$ SELECT 1; $function$",
+        )
+        target.create_function(func)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        audit_log_call = next((c for c in executed if "audit_test.get_customer_count" in c), None)
+        assert audit_log_call is not None
+
+    def test_target_create_function_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        func = FunctionDef(
+            name="public_func",
+            schema_name="public",
+            ddl="CREATE OR REPLACE FUNCTION public_func() RETURNS integer LANGUAGE sql AS $function$ SELECT 1; $function$",
+        )
+        target.create_function(func)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        ddl_call = next((s for s in executed if "CREATE OR REPLACE FUNCTION" in s), None)
+        assert ddl_call is not None
+        assert ddl_call.strip().startswith("CREATE OR REPLACE FUNCTION public_func")
+
+
+class TestPostgresTriggerSchemaQualification:
+    """
+    Regression: triggers in non-public schemas must be discovered with
+    their table schema and created in the correct target schema.  Previously
+    the source connector dropped the schema and the target emitted
+    DROP TRIGGER / CREATE TRIGGER without schema qualification, causing
+    failures for non-public tables.
+    """
+
+    def test_get_all_triggers_captures_schema_name(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("trg_customer_timestamp", "test_customers", "audit_test",
+             "CREATE TRIGGER trg_customer_timestamp BEFORE UPDATE ON audit_test.test_customers FOR EACH ROW EXECUTE FUNCTION audit_test.update_customer_timestamp()"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        triggers = connector.get_all_triggers()
+        by_name = {t.name: t for t in triggers}
+        assert "trg_customer_timestamp" in by_name
+        assert by_name["trg_customer_timestamp"].schema_name == "audit_test"
+        assert by_name["trg_customer_timestamp"].table == "test_customers"
+
+    def test_target_create_trigger_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        trigger = TriggerDef(
+            name="trg_customer_timestamp",
+            table="test_customers",
+            schema_name="audit_test",
+            ddl="CREATE TRIGGER trg_customer_timestamp BEFORE UPDATE ON audit_test.test_customers FOR EACH ROW EXECUTE FUNCTION audit_test.update_customer_timestamp()",
+        )
+        target.create_trigger(trigger)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        drop_sql = next((s for s in executed if "DROP TRIGGER" in s), None)
+        assert drop_sql is not None
+        assert '"audit_test"."test_customers"' in drop_sql
+
+    def test_target_create_trigger_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        trigger = TriggerDef(
+            name="trg_public",
+            table="customers",
+            schema_name="public",
+            ddl="CREATE TRIGGER trg_public BEFORE UPDATE ON customers FOR EACH ROW EXECUTE FUNCTION public_func()",
+        )
+        target.create_trigger(trigger)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        drop_sql = next((s for s in executed if "DROP TRIGGER" in s), None)
+        assert drop_sql is not None
+        assert drop_sql.strip().startswith('DROP TRIGGER IF EXISTS "trg_public" ON customers')
+
+
+class TestPostgresCommentSchemaQualification:
+    """
+    Regression: comments on non-public objects must preserve schema
+    information and be applied with correct schema qualification.
+    """
+
+    def test_list_comments_captures_schema_for_table(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [("TABLE", "audit_test", "test_customers", "Migration platform object testing table")],
+            [],
+            [],
+            [],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        comments = connector.list_comments()
+        by_type_name = {(c.object_type, c.object_name): c for c in comments}
+        assert ("TABLE", "test_customers") in by_type_name
+        assert by_type_name[("TABLE", "test_customers")].schema_name == "audit_test"
+        assert by_type_name[("TABLE", "test_customers")].comment == "Migration platform object testing table"
+
+    def test_list_comments_captures_schema_for_column(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [],
+            [("audit_test", "test_customers", "email", "Unique customer email")],
+            [],
+            [],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        comments = connector.list_comments()
+        by_type_name = {(c.object_type, c.object_name): c for c in comments}
+        assert ("COLUMN", "test_customers.email") in by_type_name
+        assert by_type_name[("COLUMN", "test_customers.email")].schema_name == "audit_test"
+
+    def test_target_apply_comment_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        comment = CommentDef(
+            object_type="TABLE",
+            object_name="test_customers",
+            schema_name="audit_test",
+            comment="Migration platform object testing table",
+        )
+        target.apply_comment(comment)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
+        assert comment_sql is not None
+        assert '"audit_test"."test_customers"' in comment_sql
+
+    def test_target_apply_comment_qualifies_column_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        comment = CommentDef(
+            object_type="COLUMN",
+            object_name="test_customers.email",
+            schema_name="audit_test",
+            comment="Unique customer email",
+        )
+        target.apply_comment(comment)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
+        assert comment_sql is not None
+        assert '"audit_test"."test_customers"."email"' in comment_sql
+
+    def test_target_apply_comment_qualifies_function_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        comment = CommentDef(
+            object_type="FUNCTION",
+            object_name="get_customer_count()",
+            schema_name="audit_test",
+            comment="Returns customer count",
+        )
+        target.apply_comment(comment)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
+        assert comment_sql is not None
+        assert '"audit_test".get_customer_count()' in comment_sql
+
+    def test_target_apply_comment_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        comment = CommentDef(
+            object_type="TABLE",
+            object_name="customers",
+            schema_name="public",
+            comment="Public customers table",
+        )
+        target.apply_comment(comment)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        comment_sql = next((s for s in executed if "COMMENT ON" in s), None)
+        assert comment_sql is not None
+        assert comment_sql.strip().startswith("COMMENT ON TABLE customers")
+
+
+class TestPostgresGrantSchemaQualification:
+    """
+    Regression: grants on non-public objects must preserve schema
+    information and be applied with correct schema qualification.
+    """
+
+    def test_list_grants_captures_schema_for_table(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [("audit_user", "audit_test", "test_customers", "SELECT, INSERT")],
+            [],
+            [],
+            [],
+            [],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+        by_grantee = {(g.grantee, g.object_name): g for g in grants}
+        assert ("audit_user", "test_customers") in by_grantee
+        assert by_grantee[("audit_user", "test_customers")].schema_name == "audit_test"
+        assert by_grantee[("audit_user", "test_customers")].privileges == "SELECT, INSERT"
+
+    def test_list_grants_captures_schema_for_column(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [],
+            [("audit_user", "audit_test", "test_customers", "email", "SELECT")],
+            [],
+            [],
+            [],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+        by_grantee = {(g.grantee, g.object_name): g for g in grants}
+        assert ("audit_user", "test_customers.email") in by_grantee
+        assert by_grantee[("audit_user", "test_customers.email")].schema_name == "audit_test"
+        assert by_grantee[("audit_user", "test_customers.email")].object_type == "COLUMN"
+
+    def test_target_apply_grant_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="SELECT, INSERT",
+            object_type="TABLE",
+            object_name="test_customers",
+            schema_name="audit_test",
+            grantee="audit_user",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert '"audit_test"."test_customers"' in grant_sql
+        assert "TO audit_user" in grant_sql
+
+    def test_target_apply_grant_qualifies_column_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="SELECT",
+            object_type="COLUMN",
+            object_name="test_customers.email",
+            schema_name="audit_test",
+            grantee="audit_user",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert '"test_customers"."email"' in grant_sql
+        assert "TO audit_user" in grant_sql
+
+    def test_target_apply_grant_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="SELECT",
+            object_type="TABLE",
+            object_name="customers",
+            schema_name="public",
+            grantee="public",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert grant_sql.strip().startswith("GRANT SELECT ON TABLE customers TO public")
+
+
+class TestPostgresRLSSchemaQualification:
+    """
+    Regression: RLS policies on non-public tables must preserve schema
+    information and be applied with correct schema qualification.
+    """
+
+    def test_get_rls_policies_captures_schema(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["public", "audit_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.return_value = [
+            ("test_customer_policy", "SELECT", "PERMISSIVE", "true", None, "audit_test"),
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        policies = connector.get_rls_policies("test_customers")
+        assert len(policies) == 1
+        assert policies[0].schema_name == "audit_test"
+        assert policies[0].table == "test_customers"
+        assert policies[0].cmd == "SELECT"
+        assert policies[0].permissive == "PERMISSIVE"
+        assert policies[0].using_expr == "true"
+        assert policies[0].check_expr is None
+
+    def test_target_apply_rls_policy_qualifies_non_public_schema(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        policy = RLSPolicy(
+            name="test_customer_policy",
+            table="test_customers",
+            schema_name="audit_test",
+            cmd="SELECT",
+            permissive="PERMISSIVE",
+            using_expr="true",
+        )
+        target.apply_rls_policy(policy)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER TABLE" in s), None)
+        assert alter_sql is not None
+        assert '"audit_test"."test_customers"' in alter_sql
+
+        create_sql = next((s for s in executed if "CREATE POLICY" in s), None)
+        assert create_sql is not None
+        assert '"audit_test"."test_customers"' in create_sql
+        assert "AS PERMISSIVE FOR SELECT" in create_sql
+        assert "USING (true)" in create_sql
+
+    def test_target_apply_rls_policy_remains_unqualified_for_public(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        policy = RLSPolicy(
+            name="public_policy",
+            table="customers",
+            schema_name="public",
+            cmd="ALL",
+            permissive="RESTRICTIVE",
+            using_expr="false",
+            check_expr="true",
+        )
+        target.apply_rls_policy(policy)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER TABLE" in s), None)
+        assert alter_sql is not None
+        assert alter_sql.strip().startswith("ALTER TABLE customers ENABLE ROW LEVEL SECURITY")
+
+        create_sql = next((s for s in executed if "CREATE POLICY" in s), None)
+        assert create_sql is not None
+        assert create_sql.strip().startswith("CREATE POLICY public_policy ON customers")
+
+
+class TestPostgresCrossSchemaForeignKey:
+    """
+    Regression: foreign keys referencing tables in non-public schemas
+    must preserve the referenced schema and generate schema-qualified
+    REFERENCES DDL.
+    """
+
+    def test_apply_constraints_generates_cross_schema_fk_ddl(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="fk_child",
+            schema_name="audit_test",
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_child_to_public_customers",
+                    columns=["parent_id"],
+                    ref_table="customers",
+                    ref_columns=["customer_id"],
+                    ref_schema="public",
+                    on_delete="CASCADE",
+                    on_update="CASCADE",
+                )
+            ],
+        )
+        target.apply_constraints(schema)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        fk_sql = next((s for s in executed if "FOREIGN KEY" in s), None)
+        assert fk_sql is not None
+        assert "REFERENCES customers" in fk_sql
+        assert "ON DELETE CASCADE ON UPDATE CASCADE" in fk_sql
+
+    def test_apply_constraints_generates_non_public_to_non_public_fk_ddl(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="fk_child",
+            schema_name="audit_test",
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_child_to_audit_parent",
+                    columns=["parent_id"],
+                    ref_table="fk_parent",
+                    ref_columns=["id"],
+                    ref_schema="audit_test",
+                    on_delete="NO ACTION",
+                    on_update="NO ACTION",
+                )
+            ],
+        )
+        target.apply_constraints(schema)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        fk_sql = next((s for s in executed if "FOREIGN KEY" in s), None)
+        assert fk_sql is not None
+        assert '"audit_test"."fk_parent"' in fk_sql
+
+    def test_apply_constraints_generates_non_public_to_public_fk_ddl(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = Schema(
+            name="fk_child",
+            schema_name="audit_test",
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_child_to_public_parent",
+                    columns=["parent_id"],
+                    ref_table="public_parent",
+                    ref_columns=["id"],
+                    ref_schema="public",
+                    on_delete="SET NULL",
+                    on_update="RESTRICT",
+                )
+            ],
+        )
+        target.apply_constraints(schema)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        fk_sql = next((s for s in executed if "FOREIGN KEY" in s), None)
+        assert fk_sql is not None
+        assert "REFERENCES public_parent" in fk_sql
+        assert "ON DELETE SET NULL ON UPDATE RESTRICT" in fk_sql
 
 
 class TestConfigSchema:

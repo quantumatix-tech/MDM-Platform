@@ -13,9 +13,9 @@ class Validator:
         self._source = source
         self._target = target
 
-    def validate_count(self, object_name: str) -> dict[str, Any]:
-        source_count = self._source.get_object_count(object_name)
-        target_count = self._target.get_object_count(object_name)
+    def validate_count(self, object_name: str, schema_name: str | None = None) -> dict[str, Any]:
+        source_count = self._source.get_object_count(object_name, schema_name=schema_name)
+        target_count = self._target.get_object_count(object_name, schema_name=schema_name)
         match = source_count == target_count
         audit_log(
             phase="validate_count",
@@ -35,22 +35,21 @@ class Validator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _pg_md5_hash(conn: Any, object_name: str, sample_size: int) -> str | None:
+    def _pg_md5_hash(conn: Any, object_name: str, sample_size: int, schema_name: str | None = None) -> str | None:
         """Compute an MD5 aggregate hash entirely inside PostgreSQL.
 
         Using MD5(CAST(t AS text)) avoids pulling rows into Python and is
         much faster for large tables.  Returns None if the connector is not
         a psycopg connection (falls back to Python-side hashing).
         """
+        table_qname = f"{schema_name}.{object_name}" if schema_name else object_name
         try:
             with conn.cursor() as cur:
-                # Cast the whole row to text, sort for determinism, then aggregate
-                # with MD5.  LIMIT keeps it bounded to sample_size.
                 cur.execute(
                     f"SELECT MD5(STRING_AGG(row_text, '|' ORDER BY row_text)) "
                     f"FROM ("
                     f"  SELECT CAST(t AS text) AS row_text "
-                    f"  FROM {object_name} t "
+                    f"  FROM {table_qname} t "
                     f"  LIMIT %s"
                     f") sub",
                     (sample_size,),
@@ -60,7 +59,7 @@ class Validator:
         except Exception:
             return None
 
-    def validate_checksum(self, object_name: str, sample_size: int = 1000) -> dict[str, Any]:
+    def validate_checksum(self, object_name: str, sample_size: int = 1000, schema_name: str | None = None) -> dict[str, Any]:
         """Fix #6: Prefer DB-side MD5 aggregation over pulling rows into Python.
 
         For PostgreSQL connectors the hash is computed entirely inside the
@@ -70,18 +69,16 @@ class Validator:
         source_hash: str | None = None
         target_hash: str | None = None
 
-        # Attempt DB-side hash (PostgreSQL psycopg connectors expose ._conn)
         src_conn = getattr(self._source, "_conn", None)
         tgt_conn = getattr(self._target, "_conn", None)
 
         if src_conn is not None and tgt_conn is not None:
-            source_hash = self._pg_md5_hash(src_conn, object_name, sample_size)
-            target_hash = self._pg_md5_hash(tgt_conn, object_name, sample_size)
+            source_hash = self._pg_md5_hash(src_conn, object_name, sample_size, schema_name)
+            target_hash = self._pg_md5_hash(tgt_conn, object_name, sample_size, schema_name)
 
-        # Fallback: Python-side hashing (non-PG connectors or if DB hash failed)
         if source_hash is None or target_hash is None:
-            source_rows = list(self._source.export_full(object_name))
-            target_rows = list(self._target.export_full(object_name))
+            source_rows = list(self._source.export_full(object_name, schema_name=schema_name))
+            target_rows = list(self._target.export_full(object_name, schema_name=schema_name))
 
             def _row_hash(rows: list[dict]) -> str:
                 sample = sorted(
@@ -109,9 +106,9 @@ class Validator:
             "target_sample_hash": target_hash,
         }
 
-    def validate_full(self, object_name: str) -> dict[str, Any]:
-        source_rows = list(self._source.export_full(object_name))
-        target_rows = list(self._target.export_full(object_name))
+    def validate_full(self, object_name: str, schema_name: str | None = None) -> dict[str, Any]:
+        source_rows = list(self._source.export_full(object_name, schema_name=schema_name))
+        target_rows = list(self._target.export_full(object_name, schema_name=schema_name))
 
         source_sorted = sorted(
             source_rows, key=lambda r: json.dumps(r, sort_keys=True, default=str)
@@ -134,12 +131,12 @@ class Validator:
             "target_rows": len(target_rows),
         }
 
-    def validate(self, object_name: str, mode: str = "count", sample_size: int = 1000) -> dict[str, Any]:
+    def validate(self, object_name: str, mode: str = "count", sample_size: int = 1000, schema_name: str | None = None) -> dict[str, Any]:
         if mode == "count":
-            return self.validate_count(object_name)
+            return self.validate_count(object_name, schema_name=schema_name)
         elif mode == "checksum":
-            return self.validate_checksum(object_name, sample_size=sample_size)
+            return self.validate_checksum(object_name, sample_size=sample_size, schema_name=schema_name)
         elif mode == "full":
-            return self.validate_full(object_name)
+            return self.validate_full(object_name, schema_name=schema_name)
         else:
             raise ValueError(f"Unknown validation mode: {mode}")

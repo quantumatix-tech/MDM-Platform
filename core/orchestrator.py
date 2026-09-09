@@ -67,11 +67,19 @@ class MigrationOrchestrator:
         if self._status is not None and hasattr(self._status, "record_preflight"):
             self._status.record_preflight(preflight)
 
-    def _estimate_total_rows(self, objects: list[str]) -> int:
+    def _estimate_total_rows(
+        self,
+        objects: list[str],
+        schema_map: dict[str, str | None] | None = None,
+    ) -> int:
         total = 0
         for obj_name in objects:
             try:
-                total += self._source.get_object_count(obj_name)
+                schema_name = schema_map.get(obj_name) if schema_map else None
+                total += self._source.get_object_count(
+                    obj_name,
+                    schema_name=schema_name,
+                )
             except Exception:
                 pass
         return total
@@ -266,14 +274,15 @@ class MigrationOrchestrator:
             self._update_status("create_partitions", 17, all_errors)
 
             # ---------- Phase 5: Migrate Data ----------
-            total_rows = self._estimate_total_rows(objects)
+            schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
+            total_rows = self._estimate_total_rows(objects, schema_map)
             processed_rows = 0
             for idx, (obj_name, schema) in enumerate(all_schemas.items(), start=1):
                 upsert_result = UpsertResult()
                 count: int | None = None
                 try:
-                    count = self._source.get_object_count(obj_name)
-                    rows = self._source.export_full(obj_name)
+                    count = self._source.get_object_count(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
+                    rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
                     for chunk in self._chunked(rows, self._batch_size):
                         chunk_result = self._target.upsert_batch(obj_name, iter(chunk), schema)
                         upsert_result.success_count += chunk_result.success_count
@@ -329,13 +338,29 @@ class MigrationOrchestrator:
             result["phases"]["apply_constraints"] = constraint_results
             self._update_status("apply_constraints", 60, all_errors)
 
-            # ---------- Phase 9: Row-Level Security ----------
+            # ---------- Phase 9: Sequence Ownership ----------
+            seq_owner_results: dict[str, str] = {}
+            try:
+                all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
+                for seq in all_sequences:
+                    if seq.owned_by:
+                        try:
+                            self._target.apply_sequence_ownership(seq)
+                            seq_owner_results[seq.name] = f"owned: {seq.owned_by}"
+                        except Exception as exc:
+                            seq_owner_results[seq.name] = f"skipped: {exc}"
+            except Exception as exc:
+                seq_owner_results["_error"] = str(exc)
+            result["phases"]["apply_sequence_ownership"] = seq_owner_results
+            self._update_status("apply_sequence_ownership", 65, all_errors)
+
+            # ---------- Phase 10: Row-Level Security ----------
             rls_results: dict[str, Any] = {}
             try:
                 for obj_name, schema in all_schemas.items():
                     if schema.rls_enabled:
                         rls_results[obj_name] = []
-                        for policy in self._source.get_rls_policies(obj_name):
+                        for policy in self._source.get_rls_policies(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None):
                             try:
                                 self._target.apply_rls_policy(policy)
                                 rls_results[obj_name].append(f"{policy.name}: created")
@@ -352,17 +377,24 @@ class MigrationOrchestrator:
                 all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
                 for seq in all_sequences:
                     if seq.owned_by:
-                        # owned_by is "table.column"
-                        parts = seq.owned_by.split(".", 1)
-                        if len(parts) == 2:
-                            tbl, col = parts
-                            if tbl not in seq_advance_results:
-                                seq_advance_results[tbl] = []
-                            try:
-                                self._target.advance_sequence(seq.name, tbl, col)
-                                seq_advance_results[tbl].append(f"{seq.name}: advanced")
-                            except Exception as exc:
-                                seq_advance_results[tbl].append(f"{seq.name}: skipped ({exc})")
+                        # owned_by may be either "table.column" (legacy) or
+                        # "schema.table.column" (now produced by the source
+                        # connector for non-public schemas).
+                        parts = seq.owned_by.rsplit(".", 2)
+                        if len(parts) == 3:
+                            seq_schema, tbl, col = parts
+                        elif len(parts) == 2:
+                            seq_schema, tbl, col = "public", parts[0], parts[1]
+                        else:
+                            continue
+                        if tbl not in seq_advance_results:
+                            seq_advance_results[tbl] = []
+                        seq_qname = seq.name if seq_schema == "public" else f"{seq_schema}.{seq.name}"
+                        try:
+                            self._target.advance_sequence(seq_qname, tbl, col, seq.owned_by)
+                            seq_advance_results[tbl].append(f"{seq_qname}: advanced")
+                        except Exception as exc:
+                            seq_advance_results[tbl].append(f"{seq_qname}: skipped ({exc})")
             except Exception as exc:
                 seq_advance_results["_error"] = [str(exc)]
             result["phases"]["advance_sequences"] = seq_advance_results
@@ -389,7 +421,7 @@ class MigrationOrchestrator:
                 for mv in self._source.list_materialized_views():
                     try:
                         self._target.create_materialized_view(mv)
-                        self._target.refresh_materialized_view(mv.name)
+                        self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
                         mv_results[mv.name] = "created+refreshed"
                     except Exception as exc:
                         mv_results[mv.name] = f"error: {exc}"
@@ -403,11 +435,15 @@ class MigrationOrchestrator:
             func_results: dict[str, str] = {}
             try:
                 for func in self._source.list_functions():
+                    func_key = (
+                        func.name if func.schema_name == "public"
+                        else f"{func.schema_name}.{func.name}"
+                    )
                     try:
                         self._target.create_function(func)
-                        func_results[func.name] = "created"
+                        func_results[func_key] = "created"
                     except Exception as exc:
-                        func_results[func.name] = f"skipped: {exc}"
+                        func_results[func_key] = f"skipped: {exc}"
             except Exception as exc:
                 func_results["_error"] = str(exc)
             result["phases"]["functions"] = func_results
@@ -417,11 +453,16 @@ class MigrationOrchestrator:
             trigger_results: dict[str, str] = {}
             try:
                 for trigger in self._source.get_all_triggers():
+                    trigger_key = (
+                        f"{trigger.table}.{trigger.name}"
+                        if trigger.schema_name == "public"
+                        else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
+                    )
                     try:
                         self._target.create_trigger(trigger)
-                        trigger_results[f"{trigger.table}.{trigger.name}"] = "created"
+                        trigger_results[trigger_key] = "created"
                     except Exception as exc:
-                        trigger_results[f"{trigger.table}.{trigger.name}"] = f"skipped: {exc}"
+                        trigger_results[trigger_key] = f"skipped: {exc}"
             except Exception as exc:
                 trigger_results["_error"] = str(exc)
             result["phases"]["triggers"] = trigger_results
@@ -431,11 +472,16 @@ class MigrationOrchestrator:
             comment_results: dict[str, str] = {}
             try:
                 for comment in self._source.list_comments():
+                    comment_key = (
+                        comment.object_name
+                        if comment.schema_name == "public"
+                        else f"{comment.schema_name}.{comment.object_name}"
+                    )
                     try:
                         self._target.apply_comment(comment)
-                        comment_results[comment.object_name] = "applied"
+                        comment_results[comment_key] = "applied"
                     except Exception as exc:
-                        comment_results[comment.object_name] = f"skipped: {exc}"
+                        comment_results[comment_key] = f"skipped: {exc}"
             except Exception as exc:
                 comment_results["_error"] = str(exc)
             result["phases"]["comments"] = comment_results
@@ -445,11 +491,16 @@ class MigrationOrchestrator:
             grant_results: list[str] = []
             try:
                 for grant in self._source.list_grants():
+                    grant_key = (
+                        f"{grant.object_name} TO {grant.grantee}"
+                        if grant.schema_name == "public"
+                        else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+                    )
                     try:
                         self._target.apply_grant(grant)
-                        grant_results.append(f"GRANT {grant.privileges} ON {grant.object_name} TO {grant.grantee}: ok")
+                        grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
                     except Exception as exc:
-                        grant_results.append(f"GRANT ... TO {grant.grantee}: skipped ({exc})")
+                        grant_results.append(f"GRANT ... ON {grant_key}: skipped ({exc})")
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results
@@ -460,7 +511,7 @@ class MigrationOrchestrator:
             validation_objects = [
                 obj_name for obj_name in all_schemas if obj_name not in failed_objects
             ]
-            validation = self.validate(validation_objects)
+            validation = self.validate(validation_objects, schema_map=schema_map)
             result["phases"]["validation"] = validation
             if failed_objects:
                 result["status"] = "partial_success" if validation_objects else "failed"
@@ -862,12 +913,13 @@ class MigrationOrchestrator:
             self._update_status("create_partitions", 16, all_errors)
 
             # ---- Phase 5: Initial Data Sync ----
-            total_rows = self._estimate_total_rows(objects)
+            schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
+            total_rows = self._estimate_total_rows(objects, schema_map)
             processed_rows = 0
             for idx, obj_name in enumerate(objects, start=1):
                 schema = all_schemas[obj_name]
-                count = self._source.get_object_count(obj_name)
-                rows = self._source.export_full(obj_name)
+                count = self._source.get_object_count(obj_name, schema.schema_name if hasattr(schema, "schema_name") else None)
+                rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
                 upsert_result = UpsertResult()
                 for chunk in self._chunked(rows, self._batch_size):
                     chunk_result = self._target.upsert_batch(obj_name, iter(chunk), schema)
@@ -905,13 +957,29 @@ class MigrationOrchestrator:
             result["phases"]["apply_constraints"] = constraint_results
             self._update_status("apply_constraints", 50, all_errors)
 
-            # Phase 9: Row-Level Security
+            # Phase 9: Sequence Ownership
+            seq_owner_results: dict[str, str] = {}
+            try:
+                all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
+                for seq in all_sequences:
+                    if seq.owned_by:
+                        try:
+                            self._target.apply_sequence_ownership(seq)
+                            seq_owner_results[seq.name] = f"owned: {seq.owned_by}"
+                        except Exception as exc:
+                            seq_owner_results[seq.name] = f"skipped: {exc}"
+            except Exception as exc:
+                seq_owner_results["_error"] = str(exc)
+            result["phases"]["apply_sequence_ownership"] = seq_owner_results
+            self._update_status("apply_sequence_ownership", 55, all_errors)
+
+            # Phase 10: Row-Level Security
             rls_results: dict[str, Any] = {}
             try:
                 for obj_name, schema in all_schemas.items():
                     if schema.rls_enabled:
                         rls_results[obj_name] = []
-                        for policy in self._source.get_rls_policies(obj_name):
+                        for policy in self._source.get_rls_policies(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None):
                             try:
                                 self._target.apply_rls_policy(policy)
                                 rls_results[obj_name].append(f"{policy.name}: created")
@@ -966,7 +1034,7 @@ class MigrationOrchestrator:
                 for mv in self._source.list_materialized_views():
                     try:
                         self._target.create_materialized_view(mv)
-                        self._target.refresh_materialized_view(mv.name)
+                        self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
                         mv_results[mv.name] = "created+refreshed"
                     except Exception as exc:
                         mv_results[mv.name] = f"error: {exc}"
@@ -979,11 +1047,15 @@ class MigrationOrchestrator:
             func_results: dict[str, str] = {}
             try:
                 for func in self._source.list_functions():
+                    func_key = (
+                        func.name if func.schema_name == "public"
+                        else f"{func.schema_name}.{func.name}"
+                    )
                     try:
                         self._target.create_function(func)
-                        func_results[func.name] = "created"
+                        func_results[func_key] = "created"
                     except Exception as exc:
-                        func_results[func.name] = f"skipped: {exc}"
+                        func_results[func_key] = f"skipped: {exc}"
             except Exception as exc:
                 func_results["_error"] = str(exc)
             result["phases"]["functions"] = func_results
@@ -993,11 +1065,16 @@ class MigrationOrchestrator:
             trigger_results: dict[str, str] = {}
             try:
                 for trigger in self._source.get_all_triggers():
+                    trigger_key = (
+                        f"{trigger.table}.{trigger.name}"
+                        if trigger.schema_name == "public"
+                        else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
+                    )
                     try:
                         self._target.create_trigger(trigger)
-                        trigger_results[f"{trigger.table}.{trigger.name}"] = "created"
+                        trigger_results[trigger_key] = "created"
                     except Exception as exc:
-                        trigger_results[f"{trigger.table}.{trigger.name}"] = f"skipped: {exc}"
+                        trigger_results[trigger_key] = f"skipped: {exc}"
             except Exception as exc:
                 trigger_results["_error"] = str(exc)
             result["phases"]["triggers"] = trigger_results
@@ -1007,11 +1084,16 @@ class MigrationOrchestrator:
             comment_results: dict[str, str] = {}
             try:
                 for comment in self._source.list_comments():
+                    comment_key = (
+                        comment.object_name
+                        if comment.schema_name == "public"
+                        else f"{comment.schema_name}.{comment.object_name}"
+                    )
                     try:
                         self._target.apply_comment(comment)
-                        comment_results[comment.object_name] = "applied"
+                        comment_results[comment_key] = "applied"
                     except Exception as exc:
-                        comment_results[comment.object_name] = f"skipped: {exc}"
+                        comment_results[comment_key] = f"skipped: {exc}"
             except Exception as exc:
                 comment_results["_error"] = str(exc)
             result["phases"]["comments"] = comment_results
@@ -1021,13 +1103,16 @@ class MigrationOrchestrator:
             grant_results: list[str] = []
             try:
                 for grant in self._source.list_grants():
+                    grant_key = (
+                        f"{grant.object_name} TO {grant.grantee}"
+                        if grant.schema_name == "public"
+                        else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+                    )
                     try:
                         self._target.apply_grant(grant)
-                        grant_results.append(
-                            f"GRANT {grant.privileges} ON {grant.object_name} TO {grant.grantee}: ok"
-                        )
+                        grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
                     except Exception as exc:
-                        grant_results.append(f"GRANT ... TO {grant.grantee}: skipped ({exc})")
+                        grant_results.append(f"GRANT ... ON {grant_key}: skipped ({exc})")
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results
@@ -1097,7 +1182,7 @@ class MigrationOrchestrator:
         )
         return report
 
-    def validate(self, objects: list[str] | None = None) -> dict[str, Any]:
+    def validate(self, objects: list[str] | None = None, schema_map: dict[str, str | None] | None = None) -> dict[str, Any]:
         validator = Validator(self._source, self._target)
         validation_mode = self._config.get("validation", {}).get("mode", "count")
         source_objects = objects if objects is not None else self._source.list_objects()
@@ -1109,7 +1194,8 @@ class MigrationOrchestrator:
 
         all_passed = True
         for obj_name in source_objects:
-            check = validator.validate(obj_name, mode=validation_mode)
+            schema_name = schema_map.get(obj_name) if schema_map else None
+            check = validator.validate(obj_name, mode=validation_mode, schema_name=schema_name)
             results["checks"][obj_name] = check
             if not check.get("match", False):
                 all_passed = False

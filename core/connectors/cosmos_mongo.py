@@ -115,7 +115,7 @@ class CosmosMongoTargetConnector(TargetConnector):
 
         return result
 
-    def get_object_count(self, object_name: str) -> int:
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
         validate_identifier(object_name, "collection")
         return self._db[object_name].count_documents({})
 
@@ -129,7 +129,7 @@ class CosmosMongoTargetConnector(TargetConnector):
             self._db[object_name].delete_one(filter_doc)
         audit_log(phase="cdc_delete", status="deleted", details={"collection": object_name})
 
-    def export_full(self, object_name: str) -> Iterator[dict[str, Any]]:
+    def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict[str, Any]]:
         validate_identifier(object_name, "collection")
         cursor = self._db[object_name].find().batch_size(100)
         for doc in cursor:

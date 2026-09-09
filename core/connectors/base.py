@@ -64,6 +64,7 @@ class ForeignKey:
     columns: list[str]
     ref_table: str
     ref_columns: list[str]
+    ref_schema: str = "public"
     on_delete: str = "NO ACTION"
     on_update: str = "NO ACTION"
 
@@ -112,6 +113,7 @@ class SequenceDef:
     cycle: bool
     last_value: int | None = None
     owned_by: str | None = None    # e.g. "orders.id" if column-owned
+    schema: str | None = None      # source schema; None means "public" or unknown
 
 
 @dataclass
@@ -141,6 +143,7 @@ class ViewDefinition:
     """A regular SQL view."""
     name: str
     definition: str     # raw SELECT definition
+    schema_name: str = "public"
 
 
 @dataclass
@@ -148,6 +151,7 @@ class MaterializedViewDef:
     """A materialized view — stored like a table, refreshed on demand."""
     name: str
     definition: str     # raw SELECT definition
+    schema_name: str = "public"
 
 
 @dataclass
@@ -156,6 +160,7 @@ class FunctionDef:
     ddl contains the complete CREATE OR REPLACE FUNCTION / PROCEDURE statement."""
     name: str
     ddl: str            # complete DDL from pg_get_functiondef — ready to execute
+    schema_name: str = "public"
 
 
 @dataclass
@@ -165,6 +170,7 @@ class TriggerDef:
     name: str
     table: str
     ddl: str            # complete DDL from pg_get_triggerdef — ready to execute
+    schema_name: str = "public"
 
 
 @dataclass
@@ -176,23 +182,26 @@ class RLSPolicy:
     permissive: str     # PERMISSIVE or RESTRICTIVE
     using_expr: str | None = None
     check_expr: str | None = None
+    schema_name: str = "public"
 
 
 @dataclass
 class CommentDef:
     """A COMMENT ON ... IS '...' statement."""
     object_type: str    # TABLE, COLUMN, VIEW, MATERIALIZED VIEW, FUNCTION, etc.
-    object_name: str    # For columns: 'table.column'
+    object_name: str    # For columns: 'table.column'; schema is tracked separately
     comment: str
+    schema_name: str = "public"
 
 
 @dataclass
 class GrantDef:
     """A GRANT privilege statement."""
     privileges: str     # SELECT, INSERT, ALL, etc.
-    object_type: str    # TABLE, SEQUENCE, FUNCTION, SCHEMA
-    object_name: str
+    object_type: str    # TABLE, SEQUENCE, FUNCTION, SCHEMA, COLUMN
+    object_name: str    # schema-qualified when applicable
     grantee: str
+    schema_name: str = "public"
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +293,10 @@ class SourceConnector(abc.ABC):
     def list_objects(self) -> list[str]: ...
 
     @abc.abstractmethod
-    def get_object_count(self, object_name: str) -> int: ...
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int: ...
 
     @abc.abstractmethod
-    def export_full(self, object_name: str) -> Iterator[dict[str, Any]]: ...
+    def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict[str, Any]]: ...
 
     @abc.abstractmethod
     def get_schema(self, object_name: str) -> Schema: ...
@@ -315,7 +324,7 @@ class SourceConnector(abc.ABC):
     def get_all_triggers(self) -> list[TriggerDef]:
         return []
 
-    def get_rls_policies(self, table: str) -> list[RLSPolicy]:
+    def get_rls_policies(self, table: str, schema_name: str | None = None) -> list[RLSPolicy]:
         return []
 
     def list_comments(self) -> list[CommentDef]:
@@ -344,10 +353,10 @@ class TargetConnector(abc.ABC):
     def delete(self, object_name: str, document: dict[str, Any], schema: Schema | None = None) -> None: ...
 
     @abc.abstractmethod
-    def get_object_count(self, object_name: str) -> int: ...
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int: ...
 
     @abc.abstractmethod
-    def export_full(self, object_name: str) -> Iterator[dict[str, Any]]: ...
+    def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict[str, Any]]: ...
 
     # --- Full-database application (optional — connectors override as supported) ---
 
@@ -369,7 +378,7 @@ class TargetConnector(abc.ABC):
     def create_materialized_view(self, mv: MaterializedViewDef) -> None:
         pass
 
-    def refresh_materialized_view(self, name: str) -> None:
+    def refresh_materialized_view(self, name: str, schema_name: str | None = None) -> None:
         pass
 
     def create_function(self, func: FunctionDef) -> None:
@@ -381,7 +390,10 @@ class TargetConnector(abc.ABC):
     def apply_rls_policy(self, policy: RLSPolicy) -> None:
         pass
 
-    def sync_sequence(self, table: str, column: str) -> None:
+    def sync_sequence(self, table: str, column: str, schema_name: str | None = None) -> None:
+        pass
+
+    def apply_sequence_ownership(self, seq: "SequenceDef") -> None:
         pass
 
     def apply_comment(self, comment: CommentDef) -> None:

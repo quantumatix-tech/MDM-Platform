@@ -119,8 +119,11 @@ def _resolve_include_schemas(config: dict[str, Any]) -> tuple[str, ...]:
 class PostgresSourceConnector(SourceConnector):
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
-        self._include_schemas: tuple[str, ...] = _resolve_include_schemas(config)
         self._conn: Any = None
+
+    @property
+    def _include_schemas(self) -> tuple[str, ...]:
+        return _resolve_include_schemas(self._config)
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     def connect(self) -> None:
@@ -156,10 +159,11 @@ class PostgresSourceConnector(SourceConnector):
             validate_identifier(t, "table")
         return tables
 
-    def get_object_count(self, object_name: str) -> int:
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
         validate_identifier(object_name, "table")
+        table_name = f"{schema_name}.{object_name}" if schema_name else object_name
         with self._conn.cursor() as cur:
-            cur.execute(f"SELECT count(*) FROM {object_name}")
+            cur.execute(f"SELECT count(*) FROM {table_name}")
             return cur.fetchone()[0]
 
     @staticmethod
@@ -178,7 +182,7 @@ class PostgresSourceConnector(SourceConnector):
             return [PostgresSourceConnector._coerce_value(i) for i in v]  # PG arrays
         return v
 
-    def export_full(self, object_name: str, statement_timeout_ms: int = 0) -> Iterator[dict[str, Any]]:
+    def export_full(self, object_name: str, statement_timeout_ms: int = 0, schema_name: str | None = None) -> Iterator[dict[str, Any]]:
         """Stream all rows from *object_name* using a server-side cursor.
 
         Fix #8: Sets lock_timeout (5 s) so the SELECT never queues behind a
@@ -186,13 +190,14 @@ class PostgresSourceConnector(SourceConnector):
         disabled) so callers can cap run-away exports.
         """
         validate_identifier(object_name, "table")
+        table_name = f"{schema_name}.{object_name}" if schema_name else object_name
         with self._conn.cursor() as setup_cur:
             # 5-second lock timeout — fails fast rather than waiting forever.
             setup_cur.execute("SET LOCAL lock_timeout = '5s'")
             if statement_timeout_ms:
                 setup_cur.execute(f"SET LOCAL statement_timeout = {int(statement_timeout_ms)}")
         with self._conn.cursor(name=f"export_{object_name}") as cur:
-            cur.execute(f"SELECT * FROM {object_name}")
+            cur.execute(f"SELECT * FROM {table_name}")
             columns = [desc.name for desc in cur.description]
             for row in cur:
                 yield {k: self._coerce_value(v) for k, v in zip(columns, row)}
@@ -295,7 +300,7 @@ class PostgresSourceConnector(SourceConnector):
             # --- Foreign Keys ---
             cur.execute(
                 "SELECT tc.constraint_name, kcu.column_name, "
-                "ccu.table_name AS ref_table, ccu.column_name AS ref_col, "
+                "ccu.table_schema AS ref_schema, ccu.table_name AS ref_table, ccu.column_name AS ref_col, "
                 "rc.delete_rule, rc.update_rule "
                 "FROM information_schema.table_constraints tc "
                 "JOIN information_schema.key_column_usage kcu "
@@ -309,11 +314,12 @@ class PostgresSourceConnector(SourceConnector):
             )
             fk_map: dict[str, ForeignKey] = {}
             for row in cur.fetchall():
-                fk_name, col, ref_table, ref_col, on_delete, on_update = row
+                fk_name, col, ref_schema, ref_table, ref_col, on_delete, on_update = row
                 if fk_name not in fk_map:
                     fk_map[fk_name] = ForeignKey(
                         name=fk_name, columns=[], ref_table=ref_table,
-                        ref_columns=[], on_delete=on_delete, on_update=on_update,
+                        ref_columns=[], ref_schema=ref_schema,
+                        on_delete=on_delete, on_update=on_update,
                     )
                 fk_map[fk_name].columns.append(col)
                 fk_map[fk_name].ref_columns.append(ref_col)
@@ -389,19 +395,21 @@ class PostgresSourceConnector(SourceConnector):
     def list_all_sequences(self) -> list["SequenceDef"]:
         """Return every sequence in the configured schemas with full metadata."""
         from core.connectors.base import SequenceDef
-        results: list[SequenceDef] = []
+        results: list["SequenceDef"] = []
         with self._conn.cursor() as cur:
             cur.execute(
                 "SELECT "
+                "  s.schemaname, "
                 "  s.sequencename, "
                 "  s.start_value, s.min_value, s.max_value, "
                 "  s.increment_by, s.cycle, "
                 "  s.last_value, "
                 "  ("
-                "    SELECT pc.relname || '.' || a.attname "
+                "    SELECT n.nspname || '.' || pc.relname || '.' || a.attname "
                 "    FROM pg_class sc "
                 "    JOIN pg_depend d ON d.objid = sc.oid AND d.deptype = 'a' "
                 "    JOIN pg_class pc ON pc.oid = d.refobjid "
+                "    JOIN pg_namespace n ON pc.relnamespace = n.oid "
                 "    JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
                 "    WHERE sc.relname = s.sequencename "
                 "      AND sc.relnamespace = ANY(SELECT oid FROM pg_namespace WHERE nspname = ANY(%s)) "
@@ -409,11 +417,11 @@ class PostgresSourceConnector(SourceConnector):
                 "  ) AS owned_by "
                 "FROM pg_sequences s "
                 "WHERE s.schemaname = ANY(%s) "
-                "ORDER BY s.sequencename",
+                "ORDER BY s.schemaname, s.sequencename",
                 (list(self._include_schemas), list(self._include_schemas)),
             )
             for row in cur.fetchall():
-                seq_name, start, min_v, max_v, incr, cycle, last_v, owned_by = row
+                seq_schema, seq_name, start, min_v, max_v, incr, cycle, last_v, owned_by = row
                 results.append(SequenceDef(
                     name=seq_name,
                     start_value=int(start),
@@ -423,6 +431,7 @@ class PostgresSourceConnector(SourceConnector):
                     cycle=bool(cycle),
                     last_value=int(last_v) if last_v is not None else None,
                     owned_by=owned_by,
+                    schema=seq_schema,
                 ))
         return results
 
@@ -550,13 +559,13 @@ class PostgresSourceConnector(SourceConnector):
     def list_views(self) -> list[ViewDefinition]:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT table_name, view_definition "
+                "SELECT table_name, table_schema, view_definition "
                 "FROM information_schema.views "
                 "WHERE table_schema = ANY(%s) "
                 "ORDER BY table_name",
                 (list(self._include_schemas),),
             )
-            return [ViewDefinition(name=row[0], definition=row[1]) for row in cur.fetchall()]
+            return [ViewDefinition(name=row[0], schema_name=row[1], definition=row[2]) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Materialized Views (Phase 12)
@@ -565,13 +574,15 @@ class PostgresSourceConnector(SourceConnector):
     def list_materialized_views(self) -> list[MaterializedViewDef]:
         with self._conn.cursor() as cur:
             cur.execute(
-                "SELECT matviewname, pg_get_viewdef(matviewname::regclass) "
-                "FROM pg_matviews "
-                "WHERE schemaname = ANY(%s) "
-                "ORDER BY matviewname",
+                "SELECT m.matviewname, m.schemaname, pg_get_viewdef(c.oid) "
+                "FROM pg_matviews m "
+                "JOIN pg_class c ON c.relname = m.matviewname "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = m.schemaname "
+                "WHERE m.schemaname = ANY(%s) "
+                "ORDER BY m.matviewname",
                 (list(self._include_schemas),),
             )
-            return [MaterializedViewDef(name=row[0], definition=row[1]) for row in cur.fetchall()]
+            return [MaterializedViewDef(name=row[0], schema_name=row[1], definition=row[2]) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Functions & Stored Procedures (Phase 13)
@@ -584,7 +595,7 @@ class PostgresSourceConnector(SourceConnector):
                 # prokind 'f'=function 'p'=procedure 'a'=aggregate 'w'=window
                 # IN ('f','p') already excludes aggregates — no need for proisagg (PG10 only)
                 cur.execute(
-                    "SELECT p.proname, pg_get_functiondef(p.oid) "
+                    "SELECT p.proname, n.nspname, pg_get_functiondef(p.oid) "
                     "FROM pg_proc p "
                     "JOIN pg_namespace n ON p.pronamespace = n.oid "
                     "WHERE n.nspname = ANY(%s) "
@@ -593,8 +604,8 @@ class PostgresSourceConnector(SourceConnector):
                     (list(self._include_schemas),),
                 )
                 for row in cur.fetchall():
-                    func_name, ddl = row
-                    funcs.append(FunctionDef(name=func_name, ddl=ddl))
+                    func_name, schema_name, ddl = row
+                    funcs.append(FunctionDef(name=func_name, schema_name=schema_name, ddl=ddl))
         except Exception:
             self._conn.rollback()   # keep source connection clean for subsequent phases
             raise
@@ -609,7 +620,7 @@ class PostgresSourceConnector(SourceConnector):
         try:
             with self._conn.cursor() as cur:
                 cur.execute(
-                    "SELECT t.tgname, c.relname, pg_get_triggerdef(t.oid) "
+                    "SELECT t.tgname, c.relname, n.nspname, pg_get_triggerdef(t.oid) "
                     "FROM pg_trigger t "
                     "JOIN pg_class c ON t.tgrelid = c.oid "
                     "JOIN pg_namespace n ON c.relnamespace = n.oid "
@@ -618,8 +629,8 @@ class PostgresSourceConnector(SourceConnector):
                     (list(self._include_schemas),),
                 )
                 for row in cur.fetchall():
-                    trig_name, table_name, ddl = row
-                    triggers.append(TriggerDef(name=trig_name, table=table_name, ddl=ddl))
+                    trig_name, table_name, schema_name, ddl = row
+                    triggers.append(TriggerDef(name=trig_name, table=table_name, schema_name=schema_name, ddl=ddl))
         except Exception:
             self._conn.rollback()   # keep source connection clean for subsequent phases
             raise
@@ -629,7 +640,7 @@ class PostgresSourceConnector(SourceConnector):
     # Row-Level Security (Phase 9)
     # ------------------------------------------------------------------
 
-    def get_rls_policies(self, table: str) -> list[RLSPolicy]:
+    def get_rls_policies(self, table: str, schema_name: str | None = None) -> list[RLSPolicy]:
         policies: list[RLSPolicy] = []
         with self._conn.cursor() as cur:
             cur.execute(
@@ -640,7 +651,8 @@ class PostgresSourceConnector(SourceConnector):
                 "    ELSE 'ALL' END AS cmd, "
                 "  CASE pol.polpermissive WHEN true THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END, "
                 "  pg_get_expr(pol.polqual, pol.polrelid) AS using_expr, "
-                "  pg_get_expr(pol.polwithcheck, pol.polrelid) AS check_expr "
+                "  pg_get_expr(pol.polwithcheck, pol.polrelid) AS check_expr, "
+                "  n.nspname "
                 "FROM pg_policy pol "
                 "JOIN pg_class c ON c.oid = pol.polrelid "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
@@ -648,12 +660,13 @@ class PostgresSourceConnector(SourceConnector):
                 (list(self._include_schemas), table),
             )
             for row in cur.fetchall():
-                pol_name, cmd, permissive, using_expr, check_expr = row
+                pol_name, cmd, permissive, using_expr, check_expr, nspname = row
                 policies.append(RLSPolicy(
                     name=pol_name, table=table, cmd=cmd,
                     permissive=permissive,
                     using_expr=using_expr,
                     check_expr=check_expr,
+                    schema_name=nspname or schema_name or "public",
                 ))
         return policies
 
@@ -670,7 +683,7 @@ class PostgresSourceConnector(SourceConnector):
                 "SELECT CASE c.relkind "
                 "  WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' "
                 "  WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END, "
-                "  c.relname, d.description "
+                "  n.nspname, c.relname, d.description "
                 "FROM pg_description d "
                 "JOIN pg_class c ON d.objoid = c.oid "
                 "JOIN pg_namespace n ON c.relnamespace = n.oid "
@@ -680,12 +693,12 @@ class PostgresSourceConnector(SourceConnector):
                 (schemas,),
             )
             for row in cur.fetchall():
-                obj_type, obj_name, comment = row
-                comments.append(CommentDef(object_type=obj_type, object_name=obj_name, comment=comment))
+                obj_type, schema_name, obj_name, comment = row
+                comments.append(CommentDef(object_type=obj_type, object_name=obj_name, comment=comment, schema_name=schema_name))
 
             # Column comments
             cur.execute(
-                "SELECT c.relname, a.attname, d.description "
+                "SELECT n.nspname, c.relname, a.attname, d.description "
                 "FROM pg_description d "
                 "JOIN pg_attribute a ON d.objoid = a.attrelid AND d.objsubid = a.attnum "
                 "JOIN pg_class c ON a.attrelid = c.oid "
@@ -695,16 +708,17 @@ class PostgresSourceConnector(SourceConnector):
                 (schemas,),
             )
             for row in cur.fetchall():
-                table_name, col_name, comment = row
+                schema_name, table_name, col_name, comment = row
                 comments.append(CommentDef(
                     object_type="COLUMN",
                     object_name=f"{table_name}.{col_name}",
                     comment=comment,
+                    schema_name=schema_name,
                 ))
 
             # Function comments
             cur.execute(
-                "SELECT p.proname || '(' || "
+                "SELECT n.nspname, p.proname || '(' || "
                 "  pg_get_function_arguments(p.oid) || ')', d.description "
                 "FROM pg_description d "
                 "JOIN pg_proc p ON d.objoid = p.oid "
@@ -714,8 +728,22 @@ class PostgresSourceConnector(SourceConnector):
                 (schemas,),
             )
             for row in cur.fetchall():
-                func_sig, comment = row
-                comments.append(CommentDef(object_type="FUNCTION", object_name=func_sig, comment=comment))
+                schema_name, func_sig, comment = row
+                comments.append(CommentDef(object_type="FUNCTION", object_name=func_sig, comment=comment, schema_name=schema_name))
+
+            # Schema comments
+            cur.execute(
+                "SELECT n.nspname, d.description "
+                "FROM pg_description d "
+                "JOIN pg_namespace n ON d.objoid = n.oid "
+                "WHERE d.classoid = 'pg_namespace'::regclass "
+                "  AND n.nspname = ANY(%s) "
+                "ORDER BY n.nspname",
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                schema_name, comment = row
+                comments.append(CommentDef(object_type="SCHEMA", object_name=schema_name, comment=comment, schema_name=schema_name))
 
         return comments
 
@@ -729,40 +757,102 @@ class PostgresSourceConnector(SourceConnector):
             schemas = list(self._include_schemas)
             # Table grants
             cur.execute(
-                "SELECT grantee, table_name, "
+                "SELECT grantee, table_schema, table_name, "
                 "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
                 "FROM information_schema.role_table_grants "
                 "WHERE table_schema = ANY(%s) "
                 "  AND grantee NOT IN ('PUBLIC') "
                 "  AND grantor != grantee "
-                "GROUP BY grantee, table_name "
-                "ORDER BY table_name, grantee",
+                "GROUP BY grantee, table_schema, table_name "
+                "ORDER BY table_schema, table_name, grantee",
                 (schemas,),
             )
             for row in cur.fetchall():
-                grantee, table_name, privs = row
+                grantee, schema_name, table_name, privs = row
                 grants.append(GrantDef(
                     privileges=privs, object_type="TABLE",
-                    object_name=table_name, grantee=grantee,
+                    object_name=table_name, grantee=grantee, schema_name=schema_name,
+                ))
+
+            # Column grants
+            cur.execute(
+                "SELECT grantee, table_schema, table_name, column_name, "
+                "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
+                "FROM information_schema.role_column_grants "
+                "WHERE table_schema = ANY(%s) "
+                "  AND grantee NOT IN ('PUBLIC') "
+                "  AND grantor != grantee "
+                "GROUP BY grantee, table_schema, table_name, column_name "
+                "ORDER BY table_schema, table_name, column_name, grantee",
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                grantee, schema_name, table_name, column_name, privs = row
+                grants.append(GrantDef(
+                    privileges=privs, object_type="COLUMN",
+                    object_name=f"{table_name}.{column_name}", grantee=grantee, schema_name=schema_name,
                 ))
 
             # Sequence grants
             cur.execute(
-                "SELECT grantee, object_name, "
+                "SELECT grantee, object_schema, object_name, "
                 "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
                 "FROM information_schema.role_usage_grants "
                 "WHERE object_schema = ANY(%s) "
                 "  AND object_type = 'SEQUENCE' "
                 "  AND grantee NOT IN ('PUBLIC') "
-                "GROUP BY grantee, object_name "
-                "ORDER BY object_name, grantee",
+                "GROUP BY grantee, object_schema, object_name "
+                "ORDER BY object_schema, object_name, grantee",
                 (schemas,),
             )
             for row in cur.fetchall():
-                grantee, seq_name, privs = row
+                grantee, schema_name, seq_name, privs = row
                 grants.append(GrantDef(
                     privileges=privs, object_type="SEQUENCE",
-                    object_name=seq_name, grantee=grantee,
+                    object_name=seq_name, grantee=grantee, schema_name=schema_name,
+                ))
+
+            # Schema grants
+            cur.execute(
+                "SELECT n.nspname, r.rolname AS grantee, acl.privilege_type "
+                "FROM pg_namespace n "
+                "JOIN aclexplode(n.nspacl) acl ON true "
+                "JOIN pg_roles r ON r.oid = acl.grantee "
+                "WHERE n.nspname = ANY(%s) "
+                "  AND n.nspacl IS NOT NULL "
+                "  AND r.rolname NOT IN ('PUBLIC') "
+                "  AND acl.grantee != (SELECT oid FROM pg_roles WHERE rolname = current_user)",
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                schema_name, grantee, privilege_type = row
+                grants.append(GrantDef(
+                    privileges=privilege_type,
+                    object_type="SCHEMA",
+                    object_name=schema_name, grantee=grantee, schema_name=schema_name,
+                ))
+
+            # Function grants
+            cur.execute(
+                "SELECT n.nspname, p.proname || '(' || "
+                "  pg_get_function_arguments(p.oid) || ')', r.rolname AS grantee, acl.privilege_type "
+                "FROM pg_proc p "
+                "JOIN pg_namespace n ON p.pronamespace = n.oid "
+                "JOIN aclexplode(p.proacl) acl ON true "
+                "JOIN pg_roles r ON r.oid = acl.grantee "
+                "WHERE n.nspname = ANY(%s) "
+                "  AND p.prokind IN ('f', 'p') "
+                "  AND p.proacl IS NOT NULL "
+                "  AND r.rolname NOT IN ('PUBLIC') "
+                "  AND acl.grantee != (SELECT oid FROM pg_roles WHERE rolname = current_user)",
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                schema_name, func_sig, grantee, privilege_type = row
+                grants.append(GrantDef(
+                    privileges=privilege_type,
+                    object_type="FUNCTION",
+                    object_name=func_sig, grantee=grantee, schema_name=schema_name,
                 ))
 
         return grants
@@ -918,53 +1008,76 @@ class PostgresTargetConnector(TargetConnector):
         validate_identifier(schema.name, "table")
         table_schema = schema.schema_name or "public"
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_name = %s AND table_schema = %s",
-                (schema.name, table_schema),
-            )
-            if cur.fetchone() is not None:
-                return
+            try:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_name = %s AND table_schema = %s",
+                    (schema.name, table_schema),
+                )
+                if cur.fetchone() is not None:
+                    return
 
-            col_defs = []
-            for col in schema.columns:
-                col_type = col.target_type or col.source_type
-                if col.generated:
-                    # GENERATED ALWAYS AS (expr) STORED — do NOT include NULL/DEFAULT
-                    col_defs.append(
-                        f"{col.name} {col_type} GENERATED ALWAYS AS ({col.generated}) STORED"
-                    )
+                col_defs = []
+                for col in schema.columns:
+                    col_type = col.target_type or col.source_type
+                    if col.generated:
+                        # GENERATED ALWAYS AS (expr) STORED — do NOT include NULL/DEFAULT
+                        col_defs.append(
+                            f"{col.name} {col_type} GENERATED ALWAYS AS ({col.generated}) STORED"
+                        )
+                    else:
+                        null_str = "NULL" if col.nullable else "NOT NULL"
+                        default_str = f" DEFAULT {col.default}" if col.default else ""
+                        col_defs.append(f"{col.name} {col_type}{default_str} {null_str}")
+
+                if schema.primary_key:
+                    pk_cols = ", ".join(schema.primary_key)
+                    col_defs.append(f"PRIMARY KEY ({pk_cols})")
+
+                if table_schema == "public":
+                    ddl = f"CREATE TABLE {schema.name} ({', '.join(col_defs)})"
                 else:
-                    null_str = "NULL" if col.nullable else "NOT NULL"
-                    default_str = f" DEFAULT {col.default}" if col.default else ""
-                    col_defs.append(f"{col.name} {col_type}{default_str} {null_str}")
-
-            if schema.primary_key:
-                pk_cols = ", ".join(schema.primary_key)
-                col_defs.append(f"PRIMARY KEY ({pk_cols})")
-
-            if table_schema == "public":
-                ddl = f"CREATE TABLE {schema.name} ({', '.join(col_defs)})"
-            else:
-                ddl = f"CREATE TABLE {quote_identifier(table_schema)}.{quote_identifier(schema.name)} ({', '.join(col_defs)})"
-            if schema.partition_key:
-                ddl += f" PARTITION BY {schema.partition_key}"
-            cur.execute(ddl)
-            self._conn.commit()
-            audit_log(phase="create_table", status="created", details={"table": schema.name})
+                    ddl = f"CREATE TABLE {quote_identifier(table_schema)}.{quote_identifier(schema.name)} ({', '.join(col_defs)})"
+                if schema.partition_key:
+                    ddl += f" PARTITION BY {schema.partition_key}"
+                cur.execute(ddl)
+                self._conn.commit()
+                audit_log(phase="create_table", status="created", details={"table": schema.name})
+            except Exception:
+                # Always roll back so a single bad DDL does not poison the
+                # connection for subsequent tables / phases.
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
 
     # ------------------------------------------------------------------
     # Phase 3.5 — Sequences (create before tables that reference them)
     # ------------------------------------------------------------------
 
     def create_sequence(self, seq: "SequenceDef") -> None:
-        """Create a sequence with the exact same properties as on the source."""
+        """Create a sequence with the exact same properties as on the source.
+
+        Phase 3.5 runs BEFORE tables are created (Phase 4), so we
+        intentionally do NOT apply ``ALTER SEQUENCE ... OWNED BY`` here:
+        PostgreSQL rejects ``OWNED BY`` when the referenced table does
+        not yet exist, and the orchestrator would otherwise see every
+        sequence creation fail and lose them.  Ownership is reattached
+        later by ``apply_constraints`` / ``advance_sequence`` once the
+        owning table exists.
+        """
         from core.connectors.base import SequenceDef  # noqa: F401
+        seq_schema = seq.schema or "public"
+        seq_qname = (
+            seq.name if seq_schema == "public"
+            else f"{quote_identifier(seq_schema)}.{quote_identifier(seq.name)}"
+        )
         with self._conn.cursor() as cur:
             try:
                 cycle_clause = "CYCLE" if seq.cycle else "NO CYCLE"
                 cur.execute(
-                    f"CREATE SEQUENCE IF NOT EXISTS {seq.name} "
+                    f"CREATE SEQUENCE IF NOT EXISTS {seq_qname} "
                     f"START WITH {seq.start_value} "
                     f"INCREMENT BY {seq.increment} "
                     f"MINVALUE {seq.min_value} "
@@ -973,27 +1086,36 @@ class PostgresTargetConnector(TargetConnector):
                 )
                 self._conn.commit()
                 audit_log(phase="create_sequence", status="created",
-                          details={"sequence": seq.name, "owned_by": seq.owned_by})
+                          details={"sequence": seq_qname, "owned_by": seq.owned_by})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_sequence", status="skipped",
-                          details={"sequence": seq.name, "reason": str(exc)})
+                          details={"sequence": seq_qname, "reason": str(exc)})
 
-    def advance_sequence(self, seq_name: str, table: str, column: str) -> None:
+    def advance_sequence(self, seq_name: str, table: str, column: str, owned_by: str | None = None) -> None:
         """After data load: advance sequence to max(column) so next INSERT gets the right value.
 
         Fix #5: sequence name is passed via a %s placeholder (psycopg casts it
         to regclass automatically), which safely handles quoted names like
         'public."Order-id_seq"' without raw f-string injection.
+
+        Fix #9: For non-public schemas, the table may be in a different schema
+        than the sequence. Extract the schema from owned_by (schema.table.column)
+        to qualify the table reference in the MAX() query.
         """
-        validate_identifier(table, "table")
         validate_identifier(column, "column")
+        table_qname = table
+        if owned_by:
+            parts = owned_by.rsplit(".", 2)
+            if len(parts) == 3:
+                table_schema, table_name_from_owned, _ = parts
+                if table_name_from_owned == table:
+                    table_qname = f"{quote_identifier(table_schema)}.{quote_identifier(table)}"
         with self._conn.cursor() as cur:
             try:
-                # Use %s so psycopg quotes/escapes seq_name correctly via regclass cast.
                 cur.execute(
                     f"SELECT setval(%s::regclass, "
-                    f"COALESCE((SELECT MAX({column}) FROM {table}), 0) + 1, false)",
+                    f"COALESCE((SELECT MAX({column}) FROM {table_qname}), 0) + 1, false)",
                     (seq_name,),
                 )
                 self._conn.commit()
@@ -1066,12 +1188,16 @@ class PostgresTargetConnector(TargetConnector):
         else:
             conflict_clause = "ON CONFLICT DO NOTHING"
 
+        table_name = (
+            object_name if not schema or not schema.schema_name or schema.schema_name == "public"
+            else f"{quote_identifier(schema.schema_name)}.{quote_identifier(object_name)}"
+        )
         sql = (
-            f"INSERT INTO {object_name} ({col_names}) "
+            f"INSERT INTO {table_name} ({col_names}) "
             f"VALUES ({placeholders}) "
             f"{conflict_clause} SET {update_set}"
             if pk_cols else
-            f"INSERT INTO {object_name} ({col_names}) "
+            f"INSERT INTO {table_name} ({col_names}) "
             f"VALUES ({placeholders}) "
             f"{conflict_clause}"
         )
@@ -1100,6 +1226,10 @@ class PostgresTargetConnector(TargetConnector):
 
     def apply_constraints(self, schema: Schema) -> None:
         validate_identifier(schema.name, "table")
+        table_qname = (
+            schema.name if not schema.schema_name or schema.schema_name == "public"
+            else f"{quote_identifier(schema.schema_name)}.{quote_identifier(schema.name)}"
+        )
         with self._conn.cursor() as cur:
             # Indexes (use full DDL from pg_get_indexdef if available)
             for idx in schema.indexes:
@@ -1114,7 +1244,7 @@ class PostgresTargetConnector(TargetConnector):
                         col_list = ", ".join(idx.columns)
                         cur.execute(
                             f"CREATE {idx_type} IF NOT EXISTS {idx.name} "
-                            f"ON {schema.name} ({col_list})"
+                            f"ON {table_qname} ({col_list})"
                         )
                     self._conn.commit()
                     audit_log(phase="create_index", status="created",
@@ -1128,7 +1258,7 @@ class PostgresTargetConnector(TargetConnector):
             for chk in schema.check_constraints:
                 try:
                     cur.execute(
-                        f"ALTER TABLE {schema.name} "
+                        f"ALTER TABLE {table_qname} "
                         f"ADD CONSTRAINT {chk.name} CHECK ({chk.expression})"
                     )
                     self._conn.commit()
@@ -1143,17 +1273,21 @@ class PostgresTargetConnector(TargetConnector):
             for fk in schema.foreign_keys:
                 col_list = ", ".join(fk.columns)
                 ref_col_list = ", ".join(fk.ref_columns)
+                ref_table_qname = (
+                    fk.ref_table if fk.ref_schema == "public"
+                    else f"{quote_identifier(fk.ref_schema)}.{quote_identifier(fk.ref_table)}"
+                )
                 try:
                     cur.execute(
-                        f"ALTER TABLE {schema.name} "
+                        f"ALTER TABLE {table_qname} "
                         f"ADD CONSTRAINT {fk.name} "
                         f"FOREIGN KEY ({col_list}) "
-                        f"REFERENCES {fk.ref_table} ({ref_col_list}) "
+                        f"REFERENCES {ref_table_qname} ({ref_col_list}) "
                         f"ON DELETE {fk.on_delete} ON UPDATE {fk.on_update}"
                     )
                     self._conn.commit()
                     audit_log(phase="create_fk", status="created",
-                              details={"table": schema.name, "fk": fk.name, "ref_table": fk.ref_table})
+                              details={"table": schema.name, "fk": fk.name, "ref_table": ref_table_qname})
                 except Exception as exc:
                     self._conn.rollback()
                     audit_log(phase="create_fk", status="skipped",
@@ -1165,9 +1299,13 @@ class PostgresTargetConnector(TargetConnector):
 
     def apply_rls_policy(self, policy: RLSPolicy) -> None:
         validate_identifier(policy.table, "table")
+        table_qname = (
+            policy.table if policy.schema_name == "public"
+            else f"{quote_identifier(policy.schema_name)}.{quote_identifier(policy.table)}"
+        )
         with self._conn.cursor() as cur:
             try:
-                cur.execute(f"ALTER TABLE {policy.table} ENABLE ROW LEVEL SECURITY")
+                cur.execute(f"ALTER TABLE {table_qname} ENABLE ROW LEVEL SECURITY")
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -1176,13 +1314,13 @@ class PostgresTargetConnector(TargetConnector):
                 using_clause = f" USING ({policy.using_expr})" if policy.using_expr else ""
                 check_clause = f" WITH CHECK ({policy.check_expr})" if policy.check_expr else ""
                 cur.execute(
-                    f"CREATE POLICY {policy.name} ON {policy.table} "
+                    f"CREATE POLICY {policy.name} ON {table_qname} "
                     f"AS {policy.permissive} FOR {policy.cmd}"
                     f"{using_clause}{check_clause}"
                 )
                 self._conn.commit()
                 audit_log(phase="create_rls_policy", status="created",
-                          details={"table": policy.table, "policy": policy.name})
+                          details={"table": table_qname, "policy": policy.name})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_rls_policy", status="skipped",
@@ -1192,24 +1330,68 @@ class PostgresTargetConnector(TargetConnector):
     # Phase 10 — Sequences
     # ------------------------------------------------------------------
 
-    def sync_sequence(self, table: str, column: str) -> None:
+    def sync_sequence(self, table: str, column: str, schema_name: str | None = None) -> None:
         validate_identifier(table, "table")
         validate_identifier(column, "column")
+        schema = schema_name or "public"
+        table_qname = (
+            table if schema == "public"
+            else f"{quote_identifier(schema)}.{quote_identifier(table)}"
+        )
         with self._conn.cursor() as cur:
             try:
                 cur.execute(
                     f"SELECT setval("
-                    f"  pg_get_serial_sequence('{table}', '{column}'), "
-                    f"  COALESCE((SELECT MAX({column}) FROM {table}), 1)"
-                    f")"
+                    f"  pg_get_serial_sequence(%s, %s), "
+                    f"  COALESCE((SELECT MAX({column}) FROM {table_qname}), 1)"
+                    f")",
+                    (table_qname, column),
                 )
                 self._conn.commit()
                 audit_log(phase="sync_sequence", status="synced",
-                          details={"table": table, "column": column})
+                          details={"table": table_qname, "column": column})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="sync_sequence", status="skipped",
-                          details={"table": table, "column": column, "reason": str(exc)})
+                          details={"table": table_qname, "column": column, "reason": str(exc)})
+
+    def apply_sequence_ownership(self, seq: "SequenceDef") -> None:
+        """Apply ALTER SEQUENCE ... OWNED BY after the owning table/column exists."""
+        if not seq.owned_by:
+            return
+        parts = seq.owned_by.split(".")
+        if len(parts) not in (2, 3):
+            return
+        seq_schema = seq.schema or "public"
+        if len(parts) == 3:
+            owned_schema, table_name, column_name = parts
+            if owned_schema != seq_schema:
+                return
+        else:
+            table_name, column_name = parts
+            if seq_schema != "public":
+                return
+        seq_qname = (
+            seq.name if seq_schema == "public"
+            else f"{quote_identifier(seq_schema)}.{quote_identifier(seq.name)}"
+        )
+        table_qname = (
+            table_name if seq_schema == "public"
+            else f"{quote_identifier(seq_schema)}.{quote_identifier(table_name)}"
+        )
+        column_qname = quote_identifier(column_name)
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(
+                    f"ALTER SEQUENCE {seq_qname} OWNED BY {table_qname}.{column_qname}"
+                )
+                self._conn.commit()
+                audit_log(phase="apply_sequence_ownership", status="owned",
+                          details={"sequence": seq.name, "owned_by": f"{table_qname}.{column_qname}"})
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(phase="apply_sequence_ownership", status="skipped",
+                          details={"sequence": seq.name, "reason": str(exc)})
 
     # ------------------------------------------------------------------
     # Phase 11 — Views
@@ -1217,9 +1399,13 @@ class PostgresTargetConnector(TargetConnector):
 
     def create_view(self, view: ViewDefinition) -> None:
         validate_identifier(view.name, "view")
+        view_name = (
+            view.name if view.schema_name == "public"
+            else f"{quote_identifier(view.schema_name)}.{quote_identifier(view.name)}"
+        )
         with self._conn.cursor() as cur:
             try:
-                cur.execute(f"CREATE OR REPLACE VIEW {view.name} AS {view.definition}")
+                cur.execute(f"CREATE OR REPLACE VIEW {view_name} AS {view.definition}")
                 self._conn.commit()
                 audit_log(phase="create_view", status="created", details={"view": view.name})
             except Exception as exc:
@@ -1234,11 +1420,16 @@ class PostgresTargetConnector(TargetConnector):
 
     def create_materialized_view(self, mv: MaterializedViewDef) -> None:
         validate_identifier(mv.name, "materialized view")
+        mv_schema = mv.schema_name or "public"
+        mv_qname = (
+            mv.name if mv_schema == "public"
+            else f"{quote_identifier(mv_schema)}.{quote_identifier(mv.name)}"
+        )
         with self._conn.cursor() as cur:
             try:
                 cur.execute(
-                    "SELECT 1 FROM pg_matviews WHERE matviewname = %s AND schemaname = 'public'",
-                    (mv.name,),
+                    "SELECT 1 FROM pg_matviews WHERE matviewname = %s AND schemaname = %s",
+                    (mv.name, mv_schema),
                 )
                 if cur.fetchone() is not None:
                     return
@@ -1246,59 +1437,73 @@ class PostgresTargetConnector(TargetConnector):
                 # appending WITH NO DATA (which must be the last clause)
                 clean_def = mv.definition.rstrip().rstrip(";")
                 cur.execute(
-                    f"CREATE MATERIALIZED VIEW {mv.name} AS {clean_def} WITH NO DATA"
+                    f"CREATE MATERIALIZED VIEW {mv_qname} AS {clean_def} WITH NO DATA"
                 )
                 self._conn.commit()
-                audit_log(phase="create_matview", status="created", details={"matview": mv.name})
+                audit_log(phase="create_matview", status="created", details={"matview": mv_qname})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_matview", status="failed",
-                          details={"matview": mv.name, "reason": str(exc)})
+                          details={"matview": mv_qname, "reason": str(exc)})
                 raise
 
-    def refresh_materialized_view(self, name: str) -> None:
+    def refresh_materialized_view(self, name: str, schema_name: str | None = None) -> None:
         validate_identifier(name, "materialized view")
+        mv_qname = (
+            name if not schema_name or schema_name == "public"
+            else f"{quote_identifier(schema_name)}.{quote_identifier(name)}"
+        )
         with self._conn.cursor() as cur:
             try:
-                cur.execute(f"REFRESH MATERIALIZED VIEW {name}")
+                cur.execute(f"REFRESH MATERIALIZED VIEW {mv_qname}")
                 self._conn.commit()
-                audit_log(phase="refresh_matview", status="refreshed", details={"matview": name})
+                audit_log(phase="refresh_matview", status="refreshed", details={"matview": mv_qname})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="refresh_matview", status="failed",
-                          details={"matview": name, "reason": str(exc)})
+                          details={"matview": mv_qname, "reason": str(exc)})
 
     # ------------------------------------------------------------------
     # Phase 13 — Functions & Stored Procedures
     # ------------------------------------------------------------------
 
     def create_function(self, func: FunctionDef) -> None:
+        validate_identifier(func.name, "function")
+        func_qname = (
+            func.name if func.schema_name == "public"
+            else f"{quote_identifier(func.schema_name)}.{quote_identifier(func.name)}"
+        )
         with self._conn.cursor() as cur:
             try:
                 cur.execute(func.ddl)
                 self._conn.commit()
-                audit_log(phase="create_function", status="created", details={"function": func.name})
+                audit_log(phase="create_function", status="created", details={"function": func_qname})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_function", status="skipped",
-                          details={"function": func.name, "reason": str(exc)})
+                          details={"function": func_qname, "reason": str(exc)})
 
     # ------------------------------------------------------------------
     # Phase 14 — Triggers
     # ------------------------------------------------------------------
 
     def create_trigger(self, trigger: TriggerDef) -> None:
+        validate_identifier(trigger.name, "trigger")
+        trigger_schema = trigger.schema_name or "public"
+        table_qname = (
+            trigger.table if trigger_schema == "public"
+            else f"{quote_identifier(trigger_schema)}.{quote_identifier(trigger.table)}"
+        )
         with self._conn.cursor() as cur:
             try:
-                # Drop existing trigger first (idempotent)
                 cur.execute(
-                    f"DROP TRIGGER IF EXISTS {trigger.name} ON {trigger.table}"
+                    f"DROP TRIGGER IF EXISTS {quote_identifier(trigger.name)} ON {table_qname}"
                 )
                 self._conn.commit()
                 cur.execute(trigger.ddl)
                 self._conn.commit()
                 audit_log(phase="create_trigger", status="created",
-                          details={"trigger": trigger.name, "table": trigger.table})
+                          details={"trigger": trigger.name, "table": table_qname})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="create_trigger", status="skipped",
@@ -1312,12 +1517,26 @@ class PostgresTargetConnector(TargetConnector):
         with self._conn.cursor() as cur:
             try:
                 escaped = comment.comment.replace("'", "''")
+                if comment.object_type == "SCHEMA":
+                    qualified_name = quote_identifier(comment.schema_name)
+                elif comment.schema_name == "public":
+                    qualified_name = comment.object_name
+                elif comment.object_type == "COLUMN":
+                    parts = comment.object_name.split(".")
+                    qualified_name = (
+                        f"{quote_identifier(comment.schema_name)}.{quote_identifier(parts[0])}"
+                        f".{quote_identifier(parts[1])}"
+                    )
+                elif comment.object_type == "FUNCTION":
+                    qualified_name = f"{quote_identifier(comment.schema_name)}.{comment.object_name}"
+                else:
+                    qualified_name = f"{quote_identifier(comment.schema_name)}.{quote_identifier(comment.object_name)}"
                 cur.execute(
-                    f"COMMENT ON {comment.object_type} {comment.object_name} IS '{escaped}'"
+                    f"COMMENT ON {comment.object_type} {qualified_name} IS '{escaped}'"
                 )
                 self._conn.commit()
                 audit_log(phase="apply_comment", status="applied",
-                          details={"object": comment.object_name})
+                          details={"object": qualified_name})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="apply_comment", status="skipped",
@@ -1330,26 +1549,38 @@ class PostgresTargetConnector(TargetConnector):
     def apply_grant(self, grant: GrantDef) -> None:
         with self._conn.cursor() as cur:
             try:
+                if grant.object_type == "SCHEMA":
+                    qualified_name = quote_identifier(grant.schema_name)
+                elif grant.object_type == "COLUMN":
+                    parts = grant.object_name.split(".")
+                    qualified_name = f"{quote_identifier(parts[0])}.{quote_identifier(parts[1])}"
+                elif grant.object_type == "FUNCTION":
+                    qualified_name = f"{quote_identifier(grant.schema_name)}.{grant.object_name}"
+                elif grant.schema_name == "public":
+                    qualified_name = grant.object_name
+                else:
+                    qualified_name = f"{quote_identifier(grant.schema_name)}.{quote_identifier(grant.object_name)}"
                 cur.execute(
                     f"GRANT {grant.privileges} ON {grant.object_type} "
-                    f"{grant.object_name} TO {grant.grantee}"
+                    f"{qualified_name} TO {grant.grantee}"
                 )
                 self._conn.commit()
                 audit_log(phase="apply_grant", status="applied",
-                          details={"object": grant.object_name, "grantee": grant.grantee})
+                          details={"object": qualified_name, "grantee": grant.grantee})
             except Exception as exc:
                 self._conn.rollback()
                 audit_log(phase="apply_grant", status="skipped",
-                          details={"object": grant.object_name, "reason": str(exc)})
+                          details={"object": grant.object_name, "grantee": grant.grantee, "reason": str(exc)})
 
     # ------------------------------------------------------------------
     # Misc
     # ------------------------------------------------------------------
 
-    def get_object_count(self, object_name: str) -> int:
+    def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
         validate_identifier(object_name, "table")
+        table_name = f"{schema_name}.{object_name}" if schema_name else object_name
         with self._conn.cursor() as cur:
-            cur.execute(f"SELECT count(*) FROM {object_name}")
+            cur.execute(f"SELECT count(*) FROM {table_name}")
             return cur.fetchone()[0]
 
     def delete(self, object_name: str, document: dict[str, Any], schema: Schema | None = None) -> None:
@@ -1365,10 +1596,11 @@ class PostgresTargetConnector(TargetConnector):
             self._conn.commit()
             audit_log(phase="cdc_delete", status="deleted", details={"table": object_name})
 
-    def export_full(self, object_name: str) -> Iterator[dict[str, Any]]:
+    def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict[str, Any]]:
         validate_identifier(object_name, "table")
+        table_name = f"{schema_name}.{object_name}" if schema_name else object_name
         with self._conn.cursor(name=f"export_target_{object_name}") as cur:
-            cur.execute(f"SELECT * FROM {object_name}")
+            cur.execute(f"SELECT * FROM {table_name}")
             columns = [desc.name for desc in cur.description]
             for row in cur:
                 yield dict(zip(columns, row))
