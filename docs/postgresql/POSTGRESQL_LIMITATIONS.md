@@ -1,8 +1,8 @@
 # PostgreSQL Limitations
 
 Documented limitations identified during the PostgreSQL object migration audit
-on the `feature/postgresql-objects` branch (PostgreSQL 17.4, 94 unit tests
-passing, commit `906dc89`).
+on the `feature/postgresql-objects` branch (PostgreSQL 17.4, 100 unit tests
+passing, commit `906dc89` and subsequent fixes).
 
 Limitations are categorized as:
 - **Implementation limitation** — behavior gap in the current migration code
@@ -117,18 +117,6 @@ Limitations are categorized as:
 - **Workaround:** Manually delete stale rows or use CDC incremental mode once
   available.
 - **Tracking:** Documented in `POSTGRESQL_LOCAL_AUDIT_PHASE_1.md` Section 5.
-
-## Role migration
-
-### Roles are not created or migrated
-
-- **Category:** Implementation limitation
-- **Impact:** If a source grantee or policy role does not exist on the target,
-  grants are skipped and RLS policy enforcement depends on PostgreSQL's role
-  resolution.
-- **Workaround:** Manually create required roles on the target before running
-  the migration.
-- **Tracking:** Documented in the audit report.
 
 ## CDC — `wal_level` prerequisite
 

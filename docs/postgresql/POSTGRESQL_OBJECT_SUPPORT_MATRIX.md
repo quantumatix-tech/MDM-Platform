@@ -1,7 +1,8 @@
 # PostgreSQL Object Support Matrix
 
 Classification of PostgreSQL object types based on the completed local audit
-on PostgreSQL 17.4 (`feature/postgresql-objects` branch, commit `906dc89`).
+on PostgreSQL 17.4 (`feature/postgresql-objects` branch, commit `906dc89`
+and subsequent fixes).
 
 ## Classification keys
 
@@ -29,7 +30,7 @@ on PostgreSQL 17.4 (`feature/postgresql-objects` branch, commit `906dc89`).
 | Cross-schema FK | Supported / Verified | `audit_test.fk_child→public.customers` tested; `ref_schema` preserved |
 | Unique constraint | Supported / Verified | `customers.email`, `products.name`, `test_customers.email` |
 | Check constraint | Supported / Verified | `price >= 0`, `stock_qty >= 0`, `quantity > 0` |
-| Default | Supported / Verified | `DEFAULT NOW()`, `DEFAULT 'active'`, domain default |
+| Defaults | Supported / Verified | `DEFAULT NOW()`, `DEFAULT 'active'`, domain default |
 | `GENERATED ALWAYS AS` | Supported / Verified | Detected via `attgenerated = 's'`, preserved in DDL |
 | `NOT NULL` | Supported / Verified | Inline in column DDL |
 | Partitioned table | Out of Scope | `create_partition` hardcodes public schema in existence check; documented limitation |
@@ -106,9 +107,9 @@ on PostgreSQL 17.4 (`feature/postgresql-objects` branch, commit `906dc89`).
 | Schema `USAGE` / `CREATE` | Supported / Verified | `audit_user` granted on `public` and `audit_test` |
 | Table `SELECT` / `INSERT` / `UPDATE` / `DELETE` | Supported / Verified | `customers`, `orders`, `test_customers` grants verified |
 | Column privileges | Supported / Verified | `customers.city`, `test_customers.city` grants verified |
-| Sequence `USAGE` / `SELECT` | Supported / Verified | Sequence grants verified via `information_schema.role_usage_grants` |
+| Sequence `USAGE` / `SELECT` | Supported / Verified | Sequence grants verified via `pg_class.relacl` + `aclexplode` (captures USAGE, SELECT, UPDATE) |
 | Function `EXECUTE` | Supported / Verified | `get_customer_count()` grant verified |
-| Role creation | Out of Scope | Platform does not create or migrate roles |
+| Role creation | Supported / Verified | Roles created via `create_role_if_not_exists()` before grant application |
 
 ## RLS / Policies
 

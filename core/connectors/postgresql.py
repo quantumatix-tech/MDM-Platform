@@ -311,8 +311,10 @@ class PostgresSourceConnector(SourceConnector):
                 "  AND tc.table_schema = kcu.table_schema "
                 "JOIN information_schema.referential_constraints rc "
                 "  ON tc.constraint_name = rc.constraint_name "
+                "  AND tc.constraint_schema = rc.constraint_schema "
                 "JOIN information_schema.constraint_column_usage ccu "
                 "  ON rc.unique_constraint_name = ccu.constraint_name "
+                "  AND rc.unique_constraint_schema = ccu.constraint_schema "
                 "WHERE tc.table_name = %s AND tc.table_schema = %s "
                 "  AND tc.constraint_type = 'FOREIGN KEY'",
                 (object_name, table_schema),
@@ -774,8 +776,10 @@ class PostgresSourceConnector(SourceConnector):
                 "ORDER BY table_schema, table_name, grantee",
                 (schemas,),
             )
+            table_grants: list[tuple[str, str, str, str]] = []
             for row in cur.fetchall():
                 grantee, schema_name, table_name, privs = row
+                table_grants.append((grantee, schema_name, table_name, privs))
                 grants.append(GrantDef(
                     privileges=privs, object_type="TABLE",
                     object_name=table_name, grantee=grantee, schema_name=schema_name,
@@ -800,16 +804,21 @@ class PostgresSourceConnector(SourceConnector):
                     object_name=f"{table_name}.{column_name}", grantee=grantee, schema_name=schema_name,
                 ))
 
-            # Sequence grants
+            # Sequence grants (explicit ACL entries)
             cur.execute(
-                "SELECT grantee, object_schema, object_name, "
-                "  string_agg(privilege_type, ', ' ORDER BY privilege_type) "
-                "FROM information_schema.role_usage_grants "
-                "WHERE object_schema = ANY(%s) "
-                "  AND object_type = 'SEQUENCE' "
-                "  AND grantee NOT IN ('PUBLIC') "
-                "GROUP BY grantee, object_schema, object_name "
-                "ORDER BY object_schema, object_name, grantee",
+                "SELECT r.rolname AS grantee, n.nspname, c.relname, "
+                "  string_agg(acl.privilege_type, ', ' ORDER BY acl.privilege_type) "
+                "FROM pg_class c "
+                "JOIN pg_namespace n ON c.relnamespace = n.oid "
+                "JOIN aclexplode(c.relacl) acl ON true "
+                "JOIN pg_roles r ON r.oid = acl.grantee "
+                "WHERE n.nspname = ANY(%s) "
+                "  AND c.relkind = 'S' "
+                "  AND c.relacl IS NOT NULL "
+                "  AND acl.grantee != 0 "
+                "  AND acl.grantor != acl.grantee "
+                "GROUP BY r.rolname, n.nspname, c.relname "
+                "ORDER BY n.nspname, c.relname, r.rolname",
                 (schemas,),
             )
             for row in cur.fetchall():
@@ -818,6 +827,43 @@ class PostgresSourceConnector(SourceConnector):
                     privileges=privs, object_type="SEQUENCE",
                     object_name=seq_name, grantee=grantee, schema_name=schema_name,
                 ))
+
+            # Sequence grants for owned sequences (SERIAL/IDENTITY columns)
+            # If a role has INSERT on a table with an owned sequence, they need USAGE on that sequence
+            # This runs AFTER explicit sequence grants so we can avoid duplicates
+            if table_grants:
+                cur.execute(
+                    "SELECT s.schemaname, s.sequencename, "
+                    "  n.nspname || '.' || pc.relname || '.' || a.attname AS owned_by "
+                    "FROM pg_sequences s "
+                    "JOIN pg_class sc ON sc.relname = s.sequencename AND sc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schemaname) "
+                    "JOIN pg_depend d ON d.objid = sc.oid AND d.deptype = 'a' "
+                    "JOIN pg_class pc ON pc.oid = d.refobjid "
+                    "JOIN pg_namespace n ON pc.relnamespace = n.oid "
+                    "JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
+                    "WHERE s.schemaname = ANY(%s)",
+                    (schemas,),
+                )
+                # Map: (schema, table, column) -> (sequence_schema, sequence_name)
+                owned_sequences: dict[tuple[str, str, str], tuple[str, str]] = {}
+                for row in cur.fetchall():
+                    seq_schema, seq_name, owned_by = row
+                    if owned_by:
+                        parts = owned_by.split(".")
+                        if len(parts) == 3:
+                            owned_sequences[(parts[0], parts[1], parts[2])] = (seq_schema, seq_name)
+
+                for grantee, schema_name, table_name, privs in table_grants:
+                    if "INSERT" in privs:
+                        # Check for owned sequence on any column of this table
+                        for (s, t, c), (seq_schema, seq_name) in owned_sequences.items():
+                            if s == schema_name and t == table_name:
+                                # Avoid duplicate if explicit grant already exists
+                                if not any(g.object_type == "SEQUENCE" and g.object_name == seq_name and g.grantee == grantee for g in grants):
+                                    grants.append(GrantDef(
+                                        privileges="USAGE, SELECT", object_type="SEQUENCE",
+                                        object_name=seq_name, grantee=grantee, schema_name=seq_schema,
+                                    ))
 
             # Schema grants
             cur.execute(
@@ -1504,26 +1550,49 @@ class PostgresTargetConnector(TargetConnector):
             try:
                 if grant.object_type == "SCHEMA":
                     qualified_name = quote_identifier(grant.schema_name)
+                    cur.execute(
+                        f"GRANT {grant.privileges} ON SCHEMA {qualified_name} TO {grant.grantee}"
+                    )
                 elif grant.object_type == "COLUMN":
                     parts = grant.object_name.split(".")
-                    qualified_name = f"{quote_identifier(parts[0])}.{quote_identifier(parts[1])}"
+                    table_name = quote_identifier(parts[0])
+                    column_name = quote_identifier(parts[1])
+                    cur.execute(
+                        f"GRANT {grant.privileges} ON TABLE {table_name} ({column_name}) TO {grant.grantee}"
+                    )
                 elif grant.object_type == "FUNCTION":
                     qualified_name = f"{quote_identifier(grant.schema_name)}.{grant.object_name}"
+                    cur.execute(
+                        f"GRANT {grant.privileges} ON FUNCTION {qualified_name} TO {grant.grantee}"
+                    )
                 elif grant.schema_name == "public":
                     qualified_name = grant.object_name
+                    cur.execute(
+                        f"GRANT {grant.privileges} ON {grant.object_type} {qualified_name} TO {grant.grantee}"
+                    )
                 else:
                     qualified_name = f"{quote_identifier(grant.schema_name)}.{quote_identifier(grant.object_name)}"
-                cur.execute(
-                    f"GRANT {grant.privileges} ON {grant.object_type} "
-                    f"{qualified_name} TO {grant.grantee}"
-                )
+                    cur.execute(
+                        f"GRANT {grant.privileges} ON {grant.object_type} {qualified_name} TO {grant.grantee}"
+                    )
                 self._conn.commit()
                 audit_log(phase="apply_grant", status="applied",
-                          details={"object": qualified_name, "grantee": grant.grantee})
+                          details={"object": grant.object_name, "grantee": grant.grantee})
             except Exception as exc:
                 self._conn.rollback()
-                audit_log(phase="apply_grant", status="skipped",
+                audit_log(phase="apply_grant", status="failed",
                           details={"object": grant.object_name, "grantee": grant.grantee, "reason": str(exc)})
+                raise
+
+    def create_role_if_not_exists(self, role_name: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role_name,))
+            if cur.fetchone() is None:
+                cur.execute(f"CREATE ROLE {quote_identifier(role_name)}")
+                self._conn.commit()
+                audit_log(phase="create_role", status="created", details={"role": role_name})
+            else:
+                audit_log(phase="create_role", status="exists", details={"role": role_name})
 
     # ------------------------------------------------------------------
     # Misc

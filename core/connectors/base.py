@@ -402,6 +402,9 @@ class TargetConnector(abc.ABC):
     def apply_grant(self, grant: GrantDef) -> None:
         pass
 
+    def create_role_if_not_exists(self, role_name: str) -> None:
+        pass
+
 
 class CDCEngine(abc.ABC):
     @abc.abstractmethod

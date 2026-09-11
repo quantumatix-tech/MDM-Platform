@@ -462,17 +462,28 @@ class MigrationOrchestrator:
             # ---------- Phase 16: Grants ----------
             grant_results: list[str] = []
             try:
-                for grant in self._source.list_grants():
-                    grant_key = (
-                        f"{grant.object_name} TO {grant.grantee}"
-                        if grant.schema_name == "public"
-                        else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
-                    )
+                grants = list(self._source.list_grants())
+                # Ensure all grantee roles exist on target before applying grants
+                grantees = {g.grantee for g in grants}
+                for grantee in grantees:
+                    try:
+                        self._target.create_role_if_not_exists(grantee)
+                    except Exception as exc:
+                        grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
+                for grant in grants:
+                    if grant.object_type == "SCHEMA":
+                        grant_key = f"{grant.object_name} TO {grant.grantee}"
+                    else:
+                        grant_key = (
+                            f"{grant.object_name} TO {grant.grantee}"
+                            if grant.schema_name == "public"
+                            else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+                        )
                     try:
                         self._target.apply_grant(grant)
                         grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
                     except Exception as exc:
-                        grant_results.append(f"GRANT ... ON {grant_key}: skipped ({exc})")
+                        grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results
