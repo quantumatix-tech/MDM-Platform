@@ -885,10 +885,11 @@ class PostgresSourceConnector(SourceConnector):
                     object_name=schema_name, grantee=grantee, schema_name=schema_name,
                 ))
 
-            # Function grants
+            # Function and procedure grants
             cur.execute(
                 "SELECT n.nspname, p.proname || '(' || "
-                "  pg_get_function_arguments(p.oid) || ')', r.rolname AS grantee, acl.privilege_type "
+                "  pg_get_function_arguments(p.oid) || ')', r.rolname AS grantee, "
+                "  acl.privilege_type, p.prokind "
                 "FROM pg_proc p "
                 "JOIN pg_namespace n ON p.pronamespace = n.oid "
                 "JOIN aclexplode(p.proacl) acl ON true "
@@ -901,10 +902,11 @@ class PostgresSourceConnector(SourceConnector):
                 (schemas,),
             )
             for row in cur.fetchall():
-                schema_name, func_sig, grantee, privilege_type = row
+                schema_name, func_sig, grantee, privilege_type, prokind = row
+                object_type = "FUNCTION" if prokind == "f" else "PROCEDURE"
                 grants.append(GrantDef(
                     privileges=privilege_type,
-                    object_type="FUNCTION",
+                    object_type=object_type,
                     object_name=func_sig, grantee=grantee, schema_name=schema_name,
                 ))
 
@@ -1557,13 +1559,17 @@ class PostgresTargetConnector(TargetConnector):
                     parts = grant.object_name.split(".")
                     table_name = quote_identifier(parts[0])
                     column_name = quote_identifier(parts[1])
+                    if grant.schema_name == "public":
+                        qualified_table = table_name
+                    else:
+                        qualified_table = f"{quote_identifier(grant.schema_name)}.{table_name}"
                     cur.execute(
-                        f"GRANT {grant.privileges} ON TABLE {table_name} ({column_name}) TO {grant.grantee}"
+                        f"GRANT {grant.privileges} ({column_name}) ON TABLE {qualified_table} TO {grant.grantee}"
                     )
-                elif grant.object_type == "FUNCTION":
+                elif grant.object_type in ("FUNCTION", "PROCEDURE"):
                     qualified_name = f"{quote_identifier(grant.schema_name)}.{grant.object_name}"
                     cur.execute(
-                        f"GRANT {grant.privileges} ON FUNCTION {qualified_name} TO {grant.grantee}"
+                        f"GRANT {grant.privileges} ON {grant.object_type} {qualified_name} TO {grant.grantee}"
                     )
                 elif grant.schema_name == "public":
                     qualified_name = grant.object_name

@@ -1725,6 +1725,41 @@ class TestPostgresGrantSchemaQualification:
         assert '"audit_test"."test_customers"' in grant_sql
         assert "TO audit_user" in grant_sql
 
+    def test_list_grants_preserves_function_and_procedure_types(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["cloud_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [],
+            [],
+            [],
+            [],
+            [
+                ("cloud_test", "get_customer_count()", "cloud_test_reader", "EXECUTE", "f"),
+                ("cloud_test", "log_message(IN p_message text)", "cloud_test_reader", "EXECUTE", "p"),
+            ],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+
+        function_grant = next(g for g in grants if g.object_name == "get_customer_count()")
+        procedure_grant = next(g for g in grants if g.object_name == "log_message(IN p_message text)")
+        assert function_grant.object_type == "FUNCTION"
+        assert function_grant.schema_name == "cloud_test"
+        assert function_grant.privileges == "EXECUTE"
+        assert procedure_grant.object_type == "PROCEDURE"
+        assert procedure_grant.schema_name == "cloud_test"
+        assert procedure_grant.privileges == "EXECUTE"
+
     def test_target_apply_grant_qualifies_column_non_public_schema(self):
         from core.connectors.postgresql import PostgresTargetConnector
         target = PostgresTargetConnector(
@@ -1750,8 +1785,8 @@ class TestPostgresGrantSchemaQualification:
         executed = [c.args[0] for c in cur.execute.call_args_list]
         grant_sql = next((s for s in executed if "GRANT" in s), None)
         assert grant_sql is not None
-        # Valid PostgreSQL COLUMN grant syntax: ON TABLE "test_customers" ("email")
-        assert 'ON TABLE "test_customers" ("email")' in grant_sql
+        # Valid PostgreSQL COLUMN grant syntax: GRANT privilege (column) ON TABLE schema.table TO role
+        assert grant_sql == 'GRANT SELECT ("email") ON TABLE "audit_test"."test_customers" TO audit_user'
         assert "TO audit_user" in grant_sql
 
     def test_target_apply_grant_remains_unqualified_for_public(self):
@@ -1898,7 +1933,7 @@ class TestPostgresGrantFixes:
         assert grant_key != "cloud_test.cloud_test TO cloud_test_reader"
 
     def test_apply_grant_column_generates_valid_postgresql_sql(self):
-        """COLUMN grants must use 'GRANT ... ON TABLE table (column) TO role' syntax"""
+        """COLUMN grants must use 'GRANT privilege (column) ON TABLE table TO role' syntax"""
         from core.connectors.postgresql import PostgresTargetConnector
         from core.connectors.base import GrantDef
         target = PostgresTargetConnector(
@@ -1924,10 +1959,70 @@ class TestPostgresGrantFixes:
         executed = [c.args[0] for c in cur.execute.call_args_list]
         grant_sql = next((s for s in executed if "GRANT" in s), None)
         assert grant_sql is not None
-        # Must use ON TABLE ... (column) syntax, NOT ON COLUMN table.column
-        assert 'ON TABLE "customers" ("customer_id")' in grant_sql
-        assert 'ON COLUMN' not in grant_sql
-        assert "TO cloud_test_reader" in grant_sql
+        assert grant_sql == (
+            'GRANT SELECT, INSERT ("customer_id") '
+            'ON TABLE "cloud_test"."customers" TO cloud_test_reader'
+        )
+
+    def test_apply_grant_function_generates_valid_postgresql_sql(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="EXECUTE",
+            object_type="FUNCTION",
+            object_name="get_customer_count()",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql == (
+            'GRANT EXECUTE ON FUNCTION "cloud_test".get_customer_count() '
+            'TO cloud_test_reader'
+        )
+
+    def test_apply_grant_procedure_generates_valid_postgresql_sql(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="EXECUTE",
+            object_type="PROCEDURE",
+            object_name="log_message(IN p_message text)",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql == (
+            'GRANT EXECUTE ON PROCEDURE "cloud_test".log_message(IN p_message text) '
+            'TO cloud_test_reader'
+        )
 
     def test_apply_grant_schema_generates_valid_postgresql_sql(self):
         """SCHEMA grants must use 'GRANT ... ON SCHEMA schema TO role' syntax"""
@@ -2587,4 +2682,47 @@ class TestConfigSchema:
         assert "source" in schema
         assert "target" in schema
         assert "migration" in schema
-        assert "retry" in schema
+
+
+class TestOrchestratorGrantFailureTracking:
+    """Grant failures should be tracked in migration summary."""
+
+    def test_grant_failure_adds_to_failed_objects_and_all_errors(self):
+        from core.orchestrator import MigrationOrchestrator
+        from core.connectors.base import GrantDef
+
+        source = MagicMock(spec=SourceConnector)
+        target = MagicMock(spec=TargetConnector)
+
+        source.list_objects.return_value = ["customers"]
+        source.get_object_count.return_value = 1
+        source.get_schema.return_value = Schema(
+            name="customers", columns=[Column(name="id", source_type="integer")]
+        )
+        source.export_full.return_value = iter([{"id": 1}])
+        source.list_grants.return_value = [
+            GrantDef(
+                privileges="SELECT",
+                object_type="TABLE",
+                object_name="customers",
+                schema_name="public",
+                grantee="missing_role",
+            )
+        ]
+
+        target.connect.return_value = None
+        target.create_schema.return_value = None
+        target.create_object_if_missing.return_value = None
+        target.upsert_batch.return_value = UpsertResult(success_count=1)
+        target.get_object_count.return_value = 1
+        # Make apply_grant fail
+        target.apply_grant.side_effect = Exception("role does not exist")
+
+        orchestrator = MigrationOrchestrator(source, target, {})
+        result = orchestrator.run_full()
+
+        # Grant failure should be reflected in status
+        assert result["status"] == "partial_success"
+# Grant failure should be recorded in the grants phase results
+        grants_phase = result["phases"].get("grants", [])
+        assert any("failed" in str(g) and "role does not exist" in str(g) for g in grants_phase)

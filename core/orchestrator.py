@@ -484,6 +484,8 @@ class MigrationOrchestrator:
                         grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
                     except Exception as exc:
                         grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
+                        all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
+                        failed_objects.add(grant_key)
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results
@@ -1054,6 +1056,8 @@ class MigrationOrchestrator:
                         grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
                     except Exception as exc:
                         grant_results.append(f"GRANT ... ON {grant_key}: skipped ({exc})")
+                        all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
+                        failed_objects.add(grant_key)
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results
