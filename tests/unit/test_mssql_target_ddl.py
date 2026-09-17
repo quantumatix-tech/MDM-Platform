@@ -14,7 +14,7 @@ from core.connectors.mssql import (
     _mssql_column_type, _variant_column_names,
     PartitionFunctionDef, PartitionSchemeDef, PartitionedTableDef,
 )
-from core.connectors.base import Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef, SynonymDef, TypeDef, GrantDef
+from core.connectors.base import Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef, SynonymDef, TypeDef, GrantDef, CommentDef
 
 
 def _sales_customers_schema() -> Schema:
@@ -1739,6 +1739,378 @@ def test_apply_grant_rollbacks_on_failure():
         target.apply_grant(grant)
 
     target._conn.rollback.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Step 15 — MSSQL Comments / Extended Properties
+# ---------------------------------------------------------------------------
+
+
+def _mock_source_with_comments(rows_table, rows_column, rows_schema):
+    cur = MagicMock()
+    cur.fetchall.side_effect = [rows_table, rows_column, rows_schema]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    source = MSSQLSourceConnector(
+        {"database": "mssql_migration_test", "include_schemas": ["sales"]}
+    )
+    source._conn = conn
+    return source, cur
+
+
+def test_list_comments_discovers_table_view_function_comments():
+    source, cur = _mock_source_with_comments(
+        rows_table=[
+            ("Table description", "sales", "orders", "USER_TABLE", "TABLE"),
+            ("View description", "sales", "v_orders", "VIEW", "VIEW"),
+            ("Function description", "sales", "fn_get_total(@id int)", "SQL_SCALAR_FUNCTION", "FUNCTION"),
+            ("Proc description", "sales", "sp_update_order", "SQL_STORED_PROCEDURE", "PROCEDURE"),
+        ],
+        rows_column=[],
+        rows_schema=[],
+    )
+
+    comments = source.list_comments()
+
+    assert len(comments) == 4
+    by_name = {(c.object_type, c.object_name): c for c in comments}
+    assert ("TABLE", "orders") in by_name
+    assert by_name[("TABLE", "orders")].comment == "Table description"
+    assert by_name[("TABLE", "orders")].schema_name == "sales"
+    assert ("VIEW", "v_orders") in by_name
+    assert by_name[("VIEW", "v_orders")].comment == "View description"
+    assert ("FUNCTION", "fn_get_total(@id int)") in by_name
+    assert by_name[("FUNCTION", "fn_get_total(@id int)")].comment == "Function description"
+    assert ("PROCEDURE", "sp_update_order") in by_name
+    assert by_name[("PROCEDURE", "sp_update_order")].comment == "Proc description"
+
+    # Verify query structure - check first call (table/view/function/procedure)
+    sql = cur.execute.call_args_list[0].args[0]
+    assert "sys.extended_properties" in sql
+    assert "MS_Description" in sql
+    assert "s.name IN" in sql
+
+
+def test_list_comments_discovers_column_comments():
+    source, cur = _mock_source_with_comments(
+        rows_table=[],
+        rows_column=[
+            ("Customer email", "sales", "customers", "email"),
+            ("Order total", "sales", "orders", "total_amount"),
+        ],
+        rows_schema=[],
+    )
+
+    comments = source.list_comments()
+
+    assert len(comments) == 2
+    by_name = {(c.object_type, c.object_name): c for c in comments}
+    assert ("COLUMN", "customers.email") in by_name
+    assert by_name[("COLUMN", "customers.email")].comment == "Customer email"
+    assert by_name[("COLUMN", "customers.email")].schema_name == "sales"
+    assert ("COLUMN", "orders.total_amount") in by_name
+    assert by_name[("COLUMN", "orders.total_amount")].comment == "Order total"
+
+
+def test_list_comments_discovers_schema_comments():
+    source, cur = _mock_source_with_comments(
+        rows_table=[],
+        rows_column=[],
+        rows_schema=[
+            ("Sales schema description", "sales"),
+            ("Billing schema description", "billing"),
+        ],
+    )
+
+    comments = source.list_comments()
+
+    assert len(comments) == 2
+    by_name = {(c.object_type, c.object_name): c for c in comments}
+    assert ("SCHEMA", "sales") in by_name
+    assert by_name[("SCHEMA", "sales")].comment == "Sales schema description"
+    assert by_name[("SCHEMA", "sales")].schema_name == "sales"
+    assert ("SCHEMA", "billing") in by_name
+    assert by_name[("SCHEMA", "billing")].comment == "Billing schema description"
+
+
+def test_list_comments_uses_schema_filter_from_config():
+    source, cur = _mock_source_with_comments([], [], [])
+    source.list_comments()
+
+    # Check first call (table/view/function/procedure)
+    sql = cur.execute.call_args_list[0].args[0]
+    params = cur.execute.call_args_list[0].args[1]
+    assert "s.name IN" in sql
+    assert params == ["sales"]
+
+
+def _build_target_for_comments() -> tuple[MSSQLTargetConnector, MagicMock]:
+    cur = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    target = MSSQLTargetConnector(
+        {"database": "mssql_migration_target", "source_engine": "mssql"}
+    )
+    target._conn = conn
+    return target, cur
+
+
+def test_apply_comment_table_adds_extended_property():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = None  # property doesn't exist -> ADD
+
+    comment = CommentDef(
+        object_type="TABLE",
+        object_name="orders",
+        schema_name="sales",
+        comment="Order transactions table",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    # First call: existence check
+    assert any("sys.extended_properties" in s for s in executed)
+    # Second call: sp_addextendedproperty
+    add_call = next(c for c in cur.execute.call_args_list if "sp_addextendedproperty" in str(c.args[0]))
+    add_sql = str(add_call.args[0])
+    add_params = add_call.args[1] if len(add_call.args) > 1 else ()
+    assert "MS_Description" in add_sql
+    assert "Order transactions table" in str(add_params)
+    # level0type=SCHEMA, level0name=sales, level1type=TABLE, level1name=orders (no brackets)
+    param_str = str(add_params)
+    assert "SCHEMA" in param_str
+    assert "sales" in param_str
+    assert "TABLE" in param_str
+    assert "orders" in param_str
+    # Ensure no brackets in parameters
+    assert "[sales]" not in param_str
+    assert "[orders]" not in param_str
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_comment_table_updates_extended_property():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = (1,)  # property exists -> UPDATE
+
+    comment = CommentDef(
+        object_type="TABLE",
+        object_name="orders",
+        schema_name="sales",
+        comment="Updated order transactions table",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    update_call = next(c for c in cur.execute.call_args_list if "sp_updateextendedproperty" in str(c.args[0]))
+    update_sql = str(update_call.args[0])
+    update_params = update_call.args[1] if len(update_call.args) > 1 else ()
+    assert "MS_Description" in update_sql
+    assert "Updated order transactions table" in str(update_params)
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_comment_column_adds_extended_property():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = None
+
+    comment = CommentDef(
+        object_type="COLUMN",
+        object_name="customers.email",
+        schema_name="sales",
+        comment="Customer email address",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    add_call = next(c for c in cur.execute.call_args_list if "sp_addextendedproperty" in str(c.args[0]))
+    add_sql = str(add_call.args[0])
+    add_params = add_call.args[1] if len(add_call.args) > 1 else ()
+    assert "MS_Description" in add_sql
+    assert "Customer email address" in str(add_params)
+    # level0type=SCHEMA, level0name=sales, level1type=TABLE, level1name=customers, level2type=COLUMN, level2name=email (no brackets)
+    param_str = str(add_params)
+    assert "SCHEMA" in param_str
+    assert "sales" in param_str
+    assert "TABLE" in param_str
+    assert "customers" in param_str
+    assert "COLUMN" in param_str
+    assert "email" in param_str
+    # Ensure no brackets in parameters
+    assert "[sales]" not in param_str
+    assert "[customers]" not in param_str
+    assert "[email]" not in param_str
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_comment_column_updates_extended_property():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = (1,)
+
+    comment = CommentDef(
+        object_type="COLUMN",
+        object_name="customers.email",
+        schema_name="sales",
+        comment="Updated customer email",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    update_call = next(c for c in cur.execute.call_args_list if "sp_updateextendedproperty" in str(c.args[0]))
+    update_sql = str(update_call.args[0])
+    update_params = update_call.args[1] if len(update_call.args) > 1 else ()
+    assert "MS_Description" in update_sql
+    assert "Updated customer email" in str(update_params)
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_comment_schema_adds_extended_property():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = None
+
+    comment = CommentDef(
+        object_type="SCHEMA",
+        object_name="sales",
+        schema_name="sales",
+        comment="Sales data schema",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    add_call = next(c for c in cur.execute.call_args_list if "sp_addextendedproperty" in str(c.args[0]))
+    add_sql = str(add_call.args[0])
+    add_params = add_call.args[1] if len(add_call.args) > 1 else ()
+    assert "MS_Description" in add_sql
+    assert "Sales data schema" in str(add_params)
+    # level0type=SCHEMA, level0name=sales
+    param_str = str(add_params)
+    assert "SCHEMA" in param_str
+    assert "sales" in param_str
+    # Ensure no brackets in parameters
+    assert "[sales]" not in param_str
+    # Schema only has level0
+    assert "level1type" not in add_sql.lower()
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_comment_view_adds_extended_property():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = None
+
+    comment = CommentDef(
+        object_type="VIEW",
+        object_name="v_customer_orders",
+        schema_name="sales",
+        comment="Customer orders view",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    add_call = next(c for c in cur.execute.call_args_list if "sp_addextendedproperty" in str(c.args[0]))
+    add_sql = str(add_call.args[0])
+    add_params = add_call.args[1] if len(add_call.args) > 1 else ()
+    assert "MS_Description" in add_sql
+    assert "VIEW" in str(add_params)
+    assert "v_customer_orders" in str(add_params)
+    # Ensure no brackets in parameters
+    assert "[v_customer_orders]" not in str(add_params)
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_comment_function_adds_extended_property():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = None
+
+    comment = CommentDef(
+        object_type="FUNCTION",
+        object_name="fn_get_total(@id int)",
+        schema_name="sales",
+        comment="Returns order total",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    add_call = next(c for c in cur.execute.call_args_list if "sp_addextendedproperty" in str(c.args[0]))
+    add_sql = str(add_call.args[0])
+    add_params = add_call.args[1] if len(add_call.args) > 1 else ()
+    assert "MS_Description" in add_sql
+    assert "FUNCTION" in str(add_params)
+    assert "fn_get_total(@id int)" in str(add_params)
+    # Ensure no brackets in parameters
+    assert "[fn_get_total(@id int)]" not in str(add_params)
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_comment_procedure_adds_extended_property():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = None
+
+    comment = CommentDef(
+        object_type="PROCEDURE",
+        object_name="sp_update_order",
+        schema_name="sales",
+        comment="Updates an order",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    add_call = next(c for c in cur.execute.call_args_list if "sp_addextendedproperty" in str(c.args[0]))
+    add_sql = str(add_call.args[0])
+    add_params = add_call.args[1] if len(add_call.args) > 1 else ()
+    assert "MS_Description" in add_sql
+    assert "PROCEDURE" in str(add_params)
+    assert "sp_update_order" in str(add_params)
+    # Ensure no brackets in parameters
+    assert "[sp_update_order]" not in str(add_params)
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_comment_escapes_single_quotes():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = None
+
+    comment = CommentDef(
+        object_type="TABLE",
+        object_name="orders",
+        schema_name="sales",
+        comment="Order's description with 'quotes'",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    add_call = next(c for c in cur.execute.call_args_list if "sp_addextendedproperty" in str(c.args[0]))
+    add_sql = str(add_call.args[0])
+    add_params = add_call.args[1] if len(add_call.args) > 1 else ()
+    # Single quotes should be escaped as '' in the parameter value
+    param_str = str(add_params)
+    assert "Order''s description with ''quotes''" in param_str
+
+
+def test_apply_comment_rolls_back_on_failure():
+    target, cur = _build_target_for_comments()
+    cur.fetchone.return_value = None
+    # Second execute call (sp_addextendedproperty) fails
+    call_count = [0]
+    def execute_side_effect(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            raise RuntimeError("permission denied")
+    cur.execute.side_effect = execute_side_effect
+
+    comment = CommentDef(
+        object_type="TABLE",
+        object_name="orders",
+        schema_name="sales",
+        comment="Test comment",
+    )
+    with pytest.raises(RuntimeError, match="permission denied"):
+        target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any("sp_addextendedproperty" in s for s in executed)
+    target._conn.rollback.assert_called_once()
+    target._conn.commit.assert_not_called()
 
 
 
