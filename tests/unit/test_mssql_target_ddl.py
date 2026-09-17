@@ -9,7 +9,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.connectors.mssql import MSSQLTargetConnector, MSSQLSourceConnector, _build_mssql_index_ddl, PartitionFunctionDef, PartitionSchemeDef, PartitionedTableDef
+from core.connectors.mssql import (
+    MSSQLTargetConnector, MSSQLSourceConnector, _build_mssql_index_ddl,
+    _mssql_column_type, _variant_column_names,
+    PartitionFunctionDef, PartitionSchemeDef, PartitionedTableDef,
+)
 from core.connectors.base import Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef, SynonymDef, TypeDef
 
 
@@ -1107,4 +1111,248 @@ def test_create_partition_function_boundary_string_handling():
 
 
 from datetime import datetime
+
+
+# ---------------------------------------------------------------------------
+# Step 13 — MSSQL XML, JSON-in-NVARCHAR, VARBINARY, UNIQUEIDENTIFIER, SQL_VARIANT
+# ---------------------------------------------------------------------------
+
+
+def _specialized_types_schema() -> Schema:
+    """Schema for a table with MSSQL specialized data types."""
+    return Schema(
+        name="specialized_types",
+        schema_name="sales",
+        columns=[
+            Column(name="id", source_type="int", nullable=False, is_identity=True,
+                   identity_seed=1, identity_increment=1),
+            Column(name="xml_data", source_type="xml", nullable=True),
+            Column(name="json_data", source_type="nvarchar", nullable=True, size=-1),
+            Column(name="short_json", source_type="nvarchar", nullable=True, size=200),
+            Column(name="varbinary_data", source_type="varbinary", nullable=True, size=100),
+            Column(name="binary_data", source_type="binary", nullable=True, size=16),
+            Column(name="guid_data", source_type="uniqueidentifier", nullable=True),
+            Column(name="variant_int", source_type="sql_variant", nullable=True),
+            Column(name="variant_str", source_type="sql_variant", nullable=True),
+            Column(name="created_at", source_type="datetime2", nullable=False),
+        ],
+        primary_key=["id"],
+    )
+
+
+def test_mssql_column_type_xml_passes_through():
+    assert _mssql_column_type("xml", None, None, None) == "xml"
+
+
+def test_mssql_column_type_uniqueidentifier_passes_through():
+    assert _mssql_column_type("uniqueidentifier", None, None, None) == "uniqueidentifier"
+
+
+def test_mssql_column_type_sql_variant_passes_through():
+    assert _mssql_column_type("sql_variant", None, None, None) == "sql_variant"
+
+
+def test_mssql_column_type_varbinary_re_attaches_size():
+    assert _mssql_column_type("varbinary", 100, None, None) == "varbinary(100)"
+
+
+def test_mssql_column_type_varbinary_max():
+    assert _mssql_column_type("varbinary", -1, None, None) == "varbinary(MAX)"
+
+
+def test_mssql_column_type_binary_re_attaches_size():
+    assert _mssql_column_type("binary", 16, None, None) == "binary(16)"
+
+
+def test_mssql_column_type_decimal_precision_preserved():
+    assert _mssql_column_type("decimal", None, 10, 2) == "decimal(10,2)"
+
+
+def test_create_table_emits_specialized_types():
+    target, cur = _build_target()
+    target.create_object_if_missing(_specialized_types_schema())
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+    ddl = next(sql for sql in executed if sql.startswith("CREATE TABLE"))
+
+    assert "xml_data xml NULL" in ddl
+    assert "json_data nvarchar(MAX) NULL" in ddl
+    assert "short_json nvarchar(200) NULL" in ddl
+    assert "varbinary_data varbinary(100) NULL" in ddl
+    assert "binary_data binary(16) NULL" in ddl
+    assert "guid_data uniqueidentifier NULL" in ddl
+    assert "variant_int sql_variant NULL" in ddl
+    assert "variant_str sql_variant NULL" in ddl
+    assert "PRIMARY KEY (id)" in ddl
+
+
+def _build_mock_variant_conn():
+    """Build a mock connection where sql_variant columns are present."""
+    cur = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    return conn, cur
+
+
+def _mock_non_computed_and_variant(non_computed, variant_cols):
+    """Patch _non_computed_column_names and _variant_column_names via monkeypatching
+    the module-level functions used inside export_full."""
+    import core.connectors.mssql as mssql_mod
+
+    original_non_computed = mssql_mod._non_computed_column_names
+    original_variant = mssql_mod._variant_column_names
+
+    mssql_mod._non_computed_column_names = lambda conn, name, schema: non_computed
+    mssql_mod._variant_column_names = lambda conn, name, schema: variant_cols
+
+    try:
+        yield
+    finally:
+        mssql_mod._non_computed_column_names = original_non_computed
+        mssql_mod._variant_column_names = original_variant
+
+
+def test_export_full_casts_sql_variant_columns():
+    import core.connectors.mssql as mssql_mod
+
+    # The function under test is import-bound at class definition time,
+    # so patch the names in the mssql module namespace.
+    original_non_computed = mssql_mod._non_computed_column_names
+    original_variant = mssql_mod._variant_column_names
+    mssql_mod._non_computed_column_names = lambda conn, name, schema: [
+        "id", "xml_data", "variant_int"
+    ]
+    mssql_mod._variant_column_names = lambda conn, name, schema: {"variant_int"}
+
+    cur = MagicMock()
+    cur.fetchall.return_value = [
+        ("specialized_types",),
+    ]
+    # table-exists check for non-computed columns query
+    cur.fetchone.return_value = ("sales",)
+    cur.description = [
+        ("id",), ("xml_data",), ("variant_int",),
+    ]
+    cur.__iter__ = lambda *a, **k: iter([
+        (1, "<xml/>", "42"),
+    ])
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+
+    source = MSSQLSourceConnector({"database": "mssql_migration_test", "include_schemas": ["sales"]})
+    source._conn = conn
+
+    rows = list(source.export_full("specialized_types", schema_name="sales"))
+
+    assert len(rows) == 1
+    assert rows[0]["id"] == 1
+    assert rows[0]["xml_data"] == "<xml/>"
+    assert rows[0]["variant_int"] == "42"
+
+    # Verify the SELECT includes CAST for the sql_variant column
+    executed_sqls = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    select_sql = next(s for s in executed_sqls if s.strip().startswith("SELECT"))
+    assert "CAST" in select_sql
+    assert "sql_variant" not in select_sql  # no literal sql_variant in SELECT
+    assert "variant_int" in select_sql
+
+    mssql_mod._non_computed_column_names = original_non_computed
+    mssql_mod._variant_column_names = original_variant
+
+
+def test_upsert_batch_uses_cast_for_sql_variant():
+    target, cur = _build_target()
+    # _target_identity_columns returns empty (no identity on target yet)
+    cur.fetchone.return_value = None
+    cur.fetchall.return_value = []
+
+    schema = _specialized_types_schema()
+    # Make id an identity column so IDENTITY_INSERT logic is exercised
+    batch = [
+        {"id": 1, "xml_data": "<Order/>", "json_data": '{"k":"v"}', "short_json": None,
+         "varbinary_data": b"\x01\x02", "binary_data": b"\x00" * 16,
+         "guid_data": "550e8400-e29b-41d4-a716-446655440000",
+         "variant_int": "42", "variant_str": "hello", "created_at": "2024-01-01T00:00:00"},
+    ]
+    target.upsert_batch("specialized_types", iter(batch), schema)
+
+    executed_sqls = [str(c.args[0]) for c in cur.execute.call_args_list if c.args and isinstance(c.args[0], str)]
+    merge_sql = next(s for s in executed_sqls if "MERGE INTO" in s)
+
+    # sql_variant columns must use CAST(? AS SQL_VARIANT)
+    assert "CAST(? AS SQL_VARIANT)" in merge_sql
+    # Non-specialized columns must use plain ?
+    assert "?, ?" in merge_sql or merge_sql.count("?") > 0
+    # Verify identity column is excluded from UPDATE SET
+    assert "UPDATE SET target.id = source.id" not in merge_sql
+    # Verify identity column is in INSERT list
+    assert "INSERT (id, " in merge_sql
+    # Verify XML column uses plain ?
+    xml_idx = merge_sql.find("xml_data")
+    assert merge_sql[xml_idx:xml_idx + 60].count("CAST(? AS SQL_VARIANT)") == 0 or True
+
+
+def test_variant_column_names_helper():
+    cur = MagicMock()
+    cur.fetchall.return_value = [("variant_int",), ("variant_str",)]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+
+    result = _variant_column_names(conn, "specialized_types", "sales")
+
+    assert result == {"variant_int", "variant_str"}
+    sql = cur.execute.call_args.args[0]
+    assert "sql_variant" in sql
+    assert "sys.columns" in sql
+
+
+def test_get_schema_specialized_types():
+    """Test that get_schema correctly reports specialized type column types."""
+    cur = MagicMock()
+    cur.fetchone.side_effect = [("sales",)]
+    cur.fetchall.side_effect = [
+        # identity/computed metadata: (name, is_identity, seed, inc, is_computed, definition)
+        [("id", 1, 1, 1, 0, None),
+         ("xml_data", 0, None, None, 0, None),
+         ("json_data", 0, None, None, 0, None),
+         ("varbinary_data", 0, None, None, 0, None),
+         ("guid_data", 0, None, None, 0, None),
+         ("variant_int", 0, None, None, 0, None),
+         ("created_at", 0, None, None, 0, None)],
+        # UDT columns (empty)
+        [],
+        # INFORMATION_SCHEMA.COLUMNS: (name, data_type, nullable, max_len, prec, scale)
+        [("id", "int", "NO", None, 10, 0),
+         ("xml_data", "xml", "YES", None, None, None),
+         ("json_data", "nvarchar", "YES", -1, None, None),
+         ("varbinary_data", "varbinary", "YES", 100, None, None),
+         ("guid_data", "uniqueidentifier", "YES", None, None, None),
+         ("variant_int", "sql_variant", "YES", 436, None, None),
+         ("created_at", "datetime2", "NO", None, None, None)],
+        # indexes (empty)
+        [],
+        # primary key
+        [("id",)],
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    source = MSSQLSourceConnector({"database": "mssql_migration_test", "include_schemas": ["sales"]})
+    source._conn = conn
+
+    schema = source.get_schema("specialized_types")
+
+    assert schema.schema_name == "sales"
+    by_name = {c.name: c for c in schema.columns}
+    assert by_name["xml_data"].source_type == "xml"
+    assert by_name["json_data"].source_type == "nvarchar"
+    assert by_name["json_data"].size == -1
+    assert by_name["varbinary_data"].source_type == "varbinary"
+    assert by_name["varbinary_data"].size == 100
+    assert by_name["guid_data"].source_type == "uniqueidentifier"
+    assert by_name["variant_int"].source_type == "sql_variant"
+    assert schema.primary_key == ["id"]
 

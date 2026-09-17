@@ -174,6 +174,26 @@ def _target_identity_columns(conn: Any, object_name: str, schema_name: str | Non
         return [r[0] for r in cur.fetchall()]
 
 
+def _variant_column_names(conn: Any, object_name: str, schema_name: str | None) -> set[str]:
+    """Return names of ``sql_variant`` columns in a table.
+
+    pyodbc cannot natively read ODBC SQL type -16 (``SQL_VARIANT``), so
+    callers must ``CAST`` these columns to a readable type before SELECT.
+    """
+    sn = schema_name or "dbo"
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT c.name FROM sys.columns c "
+            "JOIN sys.types t ON c.user_type_id = t.user_type_id "
+            "JOIN sys.tables tbl ON c.object_id = tbl.object_id "
+            "JOIN sys.schemas s ON tbl.schema_id = s.schema_id "
+            "WHERE tbl.name = ? AND s.name = ? AND t.name = 'sql_variant' "
+            "AND c.is_computed = 0",
+            (object_name, sn),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
 class MSSQLSourceConnector(SourceConnector):
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
@@ -236,7 +256,14 @@ class MSSQLSourceConnector(SourceConnector):
         with self._conn.cursor() as cur:
             cols = _non_computed_column_names(self._conn, object_name, schema_name)
             if cols:
-                col_list = ", ".join(quote_identifier(c) for c in cols)
+                variant_cols = _variant_column_names(self._conn, object_name, schema_name)
+                col_exprs = [
+                    f"CAST({quote_identifier(c)} AS NVARCHAR(MAX)) AS {quote_identifier(c)}"
+                    if c in variant_cols
+                    else quote_identifier(c)
+                    for c in cols
+                ]
+                col_list = ", ".join(col_exprs)
                 cur.execute(f"SELECT {col_list} FROM {qualified}")
             else:
                 cur.execute(f"SELECT * FROM {qualified}")
@@ -1009,10 +1036,22 @@ class MSSQLTargetConnector(TargetConnector):
         # (SQL Server: "Cannot update identity column", error 8102), but they MUST
         # stay in the INSERT list so the explicit source identity values are kept.
         schema_id_cols = {c.name for c in (schema.columns if schema else []) if c.is_identity}
+        # Identify sql_variant columns — pyodbc cannot bind them as ? parameters;
+        # use CAST(? AS SQL_VARIANT) so the source string values are coerced.
+        variant_cols: set[str] = set()
+        if schema:
+            variant_cols = {
+                c.name
+                for c in schema.columns
+                if c.source_type and "sql_variant" in c.source_type.lower()
+            }
         with self._conn.cursor() as cur:
             columns = list(batch[0].keys())
             col_names = ", ".join(columns)
-            placeholders = ", ".join(["?"] * len(columns))
+            placeholders = ", ".join(
+                "CAST(? AS SQL_VARIANT)" if col in variant_cols else "?"
+                for col in columns
+            )
             updatable_cols = [c for c in columns if c not in schema_id_cols]
             update_set = ", ".join(
                 f"target.{col} = source.{col}" for col in updatable_cols
@@ -1086,7 +1125,14 @@ class MSSQLTargetConnector(TargetConnector):
         with self._conn.cursor() as cur:
             cols = _non_computed_column_names(self._conn, object_name, schema_name)
             if cols:
-                col_list = ", ".join(quote_identifier(c) for c in cols)
+                variant_cols = _variant_column_names(self._conn, object_name, schema_name)
+                col_exprs = [
+                    f"CAST({quote_identifier(c)} AS NVARCHAR(MAX)) AS {quote_identifier(c)}"
+                    if c in variant_cols
+                    else quote_identifier(c)
+                    for c in cols
+                ]
+                col_list = ", ".join(col_exprs)
                 cur.execute(f"SELECT {col_list} FROM {qualified}")
             else:
                 cur.execute(f"SELECT * FROM {qualified}")
