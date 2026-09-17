@@ -19,6 +19,7 @@ from core.connectors.base import (
     SourceConnector,
     TargetConnector,
     UpsertResult,
+    SynonymDef,
 )
 from core.schema_mapping.registry import TypeMappingRegistry
 from core.secrets import create_secret_provider
@@ -238,8 +239,28 @@ class MigrationOrchestrator:
                     except Exception as exc:
                         partition_results[part.name] = f"skipped: {exc}"
             except AttributeError:
-                # Non-PostgreSQL sources don't have list_partitions — skip silently
-                pass
+                try:
+                    for pf in self._source.list_partition_functions():
+                        try:
+                            self._target.create_partition_function(pf)
+                            partition_results[pf.name] = f"partition function created"
+                        except Exception as exc:
+                            partition_results[pf.name] = f"skipped: {exc}"
+                    for ps in self._source.list_partition_schemes():
+                        try:
+                            self._target.create_partition_scheme(ps)
+                            partition_results[ps.name] = f"partition scheme created"
+                        except Exception as exc:
+                            partition_results[ps.name] = f"skipped: {exc}"
+                    for pt in self._source.get_partitioned_tables():
+                        try:
+                            schema = self._source.get_schema(pt.table_name)
+                            self._target.create_partitioned_table(schema, pt.partition_function_name, pt.partition_column)
+                            partition_results[pt.table_name] = f"partitioned table created"
+                        except Exception as exc:
+                            partition_results[pt.table_name] = f"skipped: {exc}"
+                except AttributeError:
+                    pass
             except Exception as exc:
                 partition_results["_error"] = str(exc)
             result["phases"]["create_partitions"] = partition_results
@@ -421,7 +442,25 @@ class MigrationOrchestrator:
             result["phases"]["functions"] = func_results
             self._update_status("functions", 80, all_errors)
 
-            # ---------- Phase 14: Triggers ----------
+            # ---------- Phase 14: Synonyms ----------
+            synonym_results: dict[str, str] = {}
+            try:
+                for synonym in self._source.list_synonyms():
+                    syn_key = (
+                        synonym.name if synonym.schema_name == "public"
+                        else f"{synonym.schema_name}.{synonym.name}"
+                    )
+                    try:
+                        self._target.create_synonym(synonym)
+                        synonym_results[syn_key] = "created"
+                    except Exception as exc:
+                        synonym_results[syn_key] = f"skipped: {exc}"
+            except Exception as exc:
+                synonym_results["_error"] = str(exc)
+            result["phases"]["synonyms"] = synonym_results
+            self._update_status("synonyms", 82, all_errors)
+
+            # ---------- Phase 15: Triggers ----------
             trigger_results: dict[str, str] = {}
             try:
                 for trigger in self._source.get_all_triggers():
@@ -440,7 +479,7 @@ class MigrationOrchestrator:
             result["phases"]["triggers"] = trigger_results
             self._update_status("triggers", 85, all_errors)
 
-            # ---------- Phase 15: Comments ----------
+            # ---------- Phase 16: Comments ----------
             comment_results: dict[str, str] = {}
             try:
                 for comment in self._source.list_comments():
@@ -849,7 +888,28 @@ class MigrationOrchestrator:
                     except Exception as exc:
                         partition_results[part.name] = f"skipped: {exc}"
             except AttributeError:
-                pass
+                try:
+                    for pf in self._source.list_partition_functions():
+                        try:
+                            self._target.create_partition_function(pf)
+                            partition_results[pf.name] = f"partition function created"
+                        except Exception as exc:
+                            partition_results[pf.name] = f"skipped: {exc}"
+                    for ps in self._source.list_partition_schemes():
+                        try:
+                            self._target.create_partition_scheme(ps)
+                            partition_results[ps.name] = f"partition scheme created"
+                        except Exception as exc:
+                            partition_results[ps.name] = f"skipped: {exc}"
+                    for pt in self._source.get_partitioned_tables():
+                        try:
+                            schema = self._source.get_schema(pt.table_name)
+                            self._target.create_partitioned_table(schema, pt.partition_function_name, pt.partition_column)
+                            partition_results[pt.table_name] = f"partitioned table created"
+                        except Exception as exc:
+                            partition_results[pt.table_name] = f"skipped: {exc}"
+                except AttributeError:
+                    pass
             except Exception as exc:
                 partition_results["_error"] = str(exc)
             result["phases"]["create_partitions"] = partition_results
@@ -1004,7 +1064,25 @@ class MigrationOrchestrator:
             result["phases"]["functions"] = func_results
             self._update_status("functions", 60, all_errors)
 
-            # Phase 14: Triggers
+            # Phase 14: Synonyms
+            synonym_results: dict[str, str] = {}
+            try:
+                for synonym in self._source.list_synonyms():
+                    syn_key = (
+                        synonym.name if synonym.schema_name == "public"
+                        else f"{synonym.schema_name}.{synonym.name}"
+                    )
+                    try:
+                        self._target.create_synonym(synonym)
+                        synonym_results[syn_key] = "created"
+                    except Exception as exc:
+                        synonym_results[syn_key] = f"skipped: {exc}"
+            except Exception as exc:
+                synonym_results["_error"] = str(exc)
+            result["phases"]["synonyms"] = synonym_results
+            self._update_status("synonyms", 61, all_errors)
+
+            # Phase 15: Triggers
             trigger_results: dict[str, str] = {}
             try:
                 for trigger in self._source.get_all_triggers():
@@ -1023,7 +1101,7 @@ class MigrationOrchestrator:
             result["phases"]["triggers"] = trigger_results
             self._update_status("triggers", 62, all_errors)
 
-            # Phase 15: Comments
+            # Phase 16: Comments
             comment_results: dict[str, str] = {}
             try:
                 for comment in self._source.list_comments():
