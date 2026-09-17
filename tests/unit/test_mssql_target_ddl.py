@@ -889,6 +889,7 @@ def test_get_schema_resolves_udt_column_type():
         [("id", "int", "NO", None, 10, 0), ("code", "int", "NO", None, 10, 0), ("label", "nvarchar", "YES", 50, None, None)],
         [],
         [("id",)],
+        [],  # foreign keys (empty)
     ]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -1336,6 +1337,7 @@ def test_get_schema_specialized_types():
         [],
         # primary key
         [("id",)],
+        [],  # foreign keys (empty)
     ]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur

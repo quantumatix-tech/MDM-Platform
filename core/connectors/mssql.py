@@ -443,7 +443,60 @@ class MSSQLSourceConnector(SourceConnector):
             )
             primary_key = [row[0] for row in cur.fetchall()]
 
-        return Schema(name=object_name, schema_name=schema_name, columns=columns, primary_key=primary_key, indexes=indexes)
+            # --- Foreign Keys (cross-schema aware) ---
+            # Reads sys.foreign_keys + sys.foreign_key_columns so that
+            # cross-schema references (e.g. billing.customer_addresses ->
+            # sales.customers) are discovered with their referenced schema.
+            # Multiple sys.foreign_key_columns rows for the same constraint
+            # are grouped into ONE ForeignKey object with ordered columns.
+            from core.connectors.base import ForeignKey
+
+            cur.execute(
+                "SELECT "
+                "  fk.name AS fk_name, "
+                "  pc.name AS parent_col, "
+                "  rc.name AS ref_col, "
+                "  OBJECT_SCHEMA_NAME(fk.referenced_object_id) AS ref_schema, "
+                "  OBJECT_NAME(fk.referenced_object_id) AS ref_table, "
+                "  fkc.constraint_column_id AS ord "
+                "FROM sys.foreign_keys fk "
+                "JOIN sys.foreign_key_columns fkc "
+                "  ON fk.object_id = fkc.constraint_object_id "
+                "JOIN sys.columns pc "
+                "  ON fkc.parent_column_id = pc.column_id "
+                "  AND pc.object_id = fk.parent_object_id "
+                "JOIN sys.columns rc "
+                "  ON fkc.referenced_column_id = rc.column_id "
+                "  AND rc.object_id = fk.referenced_object_id "
+                "JOIN sys.tables t ON fk.parent_object_id = t.object_id "
+                "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                "WHERE t.name = ? AND s.name = ? "
+                "ORDER BY fkc.constraint_column_id",
+                (object_name, schema_name),
+            )
+            fk_map: dict[str, ForeignKey] = {}
+            for row in cur.fetchall():
+                fk_name, parent_col, ref_col, ref_schema, ref_table, _ord = row
+                if fk_name not in fk_map:
+                    fk_map[fk_name] = ForeignKey(
+                        name=fk_name,
+                        columns=[],
+                        ref_table=ref_table,
+                        ref_columns=[],
+                        ref_schema=ref_schema,
+                    )
+                fk_map[fk_name].columns.append(parent_col)
+                fk_map[fk_name].ref_columns.append(ref_col)
+            foreign_keys = list(fk_map.values())
+
+        return Schema(
+            name=object_name,
+            schema_name=schema_name,
+            columns=columns,
+            primary_key=primary_key,
+            indexes=indexes,
+            foreign_keys=foreign_keys,
+        )
 
     def list_views(self) -> list["ViewDefinition"]:
         """Return user views in the configured schemas.
@@ -1528,6 +1581,7 @@ class MSSQLTargetConnector(TargetConnector):
         validate_identifier(schema.name, "table")
         schema_name = schema.schema_name or "dbo"
         validate_identifier(schema_name, "schema")
+        table_qname = _qualify(schema_name, schema.name)
         with self._conn.cursor() as cur:
             for idx in schema.indexes:
                 try:
@@ -1544,6 +1598,48 @@ class MSSQLTargetConnector(TargetConnector):
                     audit_log(
                         phase="create_index", status="skipped",
                         details={"index": idx.name, "reason": str(exc)},
+                    )
+
+            # --- Foreign Keys (cross-schema aware, idempotent) ---
+            # Applied after all tables exist so cross-schema references
+            # (e.g. billing.customer_addresses -> sales.customers) succeed.
+            # Existing FKs are skipped to keep re-runs idempotent.
+            cur.execute(
+                "SELECT name FROM sys.foreign_keys "
+                "WHERE parent_object_id = OBJECT_ID(?)",
+                (table_qname,),
+            )
+            existing_fks = {row[0] for row in cur.fetchall()}
+            for fk in schema.foreign_keys:
+                if fk.name in existing_fks:
+                    audit_log(
+                        phase="create_fk", status="skipped",
+                        details={"fk": fk.name, "reason": "already exists"},
+                    )
+                    continue
+                col_list = ", ".join(quote_identifier(c) for c in fk.columns)
+                ref_col_list = ", ".join(quote_identifier(c) for c in fk.ref_columns)
+                ref_schema_q = quote_identifier(fk.ref_schema or "dbo")
+                ref_table_q = quote_identifier(fk.ref_table)
+                ref_qname = f"{ref_schema_q}.{ref_table_q}"
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {table_qname} "
+                        f"ADD CONSTRAINT {quote_identifier(fk.name)} "
+                        f"FOREIGN KEY ({col_list}) "
+                        f"REFERENCES {ref_qname} ({ref_col_list})",
+                    )
+                    self._conn.commit()
+                    audit_log(
+                        phase="create_fk", status="created",
+                        details={"table": schema.name, "fk": fk.name,
+                                 "ref_table": ref_qname},
+                    )
+                except Exception as exc:
+                    self._conn.rollback()
+                    audit_log(
+                        phase="create_fk", status="skipped",
+                        details={"fk": fk.name, "reason": str(exc)},
                     )
 
     def create_view(self, view: ViewDefinition) -> None:
