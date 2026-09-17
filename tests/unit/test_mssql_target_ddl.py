@@ -14,7 +14,7 @@ from core.connectors.mssql import (
     _mssql_column_type, _variant_column_names,
     PartitionFunctionDef, PartitionSchemeDef, PartitionedTableDef,
 )
-from core.connectors.base import Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef, SynonymDef, TypeDef
+from core.connectors.base import Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef, SynonymDef, TypeDef, GrantDef
 
 
 def _sales_customers_schema() -> Schema:
@@ -1355,4 +1355,392 @@ def test_get_schema_specialized_types():
     assert by_name["guid_data"].source_type == "uniqueidentifier"
     assert by_name["variant_int"].source_type == "sql_variant"
     assert schema.primary_key == ["id"]
+
+
+# ---------------------------------------------------------------------------
+# Step 14 — MSSQL Grants discovery (list_grants)
+# ---------------------------------------------------------------------------
+
+
+def _mock_source_with_grants(rows):
+    cur = MagicMock()
+    cur.fetchall.return_value = rows
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    source = MSSQLSourceConnector(
+        {"database": "mssql_migration_test", "include_schemas": ["sales"]}
+    )
+    source._conn = conn
+    return source, cur
+
+
+def test_list_grants_discovers_database_schema_table_and_column():
+    source, cur = _mock_source_with_grants([
+        ("CONNECT", "DATABASE", 0, 0, "migration_test_user", None, None, None, "mssql_migration_test"),
+        ("SELECT", "SCHEMA", 5, 0, "migration_test_reader", None, None, "sales", None),
+        ("SELECT", "OBJECT_OR_COLUMN", 100, 0, "migration_test_writer", "orders", None, "sales", None),
+        ("INSERT", "OBJECT_OR_COLUMN", 100, 0, "migration_test_writer", "orders", None, "sales", None),
+        ("UPDATE", "OBJECT_OR_COLUMN", 100, 2, "migration_test_writer", "orders", "amount", "sales", None),
+    ])
+
+    grants = source.list_grants()
+
+    assert len(grants) == 4
+
+    schema_grant = next(g for g in grants if g.object_type == "SCHEMA")
+    assert schema_grant.privileges == "SELECT"
+    assert schema_grant.object_name == "sales"
+    assert schema_grant.grantee == "migration_test_reader"
+    assert schema_grant.schema_name == "sales"
+
+    table_grant = next(g for g in grants if g.object_type == "TABLE")
+    assert table_grant.privileges == "INSERT, SELECT"
+    assert table_grant.object_name == "orders"
+    assert table_grant.grantee == "migration_test_writer"
+    assert table_grant.schema_name == "sales"
+
+    db_grant = next(g for g in grants if g.object_type == "DATABASE")
+    assert db_grant.privileges == "CONNECT"
+    assert db_grant.object_name == "mssql_migration_test"
+    assert db_grant.grantee == "migration_test_user"
+    assert db_grant.schema_name == ""
+
+    col_grant = next(g for g in grants if g.object_type == "COLUMN")
+    assert col_grant.privileges == "UPDATE"
+    assert col_grant.object_name == "orders.amount"
+    assert col_grant.grantee == "migration_test_writer"
+    assert col_grant.schema_name == "sales"
+
+
+def test_list_grants_uses_schema_filter_from_config():
+    source, cur = _mock_source_with_grants([])
+    source.list_grants()
+
+    sql = cur.execute.call_args.args[0]
+    params = cur.execute.call_args.args[1]
+    assert "sch.name IN" in sql
+    assert params == ["sales"]
+
+
+def test_list_grants_excludes_fixed_roles_in_query():
+    source, cur = _mock_source_with_grants([])
+    source.list_grants()
+
+    sql = cur.execute.call_args.args[0]
+    assert "NOT IN" in sql
+    assert "'public'" in sql
+    assert "'dbo'" in sql
+    assert "'db_owner'" in sql
+
+
+def test_list_grants_no_schemas_queries_all_non_system():
+    cur = MagicMock()
+    cur.fetchall.return_value = []
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    source = MSSQLSourceConnector({"database": "mssql_migration_test"})
+    source._conn = conn
+
+    source.list_grants()
+
+    sql = cur.execute.call_args.args[0]
+    assert "NOT IN" in sql
+    assert "'public'" in sql
+    assert "'db_datareader'" in sql
+
+
+def test_list_grants_groups_multiple_privileges_on_same_object():
+    source, cur = _mock_source_with_grants([
+        ("SELECT", "SCHEMA", 5, 0, "my_role", None, None, "sales", None),
+        ("INSERT", "SCHEMA", 5, 0, "my_role", None, None, "sales", None),
+    ])
+
+    grants = source.list_grants()
+
+    assert len(grants) == 1
+    assert grants[0].privileges == "INSERT, SELECT"
+    assert grants[0].object_type == "SCHEMA"
+    assert grants[0].grantee == "my_role"
+
+
+# ---------------------------------------------------------------------------
+# Step 14 — MSSQL Users, Roles & Role Memberships (source discovery)
+# ---------------------------------------------------------------------------
+
+
+def _mock_source_with_principals(rows):
+    cur = MagicMock()
+    cur.fetchall.return_value = rows
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    source = MSSQLSourceConnector(
+        {"database": "mssql_migration_test", "include_schemas": ["sales"]}
+    )
+    source._conn = conn
+    return source, cur
+
+
+def test_list_users_discovers_user_defined_users():
+    source, cur = _mock_source_with_principals([
+        ("migration_test_user", "S"),
+    ])
+
+    users = source.list_users()
+
+    assert len(users) == 1
+    assert users[0].name == "migration_test_user"
+    assert users[0].type == "S"
+
+
+def test_list_users_query_excludes_system_principals():
+    source, cur = _mock_source_with_principals([])
+    source.list_users()
+
+    sql = cur.execute.call_args.args[0]
+    assert "NOT IN" in sql
+    assert "'dbo'" in sql
+    assert "'guest'" in sql
+
+
+def test_list_roles_discovers_user_defined_roles():
+    source, cur = _mock_source_with_principals([
+        ("migration_test_reader", "R"),
+        ("migration_test_writer", "R"),
+    ])
+
+    roles = source.list_roles()
+
+    assert len(roles) == 2
+    names = {r.name for r in roles}
+    assert "migration_test_reader" in names
+    assert "migration_test_writer" in names
+    assert all(r.type == "R" for r in roles)
+
+
+def test_list_roles_query_excludes_fixed_roles():
+    source, cur = _mock_source_with_principals([])
+    source.list_roles()
+
+    sql = cur.execute.call_args.args[0]
+    assert "NOT IN" in sql
+    assert "'db_owner'" in sql
+    assert "'public'" in sql
+
+
+def test_list_role_memberships_discovers_user_defined():
+    source, cur = _mock_source_with_principals([
+        ("migration_test_user", "migration_test_reader"),
+        ("migration_test_user", "migration_test_writer"),
+    ])
+
+    memberships = source.list_role_memberships()
+
+    assert len(memberships) == 2
+    assert memberships[0].member_name == "migration_test_user"
+    assert memberships[0].role_name == "migration_test_reader"
+    assert memberships[1].member_name == "migration_test_user"
+    assert memberships[1].role_name == "migration_test_writer"
+
+
+def test_list_role_memberships_query_excludes_fixed_roles():
+    source, cur = _mock_source_with_principals([])
+    source.list_role_memberships()
+
+    sql = cur.execute.call_args.args[0]
+    assert "sys.database_role_members" in sql
+    assert "NOT IN" in sql
+    assert "'public'" in sql
+    assert "'dbo'" in sql
+
+
+# ---------------------------------------------------------------------------
+# Step 14 — MSSQL Users, Roles & Role Memberships (target creation)
+# ---------------------------------------------------------------------------
+
+
+def _build_target_for_security():
+    cur = MagicMock()
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    target = MSSQLTargetConnector(
+        {"database": "mssql_migration_target", "source_engine": "mssql"}
+    )
+    target._conn = conn
+    return target, cur
+
+
+def test_create_role_creates_new_role():
+    target, cur = _build_target_for_security()
+    cur.fetchone.return_value = None  # role does not exist
+
+    target.create_role_if_not_exists("migration_test_reader")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    check_sql = next(s for s in executed if "SELECT 1 FROM sys.database_principals" in s)
+    create_sql = next(s for s in executed if s.upper().startswith("CREATE ROLE"))
+    assert "[migration_test_reader]" in create_sql
+    target._conn.commit.assert_called_once()
+
+
+def test_create_role_skips_existing_principal():
+    target, cur = _build_target_for_security()
+    cur.fetchone.return_value = (1,)  # exists
+
+    target.create_role_if_not_exists("migration_test_writer")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any(s.upper().startswith("CREATE ROLE") for s in executed)
+    target._conn.commit.assert_not_called()
+
+
+def test_create_user_creates_contained_user_when_no_login():
+    target, cur = _build_target_for_security()
+    # First fetchone: database principal check (None = doesn't exist)
+    # Second fetchone: server principal check (None = login doesn't exist)
+    cur.fetchone.side_effect = [None, None]
+
+    target.create_user_if_not_exists("migration_test_user")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    create_sql = next(s for s in executed if s.upper().startswith("CREATE USER"))
+    assert "[migration_test_user]" in create_sql
+    assert "WITHOUT LOGIN" in create_sql
+    target._conn.commit.assert_called_once()
+
+
+def test_create_user_creates_user_for_login_when_login_exists():
+    target, cur = _build_target_for_security()
+    cur.fetchone.side_effect = [None, (1,)]  # no db user, but server login exists
+
+    target.create_user_if_not_exists("migration_test_user")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    create_sql = next(s for s in executed if s.upper().startswith("CREATE USER"))
+    assert "[migration_test_user]" in create_sql
+    assert "FOR LOGIN" in create_sql
+    target._conn.commit.assert_called_once()
+
+
+def test_create_user_skips_existing_user():
+    target, cur = _build_target_for_security()
+    cur.fetchone.return_value = (1,)  # user already exists
+
+    target.create_user_if_not_exists("migration_test_user")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any(s.upper().startswith("CREATE USER") for s in executed)
+    target._conn.commit.assert_not_called()
+
+
+def test_create_role_membership_adds_member():
+    target, cur = _build_target_for_security()
+    cur.fetchone.return_value = None  # membership doesn't exist
+
+    target.create_role_membership("migration_test_user", "migration_test_reader")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    alter_sql = next(s for s in executed if s.upper().startswith("ALTER ROLE"))
+    assert "[migration_test_reader]" in alter_sql
+    assert "ADD MEMBER" in alter_sql
+    assert "[migration_test_user]" in alter_sql
+    target._conn.commit.assert_called_once()
+
+
+def test_create_role_membership_skips_existing():
+    target, cur = _build_target_for_security()
+    cur.fetchone.return_value = (1,)  # membership exists
+
+    target.create_role_membership("migration_test_user", "migration_test_writer")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any(s.upper().startswith("ALTER ROLE") for s in executed)
+    target._conn.commit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Step 14 — MSSQL Grants (target apply_grant)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_grant_schema():
+    target, cur = _build_target_for_security()
+
+    grant = GrantDef(
+        privileges="SELECT",
+        object_type="SCHEMA",
+        object_name="sales",
+        grantee="migration_test_reader",
+        schema_name="sales",
+    )
+    target.apply_grant(grant)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    grant_sql = next(s for s in executed if "GRANT" in s.upper())
+    assert "GRANT SELECT" in grant_sql
+    assert "SCHEMA::[sales]" in grant_sql
+    assert "TO [migration_test_reader]" in grant_sql
+    target._conn.commit.assert_called_once()
+
+
+def test_apply_grant_table():
+    target, cur = _build_target_for_security()
+
+    grant = GrantDef(
+        privileges="SELECT, INSERT, UPDATE, DELETE",
+        object_type="TABLE",
+        object_name="orders",
+        grantee="migration_test_writer",
+        schema_name="sales",
+    )
+    target.apply_grant(grant)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    grant_sql = next(s for s in executed if "GRANT" in s.upper())
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE" in grant_sql
+    assert "[sales].[orders]" in grant_sql
+    assert "TO [migration_test_writer]" in grant_sql
+
+
+def test_apply_grant_database():
+    target, cur = _build_target_for_security()
+
+    grant = GrantDef(
+        privileges="CONNECT",
+        object_type="DATABASE",
+        object_name="mssql_migration_test",
+        grantee="migration_test_user",
+        schema_name="",
+    )
+    target.apply_grant(grant)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    grant_sql = next(s for s in executed if "GRANT" in s.upper())
+    assert "GRANT CONNECT" in grant_sql
+    assert "DATABASE::[mssql_migration_test]" in grant_sql
+    assert "TO [migration_test_user]" in grant_sql
+
+
+def test_apply_grant_rollbacks_on_failure():
+    target, cur = _build_target_for_security()
+    cur.execute.side_effect = Exception("permission denied")
+
+    grant = GrantDef(
+        privileges="SELECT",
+        object_type="TABLE",
+        object_name="orders",
+        grantee="migration_test_writer",
+        schema_name="sales",
+    )
+    with pytest.raises(Exception, match="permission denied"):
+        target.apply_grant(grant)
+
+    target._conn.rollback.assert_called_once()
+
+
+
+
 

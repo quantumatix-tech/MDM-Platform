@@ -224,6 +224,27 @@ class SynonymDef:
     base_object: str    # fully qualified base object name, e.g. "schema.table"
 
 
+@dataclass
+class RoleDef:
+    """A database role principal."""
+    name: str
+    type: str = "R"     # 'R' = database role, 'C' = application role
+
+
+@dataclass
+class UserDef:
+    """A database user principal."""
+    name: str
+    type: str = "S"     # 'S' = SQL user, 'U' = Windows user
+
+
+@dataclass
+class RoleMembershipDef:
+    """A mapping of a database principal to a database role."""
+    member_name: str
+    role_name: str
+
+
 # ---------------------------------------------------------------------------
 # CDC / result dataclasses
 # ---------------------------------------------------------------------------
@@ -353,6 +374,15 @@ class SourceConnector(abc.ABC):
     def list_grants(self) -> list[GrantDef]:
         return []
 
+    def list_users(self) -> list[UserDef]:
+        return []
+
+    def list_roles(self) -> list[RoleDef]:
+        return []
+
+    def list_role_memberships(self) -> list[RoleMembershipDef]:
+        return []
+
     def list_synonyms(self) -> list[SynonymDef]:
         return []
 
@@ -430,6 +460,12 @@ class TargetConnector(abc.ABC):
 
 
     def create_role_if_not_exists(self, role_name: str) -> None:
+        pass
+
+    def create_user_if_not_exists(self, user_name: str) -> None:
+        pass
+
+    def create_role_membership(self, member_name: str, role_name: str) -> None:
         pass
 
 

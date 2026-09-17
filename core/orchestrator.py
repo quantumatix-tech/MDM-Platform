@@ -498,6 +498,38 @@ class MigrationOrchestrator:
             result["phases"]["comments"] = comment_results
             self._update_status("comments", 88, all_errors)
 
+            # ---------- Phase: Users, Roles & Role Memberships (Step 14) ----------
+            security_results: dict[str, str] = {}
+            try:
+                for role in self._source.list_roles():
+                    try:
+                        self._target.create_role_if_not_exists(role.name)
+                        security_results[f"role:{role.name}"] = "created"
+                    except Exception as exc:
+                        security_results[f"role:{role.name}"] = f"skipped: {exc}"
+                for user in self._source.list_users():
+                    try:
+                        self._target.create_user_if_not_exists(user.name)
+                        security_results[f"user:{user.name}"] = "created"
+                    except Exception as exc:
+                        security_results[f"user:{user.name}"] = f"skipped: {exc}"
+                for membership in self._source.list_role_memberships():
+                    try:
+                        self._target.create_role_membership(
+                            membership.member_name, membership.role_name
+                        )
+                        security_results[
+                            f"membership:{membership.member_name}->{membership.role_name}"
+                        ] = "created"
+                    except Exception as exc:
+                        security_results[
+                            f"membership:{membership.member_name}->{membership.role_name}"
+                        ] = f"skipped: {exc}"
+            except Exception as exc:
+                security_results["_error"] = str(exc)
+            result["phases"]["security"] = security_results
+            self._update_status("security", 89, all_errors)
+
             # ---------- Phase 16: Grants ----------
             grant_results: list[str] = []
             try:
