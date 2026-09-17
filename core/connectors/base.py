@@ -181,8 +181,9 @@ class TriggerDef:
     ddl contains the complete CREATE TRIGGER statement."""
     name: str
     table: str
-    ddl: str            # complete DDL from pg_get_triggerdef — ready to execute
+    ddl: str            # complete DDL from pg_get_triggerdef / sys.sql_modules — ready to execute
     schema_name: str = "public"
+    is_disabled: bool = False  # True if the trigger is disabled on the source
 
 
 @dataclass

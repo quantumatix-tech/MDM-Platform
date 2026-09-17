@@ -14,7 +14,7 @@ from core.connectors.mssql import (
     _mssql_column_type, _variant_column_names,
     PartitionFunctionDef, PartitionSchemeDef, PartitionedTableDef,
 )
-from core.connectors.base import Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef, SynonymDef, TypeDef, GrantDef, CommentDef
+from core.connectors.base import Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef, SynonymDef, TypeDef, GrantDef, CommentDef, TriggerDef
 
 
 def _sales_customers_schema() -> Schema:
@@ -2111,6 +2111,226 @@ def test_apply_comment_rolls_back_on_failure():
     assert any("sp_addextendedproperty" in s for s in executed)
     target._conn.rollback.assert_called_once()
     target._conn.commit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Triggers (Step 9)
+# ---------------------------------------------------------------------------
+
+
+def _mock_trigger_source(rows):
+    cur = MagicMock()
+    cur.fetchall.return_value = rows
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    source = MSSQLSourceConnector({"database": "mssql_migration_test", "include_schemas": ["sales"]})
+    source._conn = conn
+    return source, cur
+
+
+_TRIGGERS_ROWS = [
+    ("sales", "tr_orders_audit", "orders", "CREATE TRIGGER tr_orders_audit\nON sales.orders\nAFTER INSERT\nAS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO sales.orders_audit (order_id) SELECT i.order_id FROM inserted i;\nEND", 0),
+    ("sales", "tr_orders_disabled", "orders", "CREATE TRIGGER tr_orders_disabled\nON sales.orders\nAFTER INSERT\nAS\nBEGIN\n  SET NOCOUNT ON;\nEND", 1),
+]
+
+
+def test_get_all_triggers_discovers_triggers():
+    source, cur = _mock_trigger_source(_TRIGGERS_ROWS)
+
+    triggers = source.get_all_triggers()
+
+    assert len(triggers) == 2
+    by_name = {t.name: t for t in triggers}
+    assert by_name["tr_orders_audit"].schema_name == "sales"
+    assert by_name["tr_orders_audit"].table == "orders"
+    assert by_name["tr_orders_audit"].is_disabled is False
+    assert "CREATE TRIGGER tr_orders_audit" in by_name["tr_orders_audit"].ddl
+    assert by_name["tr_orders_disabled"].is_disabled is True
+    assert "CREATE TRIGGER tr_orders_disabled" in by_name["tr_orders_disabled"].ddl
+
+    sql = cur.execute.call_args_list[0].args[0]
+    assert "sys.triggers" in sql
+    assert "sys.sql_modules" in sql
+    assert "OBJECT_SCHEMA_NAME(t.object_id)" in sql
+    assert "t.type = 'TR'" in sql
+
+
+def test_get_all_triggers_filters_by_schema():
+    source, cur = _mock_trigger_source(_TRIGGERS_ROWS)
+    source.get_all_triggers()
+
+    sql = cur.execute.call_args_list[0].args[0]
+    params = cur.execute.call_args_list[0].args[1]
+    assert "IN (?)" in sql
+    assert params == ["sales"]
+
+
+def test_get_all_triggers_no_schemas_queries_all_user_schemas():
+    source, cur = _mock_trigger_source([])
+    source._config = {"database": "mssql_migration_test"}  # no include_schemas
+
+    source.get_all_triggers()
+
+    sql = cur.execute.call_args_list[0].args[0]
+    assert "NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest')" in sql
+
+
+def test_create_trigger_emits_create_or_alter_with_schema_qualified_name():
+    target, cur = _build_target_for_type()
+    # sales schema: first fetchone (schema check) → None (create schema),
+    #                second fetchone (table check) → row (table exists)
+    cur.fetchone.side_effect = [None, ("orders",)]
+
+    trigger = TriggerDef(
+        name="tr_orders_audit",
+        table="orders",
+        schema_name="sales",
+        ddl=(
+            "CREATE TRIGGER tr_orders_audit\n"
+            "ON sales.orders\n"
+            "AFTER INSERT\n"
+            "AS\n"
+            "BEGIN\n  SET NOCOUNT ON;\nEND"
+        ),
+        is_disabled=False,
+    )
+    target.create_trigger(trigger)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    # Schema should be created since it's not dbo
+    assert any(s.startswith("CREATE SCHEMA") for s in executed)
+    # Trigger DDL should be CREATE OR ALTER with schema-qualified name
+    trigger_ddl = next(s for s in executed if "CREATE OR ALTER TRIGGER" in s.upper())
+    assert trigger_ddl.startswith("CREATE OR ALTER TRIGGER [sales].[tr_orders_audit]")
+    # ON clause should be preserved
+    assert "ON sales.orders" in trigger_ddl
+    # ENABLE TRIGGER should be called since is_disabled is False
+    enable_sql = next(s for s in executed if "ENABLE TRIGGER" in s.upper())
+    assert "sales" in enable_sql and "orders" in enable_sql
+    target._conn.commit.assert_called()
+
+
+def test_create_trigger_skips_when_parent_table_missing():
+    target, cur = _build_target_for_type()
+    # All fetchone calls return None → table not found
+    cur.fetchone.return_value = None
+
+    trigger = TriggerDef(
+        name="tr_missing",
+        table="orders",
+        schema_name="sales",
+        ddl="CREATE TRIGGER tr_missing ON sales.orders AFTER INSERT AS BEGIN SET NOCOUNT ON; END",
+        is_disabled=False,
+    )
+    target.create_trigger(trigger)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any("CREATE TRIGGER" in s for s in executed)
+    target._conn.commit.assert_not_called()
+
+
+def test_create_trigger_preserves_disabled_state():
+    target, cur = _build_target_for_type()
+    # sales schema: schema not found (create it), table exists
+    cur.fetchone.side_effect = [None, ("orders",)]
+
+    trigger = TriggerDef(
+        name="tr_orders_disabled",
+        table="orders",
+        schema_name="sales",
+        ddl="CREATE TRIGGER tr_orders_disabled ON sales.orders AFTER INSERT AS BEGIN SET NOCOUNT ON; END",
+        is_disabled=True,
+    )
+    target.create_trigger(trigger)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    trigger_ddl = next(s for s in executed if "CREATE OR ALTER TRIGGER" in s.upper())
+    assert "[sales].[tr_orders_disabled]" in trigger_ddl
+    # DISABLE TRIGGER should be called since is_disabled is True
+    disable_sql = next(s for s in executed if "DISABLE TRIGGER" in s.upper())
+    assert "tr_orders_disabled" in disable_sql
+
+
+def test_create_trigger_dbo_skips_schema_creation():
+    target, cur = _build_target_for_type()
+    # dbo: no schema check, only table check → table exists
+    cur.fetchone.return_value = ("orders",)
+
+    trigger = TriggerDef(
+        name="tr_dbo_test",
+        table="orders",
+        schema_name="dbo",
+        ddl="CREATE TRIGGER tr_dbo_test ON dbo.orders AFTER INSERT AS BEGIN SET NOCOUNT ON; END",
+        is_disabled=False,
+    )
+    target.create_trigger(trigger)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any(s.startswith("CREATE SCHEMA") for s in executed)
+    trigger_ddl = next(s for s in executed if "CREATE OR ALTER TRIGGER" in s.upper())
+    assert "[dbo].[tr_dbo_test]" in trigger_ddl
+
+
+def test_create_trigger_rolls_back_on_failure():
+    target, cur = _build_target_for_type()
+    # dbo: table exists; DDL execution (2nd call) raises
+    cur.fetchone.return_value = ("orders",)
+
+    call_count = [0]
+
+    def _execute_side_effect(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            raise RuntimeError("invalid trigger body")
+
+    cur.execute.side_effect = _execute_side_effect
+
+    trigger = TriggerDef(
+        name="tr_bad",
+        table="orders",
+        schema_name="dbo",
+        ddl="CREATE TRIGGER tr_bad ON dbo.orders AFTER INSERT AS BEGIN SET NOCOUNT ON; END",
+        is_disabled=False,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid trigger body"):
+        target.create_trigger(trigger)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args and isinstance(c.args[0], str)]
+    assert any("CREATE OR ALTER TRIGGER" in s.upper() for s in executed)
+    target._conn.rollback.assert_called_once()
+
+
+def test_create_trigger_idempotent_via_create_or_alter():
+    """CREATE OR ALTER is inherently idempotent — re-running produces the same DDL pattern."""
+    target, cur = _build_target_for_type()
+    # sales schema: schema not found (create it), table exists
+    cur.fetchone.side_effect = [None, ("orders",)]
+
+    trigger = TriggerDef(
+        name="tr_orders_audit",
+        table="orders",
+        schema_name="sales",
+        ddl="CREATE TRIGGER tr_orders_audit ON sales.orders AFTER INSERT AS BEGIN SET NOCOUNT ON; END",
+        is_disabled=False,
+    )
+
+    # First call
+    target.create_trigger(trigger)
+    executed_1 = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    trigger_ddl_1 = next(s for s in executed_1 if "CREATE OR ALTER TRIGGER" in s.upper())
+    assert trigger_ddl_1.startswith("CREATE OR ALTER TRIGGER")
+
+    # Second call (idempotent — same DDL pattern)
+    cur.reset_mock()
+    cur.fetchone.side_effect = [None, ("orders",)]
+    target.create_trigger(trigger)
+    executed_2 = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    trigger_ddl_2 = next(s for s in executed_2 if "CREATE OR ALTER TRIGGER" in s.upper())
+    assert trigger_ddl_2.startswith("CREATE OR ALTER TRIGGER")
+    assert "[sales].[tr_orders_audit]" in trigger_ddl_2
+
 
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -24,6 +25,7 @@ from core.connectors.base import (
     RoleDef,
     UserDef,
     RoleMembershipDef,
+    TriggerDef,
     validate_identifier,
     quote_identifier,
 )
@@ -1142,6 +1144,65 @@ class MSSQLSourceConnector(SourceConnector):
         return comments
 
 
+    # ------------------------------------------------------------------
+    # Step 9 — Triggers (Phase 15 source discovery)
+    # ------------------------------------------------------------------
+
+    def get_all_triggers(self) -> list[TriggerDef]:
+        """Return user DML triggers in the configured schemas.
+
+        SQL Server stores trigger definitions in ``sys.sql_modules`` and
+        metadata (parent table, enabled state) in ``sys.triggers``.  Only
+        DML triggers (``type = 'TR'``) are migrated — DDL triggers
+        (``type = 'TA'``) are server-scoped and skipped.
+        """
+        schemas = _resolve_mssql_schemas(self._config)
+        results: list[TriggerDef] = []
+        with self._conn.cursor() as cur:
+            if schemas:
+                placeholders = ", ".join("?" for _ in schemas)
+                cur.execute(
+                    "SELECT OBJECT_SCHEMA_NAME(t.object_id), "
+                    "t.name, p.name, "
+                    "CAST(m.definition AS NVARCHAR(MAX)) AS definition, "
+                    "t.is_disabled "
+                    "FROM sys.triggers t "
+                    "JOIN sys.objects p ON t.parent_id = p.object_id "
+                    "JOIN sys.sql_modules m ON t.object_id = m.object_id "
+                    f"WHERE OBJECT_SCHEMA_NAME(t.object_id) IN ({placeholders}) "
+                    "AND t.type = 'TR' "
+                    "ORDER BY OBJECT_SCHEMA_NAME(t.object_id), p.name, t.name",
+                    list(schemas),
+                )
+            else:
+                cur.execute(
+                    "SELECT OBJECT_SCHEMA_NAME(t.object_id), "
+                    "t.name, p.name, "
+                    "CAST(m.definition AS NVARCHAR(MAX)) AS definition, "
+                    "t.is_disabled "
+                    "FROM sys.triggers t "
+                    "JOIN sys.objects p ON t.parent_id = p.object_id "
+                    "JOIN sys.sql_modules m ON t.object_id = m.object_id "
+                    "WHERE OBJECT_SCHEMA_NAME(t.object_id) NOT IN "
+                    "('sys', 'INFORMATION_SCHEMA', 'guest') "
+                    "AND t.type = 'TR' "
+                    "ORDER BY OBJECT_SCHEMA_NAME(t.object_id), p.name, t.name",
+                )
+            for schema_name, trig_name, table_name, definition, is_disabled in cur.fetchall():
+                validate_identifier(trig_name, "trigger")
+                validate_identifier(schema_name, "schema")
+                results.append(
+                    TriggerDef(
+                        name=trig_name,
+                        table=table_name,
+                        schema_name=schema_name,
+                        ddl=definition,
+                        is_disabled=bool(is_disabled),
+                    )
+                )
+        return results
+
+
 class MSSQLTargetConnector(TargetConnector):
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -1553,6 +1614,96 @@ class MSSQLTargetConnector(TargetConnector):
                 audit_log(
                     phase="create_function", status="failed",
                     details={"function": func.name, "schema": schema_name, "reason": str(exc)},
+                )
+                raise
+
+    def create_trigger(self, trigger: "TriggerDef") -> None:
+        """Create or alter a trigger on the target database.
+
+        Uses ``CREATE OR ALTER TRIGGER`` (SQL Server 2016+ SP1) for idempotency.
+        The DDL from ``sys.sql_modules`` is rewritten so the trigger name is
+        schema-qualified (``[schema].[name]``) — the original text may use an
+        unqualified name that would resolve to the wrong schema on the target.
+
+        The enabled/disabled state is re-applied after creation so the target
+        matches the source regardless of whether ``CREATE OR ALTER`` preserved
+        a pre-existing state.
+        """
+        validate_identifier(trigger.name, "trigger")
+        schema_name = trigger.schema_name or "dbo"
+        validate_identifier(schema_name, "schema")
+        trigger_qname = f"[{schema_name}].[{trigger.name}]"
+        table_qname = _qualify(schema_name, trigger.table)
+
+        with self._conn.cursor() as cur:
+            # Ensure the target schema exists (dbo always exists in SQL Server).
+            if schema_name != "dbo":
+                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (schema_name,))
+                if cur.fetchone() is None:
+                    cur.execute(f"CREATE SCHEMA {quote_identifier(schema_name)}")
+                    audit_log(
+                        phase="create_schema", status="created",
+                        details={"schema": schema_name},
+                    )
+
+            # Ensure the target table exists — a trigger cannot be created on
+            # a missing parent table.
+            cur.execute(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ?",
+                (trigger.table, schema_name),
+            )
+            if cur.fetchone() is None:
+                audit_log(
+                    phase="create_trigger", status="skipped",
+                    details={"trigger": trigger.name, "reason": f"parent table {table_qname} not found"},
+                )
+                return
+
+            try:
+                ddl = trigger.ddl
+                # Rewrite CREATE TRIGGER <name> → CREATE OR ALTER TRIGGER [schema].[name]
+                # for idempotency AND to ensure the correct schema regardless of
+                # whether the source DDL used an unqualified name.
+                qualified_trigger = f"[{schema_name}].[{trigger.name}]"
+                new_ddl, n = re.subn(
+                    r"CREATE\s+TRIGGER\s+\S+",
+                    f"CREATE OR ALTER TRIGGER {qualified_trigger}",
+                    ddl,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                if n == 0:
+                    if new_ddl.upper().startswith("CREATE "):
+                        new_ddl = "CREATE OR ALTER " + new_ddl[len("CREATE "):]
+                ddl = new_ddl
+                cur.execute(ddl)
+                self._conn.commit()
+                audit_log(
+                    phase="create_trigger", status="created",
+                    details={"trigger": trigger_qname, "table": table_qname,
+                             "disabled": trigger.is_disabled},
+                )
+
+                # Re-apply enabled/disabled state to match the source.
+                if trigger.is_disabled:
+                    cur.execute(
+                        f"ALTER TABLE {table_qname} DISABLE TRIGGER {quote_identifier(trigger.name)}"
+                    )
+                else:
+                    cur.execute(
+                        f"ALTER TABLE {table_qname} ENABLE TRIGGER {quote_identifier(trigger.name)}"
+                    )
+                self._conn.commit()
+                audit_log(
+                    phase="create_trigger", status="applied_state",
+                    details={"trigger": trigger_qname, "disabled": trigger.is_disabled},
+                )
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(
+                    phase="create_trigger", status="failed",
+                    details={"trigger": trigger.name, "schema": schema_name, "reason": str(exc)},
                 )
                 raise
 
