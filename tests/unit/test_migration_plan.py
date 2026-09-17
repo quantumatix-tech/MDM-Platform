@@ -230,6 +230,172 @@ def test_report_renders_schema_mismatch_and_block_with_human_labels():
     assert ">BLOCK</span>" not in report_html
 
 
+def test_report_integrates_partitions_into_object_results_and_timeline():
+    result = {
+        "run_id": "partition-report-test",
+        "mode": "full",
+        "status": "success",
+        "phases": {"create_partitions": {
+            "tbl_partition_test.p2025": "created (table DDL)",
+            "tbl_partition_test.p2026": "created (table DDL)",
+            "tbl_partition_test.pmax": "created (table DDL)",
+        }},
+        "object_migration": {
+            "categories": {
+                "partitions": {
+                    "source_count": 3,
+                    "migrated": 3,
+                    "unsupported": 0,
+                    "failed": 0,
+                    "status": "MIGRATED",
+                },
+            },
+        },
+        "partition_testing": {
+            "status": "PASS",
+            "tables": [{
+                "table": "tbl_partition_test",
+                "source": {
+                    "partition_method": "RANGE",
+                    "partition_expression": "YEAR(created_at)",
+                    "partition_count": 3,
+                    "partitions": [
+                        {"name": "p2025", "boundary": "2026"},
+                        {"name": "p2026", "boundary": "2027"},
+                        {"name": "pmax", "boundary": "MAXVALUE"},
+                    ],
+                    "row_count": 3,
+                },
+                "target": {
+                    "partition_method": "RANGE",
+                    "partition_expression": "YEAR(created_at)",
+                    "partition_count": 3,
+                    "partitions": [
+                        {"name": "p2025", "boundary": "2026"},
+                        {"name": "p2026", "boundary": "2027"},
+                        {"name": "pmax", "boundary": "MAXVALUE"},
+                    ],
+                    "row_count": 3,
+                },
+                "checks": {
+                    "data_migration": "PASS",
+                    "structure_preservation": "PASS",
+                    "overall": "PASS",
+                },
+                "status": "PASS",
+                "errors": [],
+            }],
+        },
+    }
+
+    report = ReportBuilder(result, 0, 1)
+    report_json = report.build_json()
+    report_html = report.build_html()
+
+    assert report_json["partition_testing"]["tables"][0]["source"]["partition_count"] == 3
+    assert report_json["partition_testing"]["tables"][0]["target"]["row_count"] == 3
+    assert "Partitions" in report_html
+    assert ">3</td>" in report_html
+    assert "Create Partitions" in report_html
+    assert "3 items" in report_html
+    assert "MySQL Partitions / Partition Testing" not in report_html
+
+
+def test_report_shows_blocked_1419_details_separately_from_migrated_objects():
+    result = {
+        "run_id": "blocked-routine-report-test",
+        "mode": "full",
+        "status": "partial_success",
+        "phases": {},
+        "object_migration": {
+            "categories": {
+                "functions": {
+                    "source_count": 2,
+                    "migrated": 1,
+                    "blocked": 1,
+                    "unsupported": 0,
+                    "failed": 0,
+                    "status": "BLOCKED",
+                    "details": [
+                        "FUNCTION: BLOCKED\nPlease ask a MySQL administrator to run once:\nSET PERSIST log_bin_trust_function_creators = ON;\nThis server configuration persists across MySQL restarts.\nThen re-run the migration.",
+                    ],
+                },
+                "procedures": {
+                    "source_count": 1,
+                    "migrated": 1,
+                    "blocked": 0,
+                    "unsupported": 0,
+                    "failed": 0,
+                    "status": "MIGRATED",
+                    "details": [],
+                },
+            },
+            "failed": 0,
+            "blocked": 1,
+            "unsupported": 0,
+        },
+    }
+
+    report_html = ReportBuilder(result, 0, 1).build_html()
+
+    assert "Blocked" in report_html
+    assert ">BLOCKED<" in report_html
+    assert "FUNCTION: BLOCKED" in report_html
+    assert "SET PERSIST log_bin_trust_function_creators = ON;" in report_html
+    assert "SET GLOBAL log_bin_trust_function_creators = ON;" not in report_html
+    assert "Then re-run the migration." in report_html
+    assert "Required privilege" not in report_html
+    assert "object-status blocked" in report_html
+    assert "object-status migrated" in report_html
+    assert "MIGRATED" in report_html
+
+
+def test_dashboard_and_cli_use_object_specific_status_classification():
+    from core.status_server import _DASHBOARD_HTML
+    from migration_platform.__main__ import _format_object_result_lines
+
+    object_migration = {
+        "categories": {
+            "functions": {"status": "BLOCKED", "migrated": 0, "blocked": 1, "failed": 0, "details": ["fn: FUNCTION: BLOCKED"]},
+            "triggers": {"status": "MIGRATED", "migrated": 1, "blocked": 0, "failed": 0, "details": []},
+        }
+    }
+
+    cli_lines = "\n".join(_format_object_result_lines(object_migration))
+    assert "FUNCTION: BLOCKED" in cli_lines
+    assert "MIGRATED" in cli_lines
+    assert "object-status-${status}" in _DASHBOARD_HTML
+    assert "object-status-migrated" in _DASHBOARD_HTML
+    assert "object-status-blocked" in _DASHBOARD_HTML
+
+
+def test_blocked_function_details_are_collapsed_to_one_html_message():
+    result = {
+        "run_id": "duplicate-blocked-test",
+        "mode": "full",
+        "status": "partial_success",
+        "phases": {},
+        "object_migration": {"categories": {
+            "functions": {
+                "source_count": 2,
+                "migrated": 0,
+                "blocked": 2,
+                "failed": 0,
+                "unsupported": 0,
+                "status": "BLOCKED",
+                "details": ["FUNCTION: BLOCKED"] * 2,
+            },
+        }},
+    }
+
+    report_html = ReportBuilder(result, 0, 1).build_html()
+
+    assert report_html.count("FUNCTION: BLOCKED") == 1
+    assert report_html.count("SET PERSIST log_bin_trust_function_creators = ON;") == 1
+    assert "<code>SET PERSIST log_bin_trust_function_creators = ON;</code>" in report_html
+    assert 'style="text-align:right">2</td>' in report_html
+
+
 def test_target_clears_preflight_read_transaction_before_enabling_autocommit(monkeypatch):
     events: list[str] = []
 

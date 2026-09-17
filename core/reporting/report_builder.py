@@ -14,6 +14,30 @@ from datetime import UTC, datetime
 from typing import Any
 
 
+def _display_object_details(category: str, row: dict[str, Any]) -> list[str]:
+  details = row.get("details", []) or []
+  if row.get("status") != "BLOCKED":
+    return list(dict.fromkeys(details))
+  label = "FUNCTION" if category == "functions" else "TRIGGER" if category == "triggers" else None
+  if label is None:
+    return list(dict.fromkeys(details))
+  return [
+    f"{label}: BLOCKED",
+    "Please ask a MySQL administrator to run once:",
+    "SET PERSIST log_bin_trust_function_creators = ON;",
+    "This server configuration persists across MySQL restarts.",
+    "Then re-run the migration.",
+  ]
+
+
+def _display_object_details_html(category: str, row: dict[str, Any]) -> str:
+  details = _display_object_details(category, row)
+  return "<br>".join(
+    f"<code>{detail}</code>" if detail == "SET PERSIST log_bin_trust_function_creators = ON;" else detail
+    for detail in details
+  )
+
+
 # ---------------------------------------------------------------------------
 # Phase registry (all 19 phases, in execution order)
 # ---------------------------------------------------------------------------
@@ -30,10 +54,12 @@ _PHASE_META: list[tuple[str, str, str]] = [
     ("apply_constraints",  "Indexes + Constraints",  "🔗"),
     ("row_level_security", "Row-Level Security",     "🔒"),
     ("advance_sequences",  "Advance Sequences",      "⏭"),
+    ("auto_increment",     "Synchronize AUTO_INCREMENT", "🔢"),
     ("views",              "Views",                  "👁"),
     ("materialized_views", "Materialized Views",     "📸"),
     ("functions",          "Functions & Procs",      "⚙"),
     ("triggers",           "Triggers",               "⚡"),
+    ("events",             "Events",                 "⏰"),
     ("comments",           "Comments",               "💬"),
     ("grants",             "Grants",                 "🛡"),
     ("validation",         "Validation",             "✅"),
@@ -159,6 +185,8 @@ class ReportBuilder:
             "status": self._result.get("status"),
             "phases": self._result.get("phases", {}),
             "preflight": self._result.get("preflight"),
+            "object_migration": self._result.get("object_migration"),
+            "partition_testing": self._result.get("partition_testing") or self._result.get("phases", {}).get("partition_testing"),
             "error": self._result.get("error") or self._result.get("cdc_error"),
         }
 
@@ -188,6 +216,12 @@ class ReportBuilder:
             total_fail += fail
 
         success_rate = f"{int(total_suc / total_src * 100)}%" if total_src > 0 else "—"
+        object_summary = data.get("object_migration") or {}
+        object_rows = "".join(
+          f"<tr><td>{name.replace('_', ' ').title()}</td><td style=\"text-align:right\">{row.get('source_count', 0)}</td><td style=\"text-align:right\">{row.get('migrated', 0)}</td><td style=\"text-align:right\">{row.get('blocked', 0)}</td><td style=\"text-align:right\">{row.get('unsupported', 0)}</td><td style=\"text-align:right\">{row.get('failed', 0)}</td><td><span class=\"object-status {row.get('status', 'UNKNOWN').lower()}\">{row.get('status', 'UNKNOWN')}</span><br><small>{_display_object_details_html(name, row)}</small></td></tr>"
+            for name, row in object_summary.get("categories", {}).items()
+        )
+        object_html = ('<section class="section"><h2 class="section-title">🧩 Object Migration Results</h2><div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Category</th><th style="text-align:right">Source</th><th style="text-align:right">Migrated</th><th style="text-align:right">Blocked</th><th style="text-align:right">Unsupported</th><th style="text-align:right">Failed</th><th>Status</th></tr></thead><tbody>' + object_rows + '</tbody></table></div></section>') if object_rows else ''
 
         # ---- Status badge ----
         if status in ("success", "completed"):
@@ -367,6 +401,9 @@ class ReportBuilder:
     .badge-success {{ background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.35); padding: 0.3rem 1rem; border-radius: 9999px; font-weight: 700; font-size: 0.85rem; display: inline-block; }}
     .badge-error   {{ background: rgba(239,68,68,0.15);  color: #f87171; border: 1px solid rgba(239,68,68,0.35);  padding: 0.3rem 1rem; border-radius: 9999px; font-weight: 700; font-size: 0.85rem; display: inline-block; }}
     .badge-warn    {{ background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.35); padding: 0.3rem 1rem; border-radius: 9999px; font-weight: 700; font-size: 0.85rem; display: inline-block; }}
+    .object-status.migrated {{ color: #34d399; font-weight: 700; }}
+    .object-status.blocked, .object-status.failed {{ color: #f87171; font-weight: 700; }}
+    .object-status.unsupported {{ color: #fbbf24; font-weight: 700; }}
     .badge-small   {{ padding: 0.15rem 0.5rem; border-radius: 0.3rem; font-size: 0.75rem; font-weight: 600; }}
     .badge-mode    {{ background: var(--primary-glow); color: #818cf8; border: 1px solid rgba(99,102,241,0.35); padding: 0.3rem 1rem; border-radius: 9999px; font-weight: 600; font-size: 0.82rem; display: inline-block; }}
 
@@ -510,6 +547,9 @@ class ReportBuilder:
 
   <!-- Validation -->
   {val_html}
+
+  <!-- Object-level capability-aware outcome -->
+  {object_html}
 
   <!-- PostgreSQL Preflight / Plan -->
   {preflight_html}

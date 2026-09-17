@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import sys
 import time
 from threading import Thread
@@ -16,7 +17,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.audit_logger import configure_file_logging, get_run_id
+from core.audit_logger import audit_log, configure_file_logging, get_run_id
 from core.connectors import (
     CosmosMongoTargetConnector,
     MongoSourceConnector,
@@ -29,6 +30,7 @@ from core.connectors import (
     PostgresTargetConnector,
 )
 from core.orchestrator import MigrationOrchestrator
+from core.migration_lock import MigrationAlreadyRunning, MigrationLock
 from core.progress_display import create_progress_display
 from core.reporting.report_builder import ReportBuilder
 from core.status_server import StatusServer
@@ -74,6 +76,31 @@ class _CompoundReporter:
                 r.record_preflight(preflight)
 
 
+def _format_object_result_lines(object_migration: dict) -> list[str]:
+    lines = []
+    for category, details in (object_migration.get("categories", {}) or {}).items():
+        object_status = details.get("status", "UNKNOWN")
+        color = "\033[91m" if object_status in {"BLOCKED", "FAILED"} else "\033[92m" if object_status == "MIGRATED" else ""
+        reset = "\033[0m" if color else ""
+        lines.append(
+            f"    {category}: {color}{object_status}{reset} "
+            f"(migrated={details.get('migrated', 0)}, "
+            f"blocked={details.get('blocked', 0)}, "
+            f"failed={details.get('failed', 0)})"
+        )
+        if object_status == "BLOCKED" and category in {"functions", "triggers"}:
+            label = "FUNCTION" if category == "functions" else "TRIGGER"
+            lines.extend([
+                f"      {label}: BLOCKED",
+                "      Please ask a MySQL administrator to run:",
+                "      SET GLOBAL log_bin_trust_function_creators = ON;",
+                "      Then re-run the migration.",
+            ])
+        else:
+            lines.extend(f"      {detail}" for detail in dict.fromkeys(details.get("details", [])))
+    return lines
+
+
 def instantiate_connector(connector_cls, connection_config):
     return connector_cls(connection_config)
 
@@ -92,7 +119,7 @@ def main():
     )
     parser.add_argument(
         "--port", type=int, default=8080,
-        help="Status dashboard port (default: 8080)",
+        help="Status dashboard port; only 8080 is supported (default: 8080)",
     )
     parser.add_argument(
         "--no-live-ui", action="store_true",
@@ -103,6 +130,9 @@ def main():
         help="Build a PostgreSQL full-migration plan without DDL or DML",
     )
     args = parser.parse_args()
+
+    if args.port != 8080:
+        raise SystemExit("The status dashboard must use port 8080; choose an available port 8080 and retry.")
 
     with open(args.config, encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -130,120 +160,138 @@ def main():
     log_path = configure_file_logging(log_dir="logs", suppress_stdout=use_live_ui)
     run_id = get_run_id()
     mode = args.mode
+    migration_lock = MigrationLock(config, mode)
+    try:
+        migration_lock.acquire()
+    except MigrationAlreadyRunning as exc:
+        audit_log(phase="migration_lock", status="rejected", details={"scope_id": migration_lock.scope_id, "error": str(exc)})
+        raise SystemExit(str(exc)) from exc
+    audit_log(phase="migration_lock", status="acquired", details={"scope_id": migration_lock.scope_id})
 
     # ---- Status server (browser dashboard at http://localhost:{port}) ----
-    status_server = StatusServer(host="0.0.0.0", port=args.port)
-    status_server.start()
-    status_server.set_mode(mode)
-    status_thread = Thread(target=status_server.run, daemon=True)
-    status_thread.start()
-
-    # ---- Rich terminal progress display ----
-    progress_display = create_progress_display(run_id, mode)
-
-    # ---- Compound reporter (fans out to both) ----
-    reporter = _CompoundReporter([status_server, progress_display])
-
-    orchestrator = MigrationOrchestrator(source, target, config, status_server=reporter)
-
-    start_time = time.time()
-
-    with progress_display:
-        if not use_live_ui:
-            print(f"Live dashboard: http://localhost:{args.port}/")
-            print(f"Audit log:      {log_path}")
-
-        if dry_run:
-            result = orchestrator.run_dry_run()
-        elif args.mode == "full":
-            result = orchestrator.run_full()
-        elif args.mode == "cdc-incremental":
-            result = orchestrator.run_cdc(max_iterations=1)
-        elif args.mode == "cdc-continuous":
-            result = orchestrator.run_cdc(max_iterations=None)
-        else:
-            raise SystemExit(f"Unsupported mode: {args.mode!r}")
-
-        # ---- Push final table stats to both reporters ----
-        phases = result.get("phases", {})
-        objects = phases.get("discover", {}).get("objects", []) or []
-        for obj in objects:
-            od = phases.get(obj, {})
-            src = od.get("source_rows", od.get("initial_sync_rows", 0)) or 0
-            suc = od.get("success", 0) or 0
-            fail = od.get("failure", 0) or 0
-            reporter.record_table_stats(obj, src, suc, fail)
-
-    end_time = time.time()
-
-    # ---- Generate reports ----
-    builder = ReportBuilder(result, start_time, end_time)
-    html_path, json_path = builder.save()
-    result["report"] = {"html": html_path, "json": json_path}
-
-    # ---- Detect local network IP (so same-network colleagues can open reports) ----
-    import socket
+    status_server: StatusServer | None = None
+    status_thread: Thread | None = None
     try:
-        _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        _s.connect(("8.8.8.8", 80))
-        local_ip = _s.getsockname()[0]
-        _s.close()
-    except Exception:
-        local_ip = "localhost"
+        status_server = StatusServer(host="127.0.0.1", port=8080)
+        status_server.start()
+        status_server.set_mode(mode)
+        status_thread = Thread(target=status_server.run, daemon=True)
+        status_thread.start()
 
-    # ---- Optional: upload to Azure Blob Storage for a public shareable URL ----
-    azure_url: str | None = None
-    azure_cfg = config.get("reporting", {}).get("azure_blob", {})
-    if azure_cfg.get("connection_string"):
+        # ---- Rich terminal progress display ----
+        progress_display = create_progress_display(run_id, mode)
+
+        # ---- Compound reporter (fans out to both) ----
+        reporter = _CompoundReporter([status_server, progress_display])
+
+        orchestrator = MigrationOrchestrator(source, target, config, status_server=reporter)
+        start_time = time.time()
+
+        with progress_display:
+            if not use_live_ui:
+                print(f"Live dashboard: http://localhost:{status_server.port}/")
+                print(f"Audit log:      {log_path}")
+
+            if dry_run:
+                result = orchestrator.run_dry_run()
+            elif args.mode == "full":
+                result = orchestrator.run_full()
+            elif args.mode == "cdc-incremental":
+                result = orchestrator.run_cdc(max_iterations=1)
+            elif args.mode == "cdc-continuous":
+                result = orchestrator.run_cdc(max_iterations=None)
+            else:
+                raise SystemExit(f"Unsupported mode: {args.mode!r}")
+
+            # ---- Push final table stats to both reporters ----
+            phases = result.get("phases", {})
+            objects = phases.get("discover", {}).get("objects", []) or []
+            for obj in objects:
+                od = phases.get(obj, {})
+                src = od.get("source_rows", od.get("initial_sync_rows", 0)) or 0
+                suc = od.get("success", 0) or 0
+                fail = od.get("failure", 0) or 0
+                reporter.record_table_stats(obj, src, suc, fail)
+        end_time = time.time()
+
+        # ---- Generate reports ----
+        builder = ReportBuilder(result, start_time, end_time)
+        html_path, json_path = builder.save()
+        result["report"] = {"html": html_path, "json": json_path}
+
+        # ---- Detect local network IP (so same-network colleagues can open reports) ----
         try:
-            from core.report_uploader import upload_report
-            upload_result = upload_report(html_path, json_path, run_id, azure_cfg)
-            azure_url = upload_result["html_url"]
-            expiry = upload_result["expiry"][:10]  # just the date
-            print(f"\n  [Azure] Report uploaded! Expires: {expiry}")
-            print(f"  Shareable URL: {azure_url}")
-        except Exception as exc:
-            print(f"\n  [Azure] Upload skipped: {exc}")
+            _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _s.connect(("8.8.8.8", 80))
+            local_ip = _s.getsockname()[0]
+            _s.close()
+        except Exception:
+            local_ip = "localhost"
 
-    # ---- Final summary ----
-    status_icon = "+" if result.get("status") in ("success", "completed") else "!"
-    sep = "-" * 62
-    print(f"\n{sep}")
-    print(f"  {status_icon}  Migration {result.get('status', 'done').upper()}")
-    print(sep)
-    print(f"  Run ID      : {run_id}")
-    print(f"  Mode        : {mode}")
-    print(f"  Duration    : {round(end_time - start_time, 1)}s")
-    print(f"  Audit Log   : {log_path}")
-    print(f"  HTML Report : {os.path.abspath(html_path)}")
-    print(f"  JSON Report : {os.path.abspath(json_path)}")
-    print(sep)
-    print(f"  Local URL   : http://localhost:{args.port}/reports/{os.path.basename(html_path)}")
-    print(f"  Network URL : http://{local_ip}:{args.port}/reports/{os.path.basename(html_path)}")
-    print(f"  All Reports : http://{local_ip}:{args.port}/reports/")
-    if azure_url:
-        print(f"  Public URL  : {azure_url}")
-    print(sep)
+        # ---- Optional: upload to Azure Blob Storage for a public shareable URL ----
+        azure_url: str | None = None
+        azure_cfg = config.get("reporting", {}).get("azure_blob", {})
+        if azure_cfg.get("connection_string"):
+            try:
+                from core.report_uploader import upload_report
+                upload_result = upload_report(html_path, json_path, run_id, azure_cfg)
+                azure_url = upload_result["html_url"]
+                expiry = upload_result["expiry"][:10]  # just the date
+                print(f"\n  [Azure] Report uploaded! Expires: {expiry}")
+                print(f"  Shareable URL: {azure_url}")
+            except Exception as exc:
+                print(f"\n  [Azure] Upload skipped: {exc}")
 
-    # ---- Open latest report automatically ----
-    try:
-        import subprocess
-        subprocess.Popen(["explorer", os.path.abspath(html_path)], shell=True)
-    except Exception:
-        pass
+        # ---- Final summary ----
+        status_icon = "+" if result.get("status") in ("success", "completed") else "!"
+        sep = "-" * 62
+        print(f"\n{sep}")
+        print(f"  {status_icon}  Migration {result.get('status', 'done').upper()}")
+        print(sep)
+        print(f"  Run ID      : {run_id}")
+        print(f"  Mode        : {mode}")
+        print(f"  Duration    : {round(end_time - start_time, 1)}s")
+        print(f"  Audit Log   : {log_path}")
+        print(f"  HTML Report : {os.path.abspath(html_path)}")
+        print(f"  JSON Report : {os.path.abspath(json_path)}")
+        print(sep)
+        print("  Object Results:")
+        for line in _format_object_result_lines(result.get("object_migration", {})):
+            print(line)
+        print(sep)
+        print(f"  Local URL   : http://127.0.0.1:8080/reports/{os.path.basename(html_path)}")
+        print(f"  All Reports : http://127.0.0.1:8080/reports/")
+        if azure_url:
+            print(f"  Public URL  : {azure_url}")
+        print(sep)
 
-    # ---- Keep report server alive permanently (Ctrl+C to stop) ----
-    # Make the server thread non-daemon so the process stays alive.
-    # This means http://localhost:{port}/reports/ remains accessible
-    # until the user explicitly stops it.
-    print(f"\n  Report server is running at http://{local_ip}:{args.port}/")
-    print(f"  Share that URL with your team to view all migration reports.")
-    print(f"  Press Ctrl+C to stop the server.\n")
+        # ---- Open latest report automatically ----
+        try:
+            import subprocess
+            subprocess.Popen(["explorer", os.path.abspath(html_path)], shell=True)
+        except Exception:
+            pass
 
-    try:
-        status_server.run()   # blocks until Ctrl+C
-    except KeyboardInterrupt:
-        print("\n  Server stopped.")
+        # ``--no-live-ui`` is a batch CLI mode, so it must return after reporting
+        # instead of looking like a hung migration process.
+        if not use_live_ui:
+            return
+
+        print("\n  Report server is running at http://127.0.0.1:8080/")
+        print("  Share that URL with your team to view all migration reports.")
+        print("  Press Ctrl+C to stop the server.\n")
+
+        try:
+            status_server.run()   # blocks until Ctrl+C
+        except KeyboardInterrupt:
+            print("\n  Server stopped.")
+    finally:
+        try:
+            if status_server is not None:
+                status_server.stop()
+        finally:
+            migration_lock.release()
+            audit_log(phase="migration_lock", status="released", details={"scope_id": migration_lock.scope_id})
 
 
 if __name__ == "__main__":

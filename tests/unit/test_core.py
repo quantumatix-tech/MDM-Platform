@@ -16,6 +16,7 @@ from core.connectors.base import (
     MaterializedViewDef,
     FunctionDef,
     TriggerDef,
+    MySQLPartitionDef,
     CommentDef,
     GrantDef,
     RLSPolicy,
@@ -458,18 +459,8 @@ class TestPostgresToPostgresBaseline:
             )
         assert validation["status"] == "success"
 
-    def test_stale_target_row_is_known_gap(self):
-        """
-        KNOWN GAP / EXPECTED CURRENT FAILURE.
-
-        When a row is deleted on the source but the target still holds it,
-        `run_full` upserts cannot remove it (no DELETE pass in full mode),
-        so `validate(mode='count')` reports mismatch. This documents the
-        current behavior, NOT a correctness claim.
-
-        Any later step that removes this gap must update this test to
-        reflect the new (correct) behavior.
-        """
+    def test_full_sync_clears_stale_target_rows_before_load(self):
+        """A full run replaces target table contents before it upserts rows."""
         stale_target_counts = {
             "customers": 4,   # one stale row
             "products": 3,
@@ -480,13 +471,9 @@ class TestPostgresToPostgresBaseline:
 
         result = MigrationOrchestrator(source, target, {}).run_full()
 
+        target.clear_objects_for_full_sync.assert_called_once_with(self.EXPECTED_TABLES)
         assert result["phases"]["customers"]["success"] == 3
-        validation = result["phases"]["validation"]["checks"]["customers"]
-        assert validation["match"] is False, (
-            "If this assertion starts failing, the stale-row gap may have been "
-            "fixed — update this test to reflect the new behavior."
-        )
-        assert result["phases"]["validation"]["status"] == "mismatch"
+        assert result["phases"]["full_target_sync"]["strategy"] == "clear-before-load"
 
 
 class TestPostgresDiscoverySchemaFilter:
@@ -1131,6 +1118,617 @@ class TestPostgresCreateObjectTransactionIsolation:
         target.create_object_if_missing(schema)
         conn.commit.assert_called()
         conn.rollback.assert_not_called()
+
+
+class TestMySQLViewDatabaseReferenceRewrite:
+    def test_target_view_maps_source_database_qualifiers(self):
+        from core.connectors.mysql import MySQLTargetConnector
+
+        target = MySQLTargetConnector(
+            {"host": "x", "port": 1, "database": "mysql_migration_target",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        view = ViewDefinition(
+            name="customer_order_summary",
+            schema_name="mysql_migration_source",
+            definition=(
+                "SELECT c.name, 'mysql_migration_source.customers' AS label "
+                "/* mysql_migration_source.orders remains a comment */ "
+                "FROM `mysql_migration_source`.`customers` c "
+                "LEFT JOIN mysql_migration_source . `orders` o ON o.customer_id = c.id "
+                "LEFT JOIN reporting_archive.orders a ON a.customer_id = c.id"
+            ),
+        )
+
+        target.create_view(view)
+
+        create_sql = cur.execute.call_args.args[0]
+        assert "`mysql_migration_target`.`customers`" in create_sql
+        assert "mysql_migration_target . `orders`" in create_sql
+        assert "'mysql_migration_source.customers'" in create_sql
+        assert "/* mysql_migration_source.orders remains a comment */" in create_sql
+        assert "reporting_archive.orders" in create_sql
+        assert "`mysql_migration_source`.`customers`" not in create_sql
+        assert "mysql_migration_source . `orders`" not in create_sql
+
+    def test_target_view_leaves_same_database_definition_unchanged(self):
+        from core.connectors.mysql import _rewrite_view_database_references
+
+        definition = "SELECT * FROM mysql_migration_target.customers"
+        assert _rewrite_view_database_references(
+            definition, "mysql_migration_target", "mysql_migration_target"
+        ) == definition
+
+    def test_target_view_maps_ansi_quoted_source_database_qualifiers(self):
+        from core.connectors.mysql import MySQLTargetConnector
+
+        target = MySQLTargetConnector(
+            {"host": "x", "port": 1, "database": "mysql_migration_target",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        view = ViewDefinition(
+            name="customer_order_summary",
+            schema_name="mysql_migration_source",
+            definition=(
+                'SELECT c.name FROM "mysql_migration_source"."customers" c '
+                'LEFT JOIN "mysql_migration_source"."orders" o '
+                "ON o.customer_id = c.id"
+            ),
+        )
+
+        target.create_view(view)
+
+        create_sql = cur.execute.call_args.args[0]
+        assert '"mysql_migration_target"."customers"' in create_sql
+        assert '"mysql_migration_target"."orders"' in create_sql
+        assert '"mysql_migration_source"' not in create_sql
+
+
+class TestMySQLPartitionMigration:
+    @staticmethod
+    def _range_partition_schema() -> Schema:
+        return Schema(
+            name="tbl_partition_test",
+            columns=[
+                Column(name="id", source_type="INT", nullable=False),
+                Column(name="created_at", source_type="DATE", nullable=False),
+            ],
+            primary_key=["id", "created_at"],
+            mysql_partition_method="RANGE",
+            mysql_partition_expression="YEAR(created_at)",
+            mysql_partitions=[
+                MySQLPartitionDef("p2025", "2026"),
+                MySQLPartitionDef("p2026", "2027"),
+                MySQLPartitionDef("pmax", "MAXVALUE"),
+            ],
+        )
+
+    def _run_existing_mysql_partition_target(self, target_schema: Schema, reconcile: bool = False, after_reconcile: Schema | None = None, reconcile_error: Exception | None = None):
+        source = MagicMock(spec=SourceConnector)
+        target = MagicMock(spec=TargetConnector)
+        source_schema = self._range_partition_schema()
+        source.list_objects.return_value = ["tbl_partition_test"]
+        source.get_schema.return_value = source_schema
+        source.get_object_count.return_value = 3
+        source.export_full.return_value = iter([
+            {"id": 1, "created_at": "2025-01-01"},
+            {"id": 2, "created_at": "2026-01-01"},
+            {"id": 3, "created_at": "2027-01-01"},
+        ])
+        source.get_all_triggers.return_value = []
+        source.list_comments.return_value = []
+        source.list_grants.return_value = []
+        target.create_object_if_missing.return_value = "already_exists"
+        target.inspect_schema.return_value = target_schema
+        if after_reconcile is not None:
+            target.inspect_schema.side_effect = [target_schema, after_reconcile, after_reconcile, after_reconcile]
+        if reconcile_error is not None:
+            target.reconcile_mysql_table.side_effect = reconcile_error
+        target.upsert_batch.return_value = UpsertResult(success_count=3)
+        target.get_object_count.return_value = 3
+        target.get_capabilities.return_value = {}
+        result = MigrationOrchestrator(
+            source, target, {"source": {"engine": "mysql"}, "target": {"engine": "mysql"}, "migration": {"reconcile_target_schema": reconcile}},
+        ).run_full()
+        return result, target
+
+    def test_non_partitioned_summary_has_zero_partition_objects(self):
+        from core.connectors.mysql import MySQLTargetConnector
+
+        target = MySQLTargetConnector({"database": "mysql_migration_target"})
+        summary = MigrationOrchestrator(
+            MagicMock(spec=SourceConnector), target, {}
+        )._build_object_migration_summary(
+            {"customers": Schema(name="customers")},
+            {"create_partitions": {}},
+            {},
+        )
+
+        assert summary["categories"]["partitions"]["source_count"] == 0
+        assert summary["categories"]["partitions"]["migrated"] == 0
+
+    def test_orchestrator_builds_partition_testing_from_source_and_target_metadata(self):
+        source = MagicMock(spec=SourceConnector)
+        target = MagicMock(spec=TargetConnector)
+        target.get_object_count.return_value = 3
+        target.inspect_schema.return_value = Schema(
+            name="tbl_partition_test",
+            mysql_partition_method="RANGE",
+            mysql_partition_expression="YEAR(created_at)",
+            mysql_partitions=[
+                MySQLPartitionDef("p2025", "2026"),
+                MySQLPartitionDef("p2026", "2027"),
+                MySQLPartitionDef("pmax", "MAXVALUE"),
+            ],
+        )
+        orchestrator = MigrationOrchestrator(source, target, {})
+        source_schema = Schema(
+            name="tbl_partition_test",
+            mysql_partition_method="RANGE",
+            mysql_partition_expression="YEAR(created_at)",
+            mysql_partitions=[
+                MySQLPartitionDef("p2025", "2026"),
+                MySQLPartitionDef("p2026", "2027"),
+                MySQLPartitionDef("pmax", "MAXVALUE"),
+            ],
+        )
+
+        report = orchestrator._build_partition_testing(
+            {"tbl_partition_test": source_schema},
+            {"tbl_partition_test": {"source_rows": 3, "success": 3, "failure": 0}},
+        )
+
+        assert report["status"] == "PASS"
+        assert report["tables"][0]["checks"] == {
+            "data_migration": "PASS",
+            "structure_preservation": "PASS",
+            "overall": "PASS",
+        }
+
+        summary = orchestrator._build_object_migration_summary(
+            {"tbl_partition_test": source_schema},
+            {"create_partitions": {"tbl_partition_test.p2025": "created", "tbl_partition_test.p2026": "created", "tbl_partition_test.pmax": "created"}},
+            {},
+        )
+        assert summary["categories"]["partitions"]["source_count"] == 3
+        assert summary["categories"]["partitions"]["migrated"] == 3
+        assert summary["categories"]["partitions"]["status"] == "MIGRATED"
+
+    def test_target_create_table_preserves_ordered_range_partitions(self):
+        from core.connectors.mysql import MySQLTargetConnector
+
+        target = MySQLTargetConnector({"database": "mysql_migration_target", "source_engine": "mysql"})
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        cur.fetchone.return_value = None
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        outcome = target.create_object_if_missing(Schema(
+            name="tbl_partition_test",
+            columns=[
+                Column(name="id", source_type="INT", nullable=False),
+                Column(name="name", source_type="VARCHAR(100)", nullable=False),
+                Column(name="created_at", source_type="DATE", nullable=False),
+            ],
+            primary_key=["id", "created_at"],
+            mysql_partition_method="RANGE",
+            mysql_partition_expression="YEAR(created_at)",
+            mysql_partitions=[
+                MySQLPartitionDef("p2025", "2026"),
+                MySQLPartitionDef("p2026", "2027"),
+                MySQLPartitionDef("pmax", "MAXVALUE"),
+            ],
+        ))
+
+        create_sql = cur.execute.call_args.args[0]
+        assert "PARTITION BY RANGE (YEAR(created_at))" in create_sql
+        assert "PARTITION `p2025` VALUES LESS THAN (2026)" in create_sql
+        assert "PARTITION `p2026` VALUES LESS THAN (2027)" in create_sql
+        assert "PARTITION `pmax` VALUES LESS THAN (MAXVALUE)" in create_sql
+        assert create_sql.index("p2025") < create_sql.index("p2026") < create_sql.index("pmax")
+        assert outcome == "created"
+
+    def test_existing_unpartitioned_target_is_failed_not_reported_as_partition_created(self):
+        result, target = self._run_existing_mysql_partition_target(
+            Schema(name="tbl_partition_test")
+        )
+
+        phase = result["phases"]["create_partitions"]
+        assert set(phase) == {
+            "tbl_partition_test.p2025",
+            "tbl_partition_test.p2026",
+            "tbl_partition_test.pmax",
+        }
+        assert all(value.startswith("failed: partition schema mismatch") for value in phase.values())
+        assert all("created (table DDL)" not in value for value in phase.values())
+        assert "target table is unpartitioned" in next(iter(phase.values()))
+        assert result["object_migration"]["categories"]["partitions"]["status"] == "FAILED"
+        assert result["object_migration"]["categories"]["partitions"]["migrated"] == 0
+        assert result["status"] == "partial_success"
+        target.create_object_if_missing.assert_called_once()
+
+    def test_existing_matching_target_partitions_are_verified_without_recreation(self):
+        result, target = self._run_existing_mysql_partition_target(
+            self._range_partition_schema()
+        )
+
+        phase = result["phases"]["create_partitions"]
+        assert set(phase.values()) == {"verified_existing (partition signature matches source)"}
+        assert result["object_migration"]["categories"]["partitions"]["status"] == "MIGRATED"
+        assert result["object_migration"]["categories"]["partitions"]["migrated"] == 3
+        target.create_object_if_missing.assert_called_once()
+
+    def test_reconcile_true_stages_and_verifies_an_existing_unpartitioned_target(self):
+        source_schema = self._range_partition_schema()
+        result, target = self._run_existing_mysql_partition_target(
+            Schema(name="tbl_partition_test"), reconcile=True, after_reconcile=source_schema
+        )
+
+        assert result["phases"]["reconcile_target_schema"] == {"tbl_partition_test": "recreated_and_verified"}
+        assert set(result["phases"]["create_partitions"].values()) == {"reconciled and verified"}
+        assert result["object_migration"]["categories"]["partitions"]["status"] == "MIGRATED"
+        target.reconcile_mysql_table.assert_called_once_with(source_schema, {"tbl_partition_test"})
+
+    def test_reconciliation_failure_is_reported_without_false_partition_success(self):
+        result, _ = self._run_existing_mysql_partition_target(
+            Schema(name="tbl_partition_test"), reconcile=True,
+            reconcile_error=RuntimeError("staging failed; original retained"),
+        )
+
+        assert result["phases"]["reconcile_target_schema"]["tbl_partition_test"].startswith("failed:")
+        assert all(value.startswith("failed:") for value in result["phases"]["create_partitions"].values())
+        assert result["object_migration"]["categories"]["partitions"]["status"] == "FAILED"
+
+    def test_target_create_table_returns_already_exists_without_ddl(self):
+        from core.connectors.mysql import MySQLTargetConnector
+
+        target = MySQLTargetConnector({"database": "mysql_migration_target", "source_engine": "mysql"})
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        cur.fetchone.return_value = ("tbl_partition_test",)
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        outcome = target.create_object_if_missing(self._range_partition_schema())
+
+        assert outcome == "already_exists"
+        assert cur.execute.call_count == 1
+        assert "INFORMATION_SCHEMA.TABLES" in cur.execute.call_args.args[0]
+
+    def test_source_schema_discovers_ordered_mysql_partitions(self):
+        from core.connectors.mysql import MySQLSourceConnector
+
+        target = MySQLSourceConnector({"database": "mysql_migration_source"})
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        cur.fetchone.return_value = (None, "InnoDB", "utf8mb4_0900_ai_ci")
+        cur.fetchall.side_effect = [
+            [("id", "INT", "NO", None, None, "", None, None),
+             ("created_at", "DATE", "NO", None, None, "", None, None)],
+            [("id",)],
+            [],
+            [],
+            [],
+            [("RANGE", "year(`created_at`)", "p2025", "2026"),
+             ("RANGE", "year(`created_at`)", "p2026", "2027"),
+             ("RANGE", "year(`created_at`)", "pmax", "MAXVALUE")],
+        ]
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        schema = target.get_schema("tbl_partition_test")
+
+        assert schema.mysql_partition_method == "RANGE"
+        assert schema.mysql_partition_expression == "year(`created_at`)"
+        assert [p.name for p in schema.mysql_partitions] == ["p2025", "p2026", "pmax"]
+
+
+def test_object_summary_classifies_blocked_and_migrated_routines_separately():
+    source = MagicMock(spec=SourceConnector)
+    target = MagicMock(spec=TargetConnector)
+    target.get_capabilities.return_value = {}
+    orchestrator = MigrationOrchestrator(source, target, {})
+
+    summary = orchestrator._build_object_migration_summary(
+        {},
+        {
+            "functions": {
+                "blocked_function": "FUNCTION: BLOCKED\nPlease ask a MySQL administrator to run once:\nSET PERSIST log_bin_trust_function_creators = ON;\nThis server configuration persists across MySQL restarts.\nThen re-run the migration.",
+                "migrated_function": "created",
+                "migrated_procedure": "created",
+            },
+            "triggers": {"customers.trg_customer": "created"},
+        },
+        {
+            "functions": 2,
+            "procedures": 1,
+            "triggers": 1,
+            "routine_kinds": {
+                "blocked_function": "function",
+                "migrated_function": "function",
+                "migrated_procedure": "procedure",
+            },
+        },
+    )
+
+    assert summary["categories"]["functions"]["status"] == "BLOCKED"
+    assert summary["categories"]["functions"]["migrated"] == 1
+    assert summary["categories"]["functions"]["blocked"] == 1
+    assert summary["categories"]["procedures"]["status"] == "MIGRATED"
+    assert summary["categories"]["triggers"]["status"] == "MIGRATED"
+    assert summary["categories"]["functions"]["details"] == [
+        "FUNCTION: BLOCKED\nPlease ask a MySQL administrator to run once:\nSET PERSIST log_bin_trust_function_creators = ON;\nThis server configuration persists across MySQL restarts.\nThen re-run the migration."
+    ]
+
+
+def test_object_summary_records_applied_comments_as_migrated():
+    source = MagicMock(spec=SourceConnector)
+    target = MagicMock(spec=TargetConnector)
+    target.get_capabilities.return_value = {}
+    schema = Schema(
+        name="customers",
+        comment="Updated customers comment",
+        columns=[Column(name="email", source_type="varchar(255)", comment="Updated email comment")],
+    )
+
+    summary = MigrationOrchestrator(source, target, {})._build_object_migration_summary(
+        {"customers": schema},
+        {"comments": {"target.customers": "applied", "target.customers.email": "applied"}},
+        {},
+    )
+
+    comments = summary["categories"]["comments"]
+    assert comments["source_count"] == 2
+    assert comments["migrated"] == 2
+    assert comments["failed"] == 0
+    assert comments["status"] == "MIGRATED"
+
+
+def test_object_summary_does_not_report_failed_comment_as_migrated():
+    source = MagicMock(spec=SourceConnector)
+    target = MagicMock(spec=TargetConnector)
+    target.get_capabilities.return_value = {}
+    schema = Schema(name="customers", comment="Updated customers comment")
+
+    summary = MigrationOrchestrator(source, target, {})._build_object_migration_summary(
+        {"customers": schema},
+        {"comments": {"target.customers": "skipped: target database denied ALTER TABLE"}},
+        {},
+    )
+
+    comments = summary["categories"]["comments"]
+    assert comments["status"] == "FAILED"
+    assert comments["migrated"] == 0
+    assert comments["failed"] == 1
+
+
+def test_target_comment_database_failure_is_recorded_as_failed_not_migrated():
+    source = MagicMock(spec=SourceConnector)
+    target = MagicMock(spec=TargetConnector)
+    schema = Schema(name="customers", comment="Updated customers comment")
+    source.list_objects.return_value = ["customers"]
+    source.get_schema.return_value = schema
+    source.get_object_count.return_value = 1
+    source.export_full.return_value = iter([{"id": 1}])
+    source.list_comments.return_value = [
+        CommentDef("TABLE", "customers", "Updated customers comment", "source")
+    ]
+    target.upsert_batch.return_value = UpsertResult(success_count=1)
+    target.get_object_count.return_value = 1
+    target.apply_comment.side_effect = RuntimeError("ALTER TABLE denied")
+    target.get_capabilities.return_value = {}
+
+    result = MigrationOrchestrator(source, target, {}).run_full()
+
+    assert result["phases"]["comments"] == {
+        "source.customers": "skipped: ALTER TABLE denied"
+    }
+    comments = result["object_migration"]["categories"]["comments"]
+    assert comments["status"] == "FAILED"
+    assert comments["migrated"] == 0
+    assert comments["failed"] == 1
+
+
+def test_target_grant_database_failure_is_recorded_as_failed_not_migrated():
+    source = MagicMock(spec=SourceConnector)
+    target = MagicMock(spec=TargetConnector)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    source.list_objects.return_value = ["customers"]
+    source.get_schema.return_value = schema
+    source.get_object_count.return_value = 1
+    source.export_full.return_value = iter([{"id": 1}])
+    source.list_grants.return_value = [
+        GrantDef("SELECT", "TABLE", "customers", "'migration_grant_test'@'localhost'", "mysql_migration_source")
+    ]
+    target.upsert_batch.return_value = UpsertResult(success_count=1)
+    target.get_object_count.return_value = 1
+    target.apply_grant.side_effect = RuntimeError("GRANT denied")
+    target.get_capabilities.return_value = {}
+
+    result = MigrationOrchestrator(source, target, {}).run_full()
+
+    assert result["phases"]["grants"] == {
+        "mysql_migration_source.customers TO 'migration_grant_test'@'localhost'": "skipped: GRANT denied"
+    }
+    grants = result["object_migration"]["categories"]["grants"]
+    assert grants["status"] == "FAILED"
+    assert grants["migrated"] == 0
+    assert grants["failed"] == 1
+
+
+def test_successful_target_grant_is_recorded_as_migrated():
+    source = MagicMock(spec=SourceConnector)
+    target = MagicMock(spec=TargetConnector)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    source.list_objects.return_value = ["customers"]
+    source.get_schema.return_value = schema
+    source.get_object_count.return_value = 1
+    source.export_full.return_value = iter([{"id": 1}])
+    source.list_grants.return_value = [
+        GrantDef("SELECT", "TABLE", "customers", "'migration_grant_test'@'localhost'", "mysql_migration_source")
+    ]
+    target.upsert_batch.return_value = UpsertResult(success_count=1)
+    target.get_object_count.return_value = 1
+    target.get_capabilities.return_value = {}
+
+    result = MigrationOrchestrator(source, target, {}).run_full()
+
+    assert result["phases"]["grants"] == {
+        "mysql_migration_source.customers TO 'migration_grant_test'@'localhost'": "applied"
+    }
+    grants = result["object_migration"]["categories"]["grants"]
+    assert grants["status"] == "MIGRATED"
+    assert grants["migrated"] == 1
+    assert grants["failed"] == 0
+
+
+def test_blocked_object_forces_partial_success_even_when_validation_passes():
+    status = MigrationOrchestrator._full_migration_status(
+        {"status": "success"},
+        [],
+        set(),
+        {"failed": 0, "blocked": 1},
+    )
+
+    assert status == "partial_success"
+
+
+class TestMySQLTriggerLifecycle:
+    def test_function_1419_is_reported_as_actionable_policy_error(self):
+        from core.connectors.mysql import MySQLRoutineCreationPolicyError, MySQLTargetConnector
+
+        target = MySQLTargetConnector({"database": "mysql_migration_target"})
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        cur.execute.side_effect = [None, RuntimeError("Error 1419: log_bin_trust_function_creators")]
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        with pytest.raises(MySQLRoutineCreationPolicyError, match="FUNCTION: BLOCKED") as error:
+            target.create_function(FunctionDef(
+                name="get_customer_count",
+                kind="function",
+                ddl="CREATE FUNCTION get_customer_count() RETURNS INT RETURN 1",
+            ))
+
+        assert str(error.value).splitlines() == [
+            "FUNCTION: BLOCKED",
+            "Please ask a MySQL administrator to run once:",
+            "SET PERSIST log_bin_trust_function_creators = ON;",
+            "This server configuration persists across MySQL restarts.",
+            "Then re-run the migration.",
+        ]
+        assert "SET GLOBAL" not in str(error.value)
+        conn.rollback.assert_called_once()
+
+    def test_source_connect_enables_autocommit(self, monkeypatch):
+        import mysql.connector
+        from core.connectors.mysql import MySQLSourceConnector
+
+        connection = MagicMock()
+        monkeypatch.setattr(mysql.connector, "connect", lambda **_: connection)
+
+        source = MySQLSourceConnector({
+            "host": "x", "port": 1, "database": "mysql_migration_source",
+            "username": "u", "password": "p", "ssl": False,
+        })
+        monkeypatch.setattr("core.connectors.mysql.ensure_driver", lambda *_: None)
+        source.connect()
+
+        assert connection.autocommit is True
+
+    def test_create_trigger_rolls_back_when_ddl_fails(self):
+        from core.connectors.mysql import MySQLTargetConnector
+
+        target = MySQLTargetConnector({"database": "mysql_migration_target"})
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        cur.execute.side_effect = [None, RuntimeError("trigger DDL failed")]
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        with pytest.raises(RuntimeError, match="trigger DDL failed"):
+            target.create_trigger(TriggerDef(
+                name="trg_after_customer_insert_log",
+                table="customers",
+                ddl=(
+                    "CREATE TRIGGER trg_after_customer_insert_log "
+                    "AFTER INSERT ON customers FOR EACH ROW "
+                    "INSERT INTO customer_insert_log "
+                    "(customer_id, customer_name, customer_status) VALUES "
+                    "(NEW.id, NEW.name, NEW.status)"
+                ),
+                schema_name="mysql_migration_source",
+            ))
+
+        conn.rollback.assert_called_once()
+
+    def test_trigger_1419_is_reported_as_actionable_policy_error(self):
+        from core.connectors.mysql import MySQLRoutineCreationPolicyError, MySQLTargetConnector
+
+        target = MySQLTargetConnector({"database": "mysql_migration_target"})
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        cur.execute.side_effect = [None, RuntimeError("Error 1419: log_bin_trust_function_creators")]
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        with pytest.raises(MySQLRoutineCreationPolicyError, match="TRIGGER: BLOCKED") as error:
+            target.create_trigger(TriggerDef(
+                name="trg_customer",
+                table="customers",
+                ddl="CREATE TRIGGER trg_customer AFTER INSERT ON customers FOR EACH ROW SET @x = 1",
+            ))
+
+        conn.rollback.assert_called_once()
+        assert str(error.value).splitlines() == [
+            "TRIGGER: BLOCKED",
+            "Please ask a MySQL administrator to run once:",
+            "SET PERSIST log_bin_trust_function_creators = ON;",
+            "This server configuration persists across MySQL restarts.",
+            "Then re-run the migration.",
+        ]
+        assert "SET GLOBAL" not in str(error.value)
+
+    def test_mysql_connector_close_rolls_back_and_closes(self):
+        from core.connectors.mysql import MySQLTargetConnector
+
+        connection = MagicMock()
+        target = MySQLTargetConnector({"database": "mysql_migration_target"})
+        target._conn = connection
+
+        target.close()
+
+        connection.rollback.assert_called_once()
+        connection.close.assert_called_once()
+        assert target._conn is None
 
 
 class TestPostgresViewSchemaQualification:

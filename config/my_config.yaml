@@ -16,12 +16,12 @@ source:
 
 # TARGET DATABASE (where data goes TO)
 target:
-  engine: cosmos_mongo
+  engine: postgresql
   connection:
-    host: dmt-cosmos-test1.mongocluster.cosmos.azure.com
-    port: 27017
-    database: eds_target_cosmos
-    username: dbuser9gybjr
+    host: dmt-postgre-test.postgres.database.azure.com
+    port: 5432
+    database: postgres
+    username: dmt_user
     password_secret: target_db_pass
     ssl: true
 

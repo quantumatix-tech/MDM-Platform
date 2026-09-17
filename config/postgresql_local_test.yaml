@@ -2,8 +2,8 @@ source:
   engine: postgresql
   connection:
     host: 127.0.0.1
-    port: 55432
-    database: migration_source
+    port: 5432
+    database: eds_db1
     username: postgres
     password_secret: source_db_pass
     ssl: false
@@ -12,8 +12,8 @@ target:
   engine: postgresql
   connection:
     host: 127.0.0.1
-    port: 55432
-    database: migration_target
+    port: 5432
+    database: eds_target_pg
     username: postgres
     password_secret: target_db_pass
     ssl: false

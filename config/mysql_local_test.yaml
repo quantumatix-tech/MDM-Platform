@@ -1,0 +1,42 @@
+source:
+  engine: mysql
+  connection:
+    host: 127.0.0.1
+    port: 3306
+    database: mysql_migration_source
+    username: mysql_test
+    password_secret: mysql_source_pass
+    ssl: true
+
+target:
+  engine: mysql
+  connection:
+    host: 127.0.0.1
+    port: 3306
+    database: mysql_migration_target
+    username: mysql_test
+    password_secret: mysql_target_pass
+    ssl: true
+
+migration:
+  mode: full
+  batch_size: 1000
+  reconcile_target_schema: true
+
+retry:
+  max_retries: 3
+  base_delay_seconds: 1.0
+  max_delay_seconds: 30.0
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO

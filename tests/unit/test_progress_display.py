@@ -55,7 +55,7 @@ def test_preflight_rows_use_human_labels_and_zero_for_missing_target_rows():
         ("orders", "Target Missing", 4, 0, "Create & Migrate"),
         ("products", "Schema Mismatch", 4, 0, "Blocked"),
     ]
-    assert ("preflight", "PostgreSQL Preflight") in _PHASE_LABELS
+    assert ("preflight", "Source / Target Preflight") in _PHASE_LABELS
 
 
 def test_noop_terminal_preflight_uses_human_labels(capsys):

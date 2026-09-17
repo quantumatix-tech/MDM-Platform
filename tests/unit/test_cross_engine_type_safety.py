@@ -38,7 +38,12 @@ def test_cross_engine_mapped_type_is_used_in_generated_ddl(
 
     connector.create_object_if_missing(schema)
 
-    assert cursor.execute.call_args_list[-1].args[0] == f"CREATE TABLE orders (id {mapped_type} NOT NULL)"
+    expected = (
+        f"CREATE TABLE `orders` (`id` {mapped_type} NOT NULL)"
+        if target_engine == "mysql"
+        else f"CREATE TABLE orders (id {mapped_type} NOT NULL)"
+    )
+    assert cursor.execute.call_args_list[-1].args[0] == expected
 
 
 @pytest.mark.parametrize(

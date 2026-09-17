@@ -48,6 +48,9 @@ class Column:
     size: int | None = None
     default: str | None = None          # column default expression (non-sequence)
     generated: str | None = None        # GENERATED ALWAYS AS (expr) STORED expression
+    generated_kind: str | None = None   # engine-specific storage mode, e.g. VIRTUAL/STORED
+    auto_increment: bool = False
+    comment: str | None = None
 
 
 @dataclass
@@ -88,6 +91,11 @@ class Schema:
     sequences: list[str] = field(default_factory=list)     # column names backed by sequences
     rls_enabled: bool = False
     partition_key: str | None = None    # e.g. "RANGE (created_at)" for partitioned tables
+    mysql_partition_method: str | None = None
+    mysql_partition_expression: str | None = None
+    mysql_partitions: list["MySQLPartitionDef"] = field(default_factory=list)
+    comment: str | None = None
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +108,13 @@ class PartitionDef:
     name: str
     parent_table: str
     bound: str          # e.g. "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')"
+
+
+@dataclass
+class MySQLPartitionDef:
+    """One ordered partition from INFORMATION_SCHEMA.PARTITIONS."""
+    name: str
+    description: str | None = None
 
 
 @dataclass
@@ -161,6 +176,7 @@ class FunctionDef:
     name: str
     ddl: str            # complete DDL from pg_get_functiondef — ready to execute
     schema_name: str = "public"
+    kind: str = "function"             # function or procedure
 
 
 @dataclass
@@ -170,6 +186,14 @@ class TriggerDef:
     name: str
     table: str
     ddl: str            # complete DDL from pg_get_triggerdef — ready to execute
+    schema_name: str = "public"
+
+
+@dataclass
+class EventDef:
+    """A scheduled database event (native to MySQL/MariaDB)."""
+    name: str
+    ddl: str
     schema_name: str = "public"
 
 
@@ -289,6 +313,10 @@ class SourceConnector(abc.ABC):
     @abc.abstractmethod
     def connect(self) -> None: ...
 
+    def close(self) -> None:
+        """Release connector resources when a migration run finishes."""
+        return None
+
     @abc.abstractmethod
     def list_objects(self) -> list[str]: ...
 
@@ -324,6 +352,17 @@ class SourceConnector(abc.ABC):
     def get_all_triggers(self) -> list[TriggerDef]:
         return []
 
+    def list_events(self) -> list[EventDef]:
+        return []
+
+    def get_capabilities(self) -> dict[str, dict[str, Any]]:
+        """Describe engine object support for planning and reporting.
+
+        Values intentionally remain connector-owned: the orchestrator consumes
+        these outcomes without encoding source/target engine pairs.
+        """
+        return {}
+
     def get_rls_policies(self, table: str, schema_name: str | None = None) -> list[RLSPolicy]:
         return []
 
@@ -340,11 +379,15 @@ class TargetConnector(abc.ABC):
     @abc.abstractmethod
     def connect(self) -> None: ...
 
+    def close(self) -> None:
+        """Release connector resources when a migration run finishes."""
+        return None
+
     @abc.abstractmethod
     def ensure_database_exists(self) -> None: ...
 
     @abc.abstractmethod
-    def create_object_if_missing(self, schema: Schema) -> None: ...
+    def create_object_if_missing(self, schema: Schema) -> str | None: ...
 
     @abc.abstractmethod
     def upsert_batch(self, object_name: str, rows: Iterator[dict[str, Any]], schema: Schema | None = None) -> UpsertResult: ...
@@ -372,6 +415,13 @@ class TargetConnector(abc.ABC):
     def apply_constraints(self, schema: Schema) -> None:
         pass
 
+    def get_capabilities(self) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def inspect_schema(self, object_name: str, schema_name: str | None = None) -> Schema | None:
+        """Read target metadata needed by post-migration verification."""
+        return None
+
     def create_view(self, view: ViewDefinition) -> None:
         pass
 
@@ -386,6 +436,31 @@ class TargetConnector(abc.ABC):
 
     def create_trigger(self, trigger: TriggerDef) -> None:
         pass
+
+    def create_event(self, event: EventDef) -> None:
+        pass
+
+    def suspend_triggers_for_data_load(self, triggers: list[TriggerDef]) -> list[TriggerDef]:
+        """Temporarily remove target triggers that would observe migration DML."""
+        return []
+
+    def clear_objects_for_full_sync(self, objects: list[str]) -> list[str]:
+        """Remove target rows for a full replacement sync before loading data.
+
+        Connectors which do not define full replacement semantics retain the
+        historical upsert-only behaviour.  Relational targets can override
+        this to make a successful full run exactly match the source.
+        """
+        return []
+
+    def sync_auto_increment(self, table: str, column: str) -> None:
+        pass
+
+    def reconcile_mysql_table(self, schema: Schema, managed_tables: set[str]) -> str:
+        raise NotImplementedError("Target does not support MySQL schema reconciliation")
+
+    def finalize_schema_reconciliations(self) -> list[str]:
+        return []
 
     def apply_rls_policy(self, policy: RLSPolicy) -> None:
         pass

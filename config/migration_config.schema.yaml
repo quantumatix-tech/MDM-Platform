@@ -35,6 +35,10 @@ migration:
     type: integer
     default: 1000
     minimum: 1
+  reconcile_target_schema:
+    type: boolean
+    default: false
+    description: Opt-in MySQL FULL-mode staged reconciliation for incompatible partitioned target tables.
   stop_on_error:
     type: boolean
     default: false

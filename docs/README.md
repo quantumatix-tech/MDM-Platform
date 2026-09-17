@@ -15,3 +15,6 @@ This directory contains project documentation organized by topic.
 | [postgresql/POSTGRESQL_OBJECT_SUPPORT_MATRIX.md](postgresql/POSTGRESQL_OBJECT_SUPPORT_MATRIX.md) | PostgreSQL object migration support matrix |
 | [postgresql/POSTGRESQL_TEST_GUIDE.md](postgresql/POSTGRESQL_TEST_GUIDE.md) | PostgreSQL E2E test guide with exact commands |
 | [postgresql/POSTGRESQL_LIMITATIONS.md](postgresql/POSTGRESQL_LIMITATIONS.md) | Current PostgreSQL migration limitations |
+| [mysql/MYSQL_LOCAL_AUDIT.md](mysql/MYSQL_LOCAL_AUDIT.md) | MySQL implementation audit and evidence status |
+| [mysql/MYSQL_OBJECT_SUPPORT_MATRIX.md](mysql/MYSQL_OBJECT_SUPPORT_MATRIX.md) | MySQL object support matrix |
+| [mysql/MYSQL_TEST_GUIDE.md](mysql/MYSQL_TEST_GUIDE.md) | MySQL local and cloud E2E guide |

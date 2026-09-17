@@ -31,7 +31,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 _PHASE_LABELS: list[tuple[str, str]] = [
     ("connect",            "Connect"),
-    ("preflight",          "PostgreSQL Preflight"),
+    ("preflight",          "Source / Target Preflight"),
     ("ensure_database",    "Ensure Database"),
     ("extensions",         "Extensions"),
     ("schemas",            "Schemas"),

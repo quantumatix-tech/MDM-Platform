@@ -4,6 +4,8 @@ from collections.abc import Iterator
 from typing import Any
 import json
 from pathlib import Path
+import re
+import hashlib
 
 from core.connectors.base import (
     SourceConnector,
@@ -11,6 +13,16 @@ from core.connectors.base import (
     CDCEngine,
     Schema,
     Column,
+    Index,
+    ForeignKey,
+    CheckConstraint,
+    ViewDefinition,
+    FunctionDef,
+    TriggerDef,
+    MySQLPartitionDef,
+    EventDef,
+    CommentDef,
+    GrantDef,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -20,6 +32,258 @@ from core.connectors.base import (
 from core.driver_installer import ensure_driver
 from core.retry import retry_with_backoff
 from core.audit_logger import audit_log
+
+
+class MySQLRoutineCreationPolicyError(RuntimeError):
+    """Target policy prevents creating a function or trigger under binary logging."""
+
+
+def _mysql_routine_policy_error(error: Exception, object_type: str) -> MySQLRoutineCreationPolicyError | None:
+    text = str(error)
+    if "1419" not in text and "log_bin_trust_function_creators" not in text:
+        return None
+    return MySQLRoutineCreationPolicyError(
+        f"{object_type}: BLOCKED\n"
+        "Please ask a MySQL administrator to run once:\n"
+        "SET PERSIST log_bin_trust_function_creators = ON;\n"
+        "This server configuration persists across MySQL restarts.\n"
+        "Then re-run the migration."
+    )
+
+
+def _q(name: str) -> str:
+    """Quote a MySQL identifier. Metadata values are never interpolated bare."""
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _qname(database: str, name: str) -> str:
+    return f"{_q(database)}.{_q(name)}"
+
+
+def _mysql_partition_boundary(description: str | None) -> str:
+    boundary = (description or "").strip()
+    if boundary.upper() == "MAXVALUE":
+        return "(MAXVALUE)"
+    if boundary.startswith("(") and boundary.endswith(")"):
+        return boundary
+    return f"({boundary})"
+
+
+def _mysql_partition_clause(schema: Schema) -> str:
+    method = (schema.mysql_partition_method or "").upper()
+    expression = (schema.mysql_partition_expression or "").strip()
+    partitions = schema.mysql_partitions
+    if not method:
+        return ""
+    if method not in {"RANGE", "RANGE COLUMNS", "LIST", "LIST COLUMNS", "HASH", "KEY"}:
+        raise ValueError(f"Unsupported MySQL partition method: {method}")
+    if not expression:
+        raise ValueError(f"MySQL {method} partitioning has no expression")
+
+    if method in {"HASH", "KEY"}:
+        return f"PARTITION BY {method} ({expression}) PARTITIONS {len(partitions)}"
+
+    boundary_keyword = "VALUES LESS THAN" if method.startswith("RANGE") else "VALUES IN"
+    definitions = ", ".join(
+        f"PARTITION {_q(partition.name)} {boundary_keyword} "
+        f"{_mysql_partition_boundary(partition.description)}"
+        for partition in partitions
+    )
+    if not definitions:
+        raise ValueError(f"MySQL {method} partitioning has no partitions")
+    return f"PARTITION BY {method} ({expression}) ({definitions})"
+
+
+def _rewrite_view_database_references(
+    definition: str, source_database: str, target_database: str
+) -> str:
+    """Map source-database qualifiers in a MySQL view definition to the target.
+
+    ``INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION`` commonly contains fully
+    qualified MySQL object names.  Replaying it unchanged on a different
+    target database makes the target view continue to read from the source.
+    This deliberately scans SQL rather than using ``str.replace`` so text in
+    string literals and comments, and references to other databases, remain
+    untouched.
+    """
+    if source_database == target_database:
+        return definition
+
+    def has_qualifier_after(position: int) -> bool:
+        while position < len(definition) and definition[position].isspace():
+            position += 1
+        return position < len(definition) and definition[position] == "."
+
+    output: list[str] = []
+    index = 0
+    source_folded = source_database.casefold()
+    while index < len(definition):
+        char = definition[index]
+
+        # Preserve line and block comments verbatim.
+        if char == "#" or (
+            char == "-"
+            and definition[index:index + 2] == "--"
+            and index + 2 < len(definition)
+            and definition[index + 2].isspace()
+        ):
+            end = definition.find("\n", index)
+            if end == -1:
+                return "".join(output) + definition[index:]
+            output.append(definition[index:end + 1])
+            index = end + 1
+            continue
+        if definition[index:index + 2] == "/*":
+            end = definition.find("*/", index + 2)
+            if end == -1:
+                return "".join(output) + definition[index:]
+            output.append(definition[index:end + 2])
+            index = end + 2
+            continue
+
+        # MySQL supports both doubled quotes and backslash escaping in string
+        # literals. Double quotes can also quote identifiers with ANSI_QUOTES.
+        if char == "'":
+            quote = char
+            end = index + 1
+            while end < len(definition):
+                if definition[end] == "\\":
+                    end += 2
+                    continue
+                if definition[end] == quote:
+                    if end + 1 < len(definition) and definition[end + 1] == quote:
+                        end += 2
+                        continue
+                    end += 1
+                    break
+                end += 1
+            output.append(definition[index:end])
+            index = end
+            continue
+
+        if char == '"':
+            end = index + 1
+            while end < len(definition):
+                if definition[end] == '"':
+                    if end + 1 < len(definition) and definition[end + 1] == '"':
+                        end += 2
+                        continue
+                    break
+                end += 1
+            if end < len(definition):
+                identifier = definition[index + 1:end].replace('""', '"')
+                if identifier.casefold() == source_folded and has_qualifier_after(end + 1):
+                    output.append('"' + target_database.replace('"', '""') + '"')
+                else:
+                    output.append(definition[index:end + 1])
+                index = end + 1
+                continue
+
+        # Backticks quote identifiers in MySQL.  A doubled backtick represents
+        # a literal backtick in the identifier.
+        if char == "`":
+            end = index + 1
+            while end < len(definition):
+                if definition[end] == "`":
+                    if end + 1 < len(definition) and definition[end + 1] == "`":
+                        end += 2
+                        continue
+                    break
+                end += 1
+            if end < len(definition):
+                identifier = definition[index + 1:end].replace("``", "`")
+                if identifier.casefold() == source_folded and has_qualifier_after(end + 1):
+                    output.append(_q(target_database))
+                else:
+                    output.append(definition[index:end + 1])
+                index = end + 1
+                continue
+
+        # Bare MySQL identifiers.  Only a source-database token immediately
+        # followed by a qualifier dot is mapped; table aliases and unrelated
+        # identifiers are not candidates.
+        if char.isalpha() or char in {"_", "$"}:
+            end = index + 1
+            while end < len(definition) and (definition[end].isalnum() or definition[end] in {"_", "$"}):
+                end += 1
+            identifier = definition[index:end]
+            if identifier.casefold() == source_folded and has_qualifier_after(end):
+                output.append(target_database)
+            else:
+                output.append(identifier)
+            index = end
+            continue
+
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _connection_options(config: dict[str, Any]) -> dict[str, Any]:
+    """Provider-neutral MySQL TLS options; legacy ``ssl: bool`` still works."""
+    tls = config.get("tls", {})
+    enabled = tls.get("enabled", config.get("ssl", True))
+    options: dict[str, Any] = {"ssl_disabled": not enabled}
+    if enabled:
+        if tls.get("ca_path"): options["ssl_ca"] = tls["ca_path"]
+        if tls.get("cert_path"): options["ssl_cert"] = tls["cert_path"]
+        if tls.get("key_path"): options["ssl_key"] = tls["key_path"]
+        if "verify_cert" in tls: options["ssl_verify_cert"] = bool(tls["verify_cert"])
+        if "verify_identity" in tls: options["ssl_verify_identity"] = bool(tls["verify_identity"])
+    return options
+
+
+def _default_sql(value: Any, column_type: str) -> str:
+    """Render INFORMATION_SCHEMA defaults as MySQL DDL, preserving expressions."""
+    if value is None:
+        return "NULL"
+    text = str(value)
+    if re.fullmatch(r"CURRENT_TIMESTAMP(?:\(\d*\))?", text, re.IGNORECASE) or text.upper() == "NULL" or re.match(r"^-?(?:\d+|\d+\.\d+)$", text) or text.startswith("("):
+        return text
+    if text.startswith(("'", '"', "b'", "B'")):
+        return text
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _mysql_set_members(column_type: str) -> list[str]:
+    """Return SET members in the order declared by MySQL metadata."""
+    text = column_type.strip()
+    if not text.lower().startswith("set(") or not text.endswith(")"):
+        return []
+
+    members: list[str] = []
+    index = text.find("(") + 1
+    end = len(text) - 1
+    while index < end:
+        while index < end and (text[index].isspace() or text[index] == ","):
+            index += 1
+        if index >= end or text[index] != "'":
+            break
+        index += 1
+        chars: list[str] = []
+        while index < end:
+            char = text[index]
+            if char == "\\" and index + 1 < end:
+                chars.append(text[index + 1])
+                index += 2
+            elif char == "'":
+                index += 1
+                break
+            else:
+                chars.append(char)
+                index += 1
+        members.append("".join(chars))
+    return members
+
+
+def _normalize_mysql_set_value(value: Any, column_type: str) -> Any:
+    """Convert a connector SET collection to MySQL's comma-separated value."""
+    if not column_type.strip().lower().startswith("set(") or not isinstance(value, (set, frozenset)):
+        return value
+    members = _mysql_set_members(column_type)
+    declared_order = {member: position for position, member in enumerate(members)}
+    ordered = sorted(value, key=lambda member: (declared_order.get(member, len(members)), member))
+    return ",".join(ordered)
 
 
 class MySQLSourceConnector(SourceConnector):
@@ -32,19 +296,36 @@ class MySQLSourceConnector(SourceConnector):
         ensure_driver("mysql-connector-python", "mysql.connector")
         import mysql.connector
 
+        # ssl_disabled (plus CA/verification options) is supplied below by
+        # _connection_options for legacy and provider-neutral TLS configs.
+
         conn_kwargs: dict[str, Any] = {
             "host": self._config["host"],
             "port": self._config.get("port", 3306),
             "database": self._config["database"],
             "user": self._config["username"],
             "password": self._config.get("password", ""),
-            "ssl_disabled": not self._config.get("ssl", True),
+            "connection_timeout": self._config.get("connection_timeout", 10),
         }
-
-        
+        conn_kwargs.update(_connection_options(self._config))
 
         self._conn = mysql.connector.connect(**conn_kwargs)
+        # Source access is read-only. Autocommit prevents metadata locks from
+        # surviving catalog reads or streaming exports until run shutdown.
+        self._conn.autocommit = True
         audit_log(phase="connect", status="success", details={"engine": "mysql", "role": "source"})
+
+    def close(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+        try:
+            self._conn.close()
+        finally:
+            self._conn = None
 
     def list_objects(self) -> list[str]:
         db_name = self._config["database"]
@@ -75,53 +356,108 @@ class MySQLSourceConnector(SourceConnector):
 
     def get_schema(self, object_name: str) -> Schema:
         validate_identifier(object_name, "table")
-        columns: list[Column] = []
-        primary_key: list[str] = []
-
-        # Get columns
+        db = self._config["database"]
         with self._conn.cursor(buffered=True) as cur:
-            cur.execute(
-                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH "
-                "FROM INFORMATION_SCHEMA.COLUMNS "
-                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
-                "ORDER BY ORDINAL_POSITION",
-                (self._config["database"], object_name),
-            )
+            cur.execute("SELECT COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,CHARACTER_MAXIMUM_LENGTH,COLUMN_DEFAULT,EXTRA,GENERATION_EXPRESSION,COLUMN_COMMENT FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION", (db, object_name))
+            columns = [Column(name=n, source_type=t, nullable=(nullable == "YES"), size=size,
+                default=default, generated=generated or None,
+                generated_kind=("STORED" if "STORED GENERATED" in (extra or "") else "VIRTUAL") if generated else None,
+                auto_increment="auto_increment" in (extra or "").lower(), comment=comment or None)
+                for n, t, nullable, size, default, extra, generated, comment in cur.fetchall()]
+            cur.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND CONSTRAINT_NAME='PRIMARY' ORDER BY ORDINAL_POSITION", (db, object_name))
+            primary_key = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT INDEX_NAME,NON_UNIQUE,COLUMN_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND INDEX_NAME<>'PRIMARY' ORDER BY INDEX_NAME,SEQ_IN_INDEX", (db, object_name))
+            index_map: dict[str, Index] = {}
+            for name, non_unique, column in cur.fetchall():
+                index_map.setdefault(name, Index(name=name, columns=[], unique=not bool(non_unique))).columns.append(column)
+            cur.execute("SELECT k.CONSTRAINT_NAME,k.COLUMN_NAME,k.REFERENCED_TABLE_SCHEMA,k.REFERENCED_TABLE_NAME,k.REFERENCED_COLUMN_NAME,r.UPDATE_RULE,r.DELETE_RULE FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME=k.CONSTRAINT_NAME WHERE k.TABLE_SCHEMA=%s AND k.TABLE_NAME=%s AND k.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY k.CONSTRAINT_NAME,k.ORDINAL_POSITION", (db, object_name))
+            fk_map: dict[str, ForeignKey] = {}
+            for name, col, ref_schema, ref_table, ref_col, on_update, on_delete in cur.fetchall():
+                fk = fk_map.setdefault(name, ForeignKey(name=name, columns=[], ref_table=ref_table, ref_columns=[], ref_schema=ref_schema, on_update=on_update, on_delete=on_delete))
+                fk.columns.append(col); fk.ref_columns.append(ref_col)
+            cur.execute("SELECT tc.CONSTRAINT_NAME,cc.CHECK_CLAUSE FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc JOIN INFORMATION_SCHEMA.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA=tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME=tc.CONSTRAINT_NAME WHERE tc.TABLE_SCHEMA=%s AND tc.TABLE_NAME=%s AND tc.CONSTRAINT_TYPE='CHECK'", (db, object_name))
+            # INFORMATION_SCHEMA returns escaped character-set string literals
+            # on this MySQL build; DDL requires the unescaped form.
+            checks = [CheckConstraint(name=n, expression=e.replace("\\'", "'")) for n, e in cur.fetchall()]
+            cur.execute("SELECT TABLE_COMMENT,ENGINE,TABLE_COLLATION FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s", (db, object_name))
+            comment, engine, collation = cur.fetchone()
+            cur.execute("SELECT PARTITION_METHOD,PARTITION_EXPRESSION,PARTITION_NAME,PARTITION_DESCRIPTION FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND PARTITION_NAME IS NOT NULL ORDER BY PARTITION_ORDINAL_POSITION", (db, object_name))
+            partition_rows = cur.fetchall()
 
-            for row in cur.fetchall():
-                col_name, column_type, nullable, max_len = row
-                columns.append(
-                    Column(
-                        name=col_name,
-                        source_type=column_type,
-                        target_type=None,
-                        nullable=(nullable == "YES"),
-                        size=max_len,
-                    )
-                )
+        partition_method = partition_rows[0][0] if partition_rows else None
+        partition_expression = partition_rows[0][1] if partition_rows else None
+        mysql_partitions = [
+            MySQLPartitionDef(name=name, description=description)
+            for _, _, name, description in partition_rows
+        ]
+        return Schema(name=object_name, columns=columns, primary_key=primary_key, indexes=list(index_map.values()), foreign_keys=list(fk_map.values()), check_constraints=checks, mysql_partition_method=partition_method, mysql_partition_expression=partition_expression, mysql_partitions=mysql_partitions, comment=comment or None, options={"engine": engine, "collation": collation})
 
-        # Get primary key separately
-        with self._conn.cursor(buffered=True) as cur:
-            cur.execute(
-                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
-                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
-                "AND CONSTRAINT_NAME = 'PRIMARY'",
-                (self._config["database"], object_name),
-            )
+    def _show_create(self, kind: str, name: str) -> str:
+        with self._conn.cursor() as cur:
+            cur.execute(f"SHOW CREATE {kind} {_q(name)}")
+            row = cur.fetchone()
+            for index, column_name in enumerate(cur.column_names):
+                if "create" in column_name.lower() or "original statement" in column_name.lower():
+                    return row[index]
+            raise RuntimeError(f"SHOW CREATE {kind} did not return a DDL column")
 
-            primary_key = [row[0] for row in cur.fetchall()]
+    def list_views(self) -> list[ViewDefinition]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT TABLE_NAME,VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA=%s", (self._config["database"],))
+            return [ViewDefinition(name=n, definition=d, schema_name=self._config["database"]) for n, d in cur.fetchall()]
 
-        return Schema(
-            name=object_name,
-            columns=columns,
-            primary_key=primary_key,
-        )
+    def list_functions(self) -> list[FunctionDef]:
+        result: list[FunctionDef] = []
+        with self._conn.cursor() as cur:
+            for kind in ("FUNCTION", "PROCEDURE"):
+                cur.execute("SELECT ROUTINE_NAME FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA=%s AND ROUTINE_TYPE=%s", (self._config["database"], kind))
+                result.extend(FunctionDef(name=n, ddl=self._show_create(kind, n), schema_name=self._config["database"], kind=kind.lower()) for (n,) in cur.fetchall())
+        return result
+
+    def get_all_triggers(self) -> list[TriggerDef]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT TRIGGER_NAME,EVENT_OBJECT_TABLE FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA=%s", (self._config["database"],))
+            return [TriggerDef(name=n, table=t, ddl=self._show_create("TRIGGER", n), schema_name=self._config["database"]) for n, t in cur.fetchall()]
+
+    def list_events(self) -> list[EventDef]:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT EVENT_NAME FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA=%s", (self._config["database"],))
+            return [EventDef(name=n, ddl=self._show_create("EVENT", n), schema_name=self._config["database"]) for (n,) in cur.fetchall()]
+
+    def list_comments(self) -> list[CommentDef]:
+        db = self._config["database"]; result: list[CommentDef] = []
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT TABLE_NAME,TABLE_COMMENT FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=%s AND TABLE_TYPE='BASE TABLE' AND TABLE_COMMENT<>''", (db,))
+            result.extend(CommentDef("TABLE", n, c, db) for n, c in cur.fetchall())
+            cur.execute("SELECT c.TABLE_NAME,c.COLUMN_NAME,c.COLUMN_COMMENT FROM INFORMATION_SCHEMA.COLUMNS c JOIN INFORMATION_SCHEMA.TABLES t ON t.TABLE_SCHEMA=c.TABLE_SCHEMA AND t.TABLE_NAME=c.TABLE_NAME WHERE c.TABLE_SCHEMA=%s AND t.TABLE_TYPE='BASE TABLE' AND c.COLUMN_COMMENT<>''", (db,))
+            result.extend(CommentDef("COLUMN", f"{t}.{n}", c, db) for t, n, c in cur.fetchall())
+        return result
+
+    def list_grants(self) -> list[GrantDef]:
+        db = self._config["database"]; result: list[GrantDef] = []
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT GRANTEE,TABLE_SCHEMA,TABLE_NAME,PRIVILEGE_TYPE FROM INFORMATION_SCHEMA.TABLE_PRIVILEGES WHERE TABLE_SCHEMA=%s", (db,))
+            result.extend(GrantDef(privileges=p, object_type="TABLE", object_name=t, grantee=g, schema_name=s) for g, s, t, p in cur.fetchall())
+            try:
+                cur.execute("SELECT GRANTEE,ROUTINE_NAME,ROUTINE_TYPE,PRIVILEGE_TYPE FROM INFORMATION_SCHEMA.ROUTINE_PRIVILEGES WHERE ROUTINE_SCHEMA=%s", (db,))
+                result.extend(GrantDef(privileges=p, object_type=rtype, object_name=n, grantee=g, schema_name=db) for g, n, rtype, p in cur.fetchall())
+            except Exception:
+                # Some compatible servers do not expose ROUTINE_PRIVILEGES.
+                # Preserve table grants and leave routine grants unreported.
+                self._conn.rollback()
+        return result
+
+    def get_capabilities(self) -> dict[str, dict[str, Any]]:
+        direct = ("tables", "columns", "defaults", "primary_keys", "auto_increment", "indexes", "unique_constraints", "check_constraints", "foreign_keys", "generated_columns", "partitions", "views", "functions", "procedures", "triggers", "events", "comments", "grants")
+        unsupported = {"materialized_views": "MySQL has no native materialized views", "rls_policies": "MySQL has no row-level security policies", "extensions": "MySQL has no PostgreSQL extension model", "custom_types": "MySQL has no PostgreSQL domain/type model", "sequences": "AUTO_INCREMENT is table-bound", "schemas": "MySQL databases are namespaces, not PostgreSQL schemas"}
+        return {x: {"supported": True, "mode": "direct"} for x in direct} | {x: {"supported": False, "mode": "unsupported", "reason": r} for x, r in unsupported.items()}
 
 
 class MySQLTargetConnector(TargetConnector):
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
         self._conn: Any = None
+        self._reconciliation_backups: list[str] = []
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     def connect(self) -> None:
@@ -134,11 +470,24 @@ class MySQLTargetConnector(TargetConnector):
             "database": self._config.get("database", "mysql"),
             "user": self._config["username"],
             "password": self._config.get("password", ""),
-            "ssl_disabled": not self._config.get("ssl", True),
+            "connection_timeout": self._config.get("connection_timeout", 10),
         }
+        conn_kwargs.update(_connection_options(self._config))
 
         self._conn = mysql.connector.connect(**conn_kwargs)
         audit_log(phase="connect", status="success", details={"engine": "mysql", "role": "target"})
+
+    def close(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            self._conn.rollback()
+        except Exception:
+            pass
+        try:
+            self._conn.close()
+        finally:
+            self._conn = None
 
     def ensure_database_exists(self) -> None:
         db_name = self._config["database"]
@@ -149,7 +498,36 @@ class MySQLTargetConnector(TargetConnector):
                 cur.execute(f"CREATE DATABASE {db_name}")
                 audit_log(phase="ensure_database", status="created", details={"database": db_name})
 
-    def create_object_if_missing(self, schema: Schema) -> None:
+    def _show_create(self, kind: str, name: str) -> str:
+        """Return the authoritative MySQL DDL for an existing target object."""
+        with self._conn.cursor() as cur:
+            cur.execute(f"SHOW CREATE {kind} {_q(name)}")
+            row = cur.fetchone()
+            for index, column_name in enumerate(cur.column_names):
+                if "create" in column_name.lower() or "original statement" in column_name.lower():
+                    return row[index]
+            raise RuntimeError(f"SHOW CREATE {kind} did not return a DDL column")
+
+    def get_capabilities(self) -> dict[str, dict[str, Any]]:
+        # Target-owned because permissions/version checks can refine this later.
+        direct = ("tables", "columns", "defaults", "primary_keys", "auto_increment", "indexes", "unique_constraints", "check_constraints", "foreign_keys", "generated_columns", "partitions", "views", "functions", "procedures", "triggers", "events", "comments", "grants")
+        unsupported = {"materialized_views": "MySQL has no native materialized views", "rls_policies": "MySQL has no row-level security policies", "extensions": "MySQL has no PostgreSQL extension model", "custom_types": "MySQL has no PostgreSQL domain/type model", "sequences": "AUTO_INCREMENT is table-bound", "schemas": "MySQL databases are namespaces, not PostgreSQL schemas"}
+        return {x: {"supported": True, "mode": "direct"} for x in direct} | {x: {"supported": False, "mode": "unsupported", "reason": r} for x, r in unsupported.items()}
+
+    def inspect_schema(self, object_name: str, schema_name: str | None = None) -> Schema | None:
+        """Reuse MySQL catalog extraction for target partition verification."""
+        validate_identifier(object_name, "table")
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND TABLE_TYPE='BASE TABLE'",
+                (self._config.get("database", "mysql"), object_name),
+            )
+            if cur.fetchone() is None:
+                return None
+        return MySQLSourceConnector.get_schema(self, object_name)
+
+    def create_object_if_missing(self, schema: Schema) -> str:
         validate_identifier(schema.name, "table")
         with self._conn.cursor() as cur:
             cur.execute(
@@ -158,8 +536,15 @@ class MySQLTargetConnector(TargetConnector):
                 (self._config.get("database", "mysql"), schema.name),
             )
             if cur.fetchone() is not None:
-                return
+                return "already_exists"
+            self._create_table(cur, schema, schema.name)
+            self._conn.commit()
+            audit_log(phase="create_table", status="created", details={"table": schema.name})
+            return "created"
 
+    def _create_table(self, cur: Any, schema: Schema, table_name: str) -> None:
+            """Emit the same source-derived DDL for a final or staged table."""
+            validate_identifier(table_name, "table")
             col_defs = []
             for col in schema.columns:
                 if col.target_type is None:
@@ -176,16 +561,332 @@ class MySQLTargetConnector(TargetConnector):
                 else:
                     col_type = col.target_type
                 null_str = "NULL" if col.nullable else "NOT NULL"
-                col_defs.append(f"{col.name} {col_type} {null_str}")
+                generated = f" GENERATED ALWAYS AS ({col.generated}) {col.generated_kind or 'VIRTUAL'}" if col.generated else ""
+                default = f" DEFAULT {_default_sql(col.default, col_type)}" if col.default is not None and not col.generated else ""
+                increment = " AUTO_INCREMENT" if col.auto_increment else ""
+                comment = f" COMMENT {self._literal(col.comment)}" if col.comment else ""
+                col_defs.append(f"{_q(col.name)} {col_type}{generated} {null_str}{default}{increment}{comment}")
 
             if schema.primary_key:
-                pk_cols = ", ".join(schema.primary_key)
+                pk_cols = ", ".join(_q(c) for c in schema.primary_key)
                 col_defs.append(f"PRIMARY KEY ({pk_cols})")
 
-            ddl = f"CREATE TABLE {schema.name} ({', '.join(col_defs)})"
+            suffix = ""
+            if schema.options.get("engine"):
+                suffix += f" ENGINE={schema.options['engine']}"
+            if schema.options.get("collation"):
+                suffix += f" COLLATE={schema.options['collation']}"
+            if schema.comment:
+                suffix += f" COMMENT={self._literal(schema.comment)}"
+            partition_clause = _mysql_partition_clause(schema)
+            if partition_clause:
+                suffix += f" {partition_clause}"
+            ddl = f"CREATE TABLE {_q(table_name)} ({', '.join(col_defs)}){suffix}"
             cur.execute(ddl)
+
+    def reconcile_mysql_table(self, schema: Schema, managed_tables: set[str]) -> str:
+        """Stage and atomically swap a source-equivalent table, retaining backup until success."""
+        token = hashlib.sha1(schema.name.encode()).hexdigest()[:10]
+        staged = f"__dms_stage_{token}"
+        backup = f"__dms_backup_{token}"
+        validate_identifier(staged, "table"); validate_identifier(backup, "table")
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(f"DROP TABLE IF EXISTS {_q(staged)}")
+                self._create_table(cur, schema, staged)
+                self._conn.commit()
+                staged_schema = MySQLSourceConnector.get_schema(self, staged)
+                if (
+                    staged_schema.mysql_partition_method != schema.mysql_partition_method
+                    or staged_schema.mysql_partition_expression != schema.mysql_partition_expression
+                    or [(p.name, p.description) for p in staged_schema.mysql_partitions] != [(p.name, p.description) for p in schema.mysql_partitions]
+                ):
+                    raise RuntimeError("staged table partition metadata does not match source")
+                cur.execute(
+                    "SELECT TABLE_NAME,CONSTRAINT_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
+                    "WHERE TABLE_SCHEMA=%s AND REFERENCED_TABLE_SCHEMA=%s AND REFERENCED_TABLE_NAME=%s "
+                    "AND CONSTRAINT_NAME<>'PRIMARY'",
+                    (self._config["database"], self._config["database"], schema.name),
+                )
+                incoming = cur.fetchall()
+                external = [table for table, _ in incoming if table not in managed_tables]
+                if external:
+                    raise RuntimeError(f"cannot safely reconcile {schema.name}: referenced by unmanaged target tables {external}")
+                for child, constraint in incoming:
+                    if child != schema.name:
+                        cur.execute(f"ALTER TABLE {_q(child)} DROP FOREIGN KEY {_q(constraint)}")
+                cur.execute(f"DROP TABLE IF EXISTS {_q(backup)}")
+                cur.execute(f"RENAME TABLE {_q(schema.name)} TO {_q(backup)}, {_q(staged)} TO {_q(schema.name)}")
+                self._conn.commit()
+                self._reconciliation_backups.append(backup)
+                audit_log(phase="reconcile_table", status="recreated", details={"table": schema.name, "backup": backup})
+                return "reconciled"
+            except Exception:
+                self._conn.rollback()
+                try:
+                    cur.execute(f"DROP TABLE IF EXISTS {_q(staged)}")
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                raise
+
+    def finalize_schema_reconciliations(self) -> list[str]:
+        removed: list[str] = []
+        with self._conn.cursor() as cur:
+            for backup in self._reconciliation_backups:
+                cur.execute(f"DROP TABLE {_q(backup)}")
+                removed.append(backup)
             self._conn.commit()
-            audit_log(phase="create_table", status="created", details={"table": schema.name})
+        self._reconciliation_backups.clear()
+        return removed
+
+    @staticmethod
+    def _literal(value: str) -> str:
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    def apply_constraints(self, schema: Schema) -> None:
+        """Apply post-load objects; FKs last so referenced tables always exist."""
+        table = _q(schema.name)
+        with self._conn.cursor() as cur:
+            for index in schema.indexes:
+                try:
+                    cur.execute("SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX), NON_UNIQUE FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND INDEX_NAME=%s GROUP BY NON_UNIQUE", (self._config["database"], schema.name, index.name))
+                    existing = cur.fetchone()
+                    if existing is not None:
+                        actual_columns, non_unique = existing
+                        if actual_columns == ",".join(index.columns) and bool(non_unique) == (not index.unique):
+                            audit_log(phase="create_index", status="verified_existing", details={"table": schema.name, "index": index.name})
+                            continue
+                        raise RuntimeError(f"existing index definition differs: {actual_columns}")
+                    unique = "UNIQUE " if index.unique else ""
+                    cur.execute(f"CREATE {unique}INDEX {_q(index.name)} ON {table} ({', '.join(_q(c) for c in index.columns)})")
+                    self._conn.commit()
+                except Exception as exc:
+                    self._conn.rollback()
+                    raise RuntimeError(f"index {index.name}: {exc}") from exc
+            for check in schema.check_constraints:
+                try:
+                    cur.execute("SELECT 1 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND CONSTRAINT_NAME=%s AND CONSTRAINT_TYPE='CHECK'", (self._config["database"], schema.name, check.name))
+                    if cur.fetchone() is not None:
+                        audit_log(phase="create_check", status="verified_existing", details={"table": schema.name, "constraint": check.name})
+                        continue
+                    cur.execute(f"ALTER TABLE {table} ADD CONSTRAINT {_q(check.name)} CHECK ({check.expression})")
+                    self._conn.commit()
+                except Exception as exc:
+                    self._conn.rollback()
+                    raise RuntimeError(f"check {check.name}: {exc}") from exc
+            for fk in schema.foreign_keys:
+                try:
+                    cur.execute("SELECT 1 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND CONSTRAINT_NAME=%s AND CONSTRAINT_TYPE='FOREIGN KEY'", (self._config["database"], schema.name, fk.name))
+                    if cur.fetchone() is not None:
+                        audit_log(phase="create_fk", status="verified_existing", details={"table": schema.name, "constraint": fk.name})
+                        continue
+                    # MySQL's schema value is the source database namespace.
+                    # A database migration maps it to the configured target
+                    # database; retaining it would create cross-database FKs
+                    # back to the source server/database.
+                    ref = _qname(self._config["database"], fk.ref_table)
+                    cur.execute(f"ALTER TABLE {table} ADD CONSTRAINT {_q(fk.name)} FOREIGN KEY ({', '.join(_q(c) for c in fk.columns)}) REFERENCES {ref} ({', '.join(_q(c) for c in fk.ref_columns)}) ON DELETE {fk.on_delete} ON UPDATE {fk.on_update}")
+                    self._conn.commit()
+                except Exception as exc:
+                    self._conn.rollback()
+                    raise RuntimeError(f"foreign key {fk.name}: {exc}") from exc
+
+    def create_view(self, view: ViewDefinition) -> None:
+        definition = _rewrite_view_database_references(
+            view.definition,
+            source_database=view.schema_name,
+            target_database=self._config["database"],
+        )
+        with self._conn.cursor() as cur:
+            cur.execute(f"CREATE OR REPLACE VIEW {_q(view.name)} AS {definition.rstrip().rstrip(';')}")
+            self._conn.commit()
+
+    def create_function(self, func: FunctionDef) -> None:
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(f"DROP {func.kind.upper()} IF EXISTS {_q(func.name)}")
+                cur.execute(func.ddl)
+                self._conn.commit()
+        except Exception as exc:
+            self._conn.rollback()
+            policy_error = _mysql_routine_policy_error(exc, "FUNCTION")
+            if policy_error is not None:
+                raise policy_error from exc
+            raise
+
+    def create_trigger(self, trigger: TriggerDef) -> None:
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute(f"DROP TRIGGER IF EXISTS {_q(trigger.name)}")
+                cur.execute(trigger.ddl)
+                self._conn.commit()
+        except Exception as exc:
+            self._conn.rollback()
+            policy_error = _mysql_routine_policy_error(exc, "TRIGGER")
+            if policy_error is not None:
+                raise policy_error from exc
+            raise
+
+    def suspend_triggers_for_data_load(self, triggers: list[TriggerDef]) -> list[TriggerDef]:
+        """MySQL lacks DISABLE TRIGGER; snapshot/drop only matching triggers.
+
+        The orchestration recreates source definitions after the load. Returning
+        the target definitions provides an audit trail and permits callers to
+        restore them if later trigger application is unavailable.
+        """
+        requested = {trigger.name for trigger in triggers}
+        suspended: list[TriggerDef] = []
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA=%s", (self._config["database"],))
+            for name, table in cur.fetchall():
+                if name not in requested:
+                    continue
+                ddl = self._show_create("TRIGGER", name)
+                cur.execute(f"DROP TRIGGER {_q(name)}")
+                suspended.append(TriggerDef(name=name, table=table, ddl=ddl, schema_name=self._config["database"]))
+            self._conn.commit()
+        if suspended:
+            audit_log(phase="suspend_triggers", status="success", details={"triggers": [t.name for t in suspended]})
+        return suspended
+
+    def clear_objects_for_full_sync(self, objects: list[str]) -> list[str]:
+        """Delete all migrated-table rows for a deterministic MySQL full sync.
+
+        ``TRUNCATE`` is deliberately not used: it is incompatible with tables
+        referenced by foreign keys.  FK checks are disabled only in this target
+        connection while deleting the known migration tables, then restored in
+        a ``finally`` block.  The orchestrator suspends matching triggers first.
+        """
+        tables = [validate_identifier(name, "table") for name in objects]
+        if not tables:
+            return []
+        with self._conn.cursor() as cur:
+            cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+            try:
+                for table in tables:
+                    cur.execute(f"DELETE FROM {_q(table)}")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            finally:
+                cur.execute("SET FOREIGN_KEY_CHECKS = 1")
+                self._conn.commit()
+        audit_log(phase="clear_full_sync", status="success", details={"tables": tables})
+        return tables
+
+    def create_event(self, event: EventDef) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(f"DROP EVENT IF EXISTS {_q(event.name)}")
+            cur.execute(event.ddl)
+            self._conn.commit()
+
+    def sync_auto_increment(self, table: str, column: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(f"SELECT COALESCE(MAX({_q(column)}), 0) + 1 FROM {_q(table)}")
+            next_value = int(cur.fetchone()[0])
+            cur.execute(f"ALTER TABLE {_q(table)} AUTO_INCREMENT = {next_value}")
+            self._conn.commit()
+
+    def apply_comment(self, comment: CommentDef) -> None:
+        # MySQL stores comments in table/column DDL; retain source comments for
+        # existing target objects by applying native ALTER statements.
+        if comment.object_type not in {"TABLE", "COLUMN"}:
+            raise ValueError(f"Unsupported MySQL comment object type: {comment.object_type}")
+
+        try:
+            table_name, column_name = (
+                comment.object_name.rsplit(".", 1)
+                if comment.object_type == "COLUMN"
+                else (comment.object_name, None)
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid MySQL column comment name: {comment.object_name}") from exc
+        validate_identifier(table_name, "table")
+        if column_name is not None:
+            validate_identifier(column_name, "column")
+
+        with self._conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "SELECT TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES "
+                    "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                    (self._config["database"], table_name),
+                )
+                row = cur.fetchone()
+                if row is None or row[0] != "BASE TABLE":
+                    raise RuntimeError(f"Target object is not a BASE TABLE: {table_name}")
+
+                if comment.object_type == "TABLE":
+                    cur.execute(
+                        f"ALTER TABLE {_q(table_name)} "
+                        f"COMMENT = {self._literal(comment.comment)}"
+                    )
+                    self._conn.commit()
+                    return
+
+                cur.execute(
+                    "SELECT COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,"
+                    "GENERATION_EXPRESSION,CHARACTER_SET_NAME,COLLATION_NAME "
+                    "FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND COLUMN_NAME=%s",
+                    (self._config["database"], table_name, column_name),
+                )
+                metadata = cur.fetchone()
+                if metadata is None:
+                    raise RuntimeError(f"Target column not found: {table_name}.{column_name}")
+                (
+                    column_type,
+                    is_nullable,
+                    default,
+                    extra,
+                    generation_expression,
+                    character_set,
+                    collation,
+                ) = metadata
+                extra_text = extra or ""
+                definition = str(column_type)
+                if character_set:
+                    definition += f" CHARACTER SET {_q(str(character_set))}"
+                if collation:
+                    definition += f" COLLATE {_q(str(collation))}"
+                if generation_expression:
+                    generated_kind = "STORED" if "STORED" in extra_text.upper() else "VIRTUAL"
+                    definition += f" GENERATED ALWAYS AS ({generation_expression}) {generated_kind}"
+                    definition += " NULL" if is_nullable == "YES" else " NOT NULL"
+                else:
+                    definition += " NULL" if is_nullable == "YES" else " NOT NULL"
+                    if default is not None:
+                        definition += f" DEFAULT {_default_sql(default, str(column_type))}"
+                    if "AUTO_INCREMENT" in extra_text.upper():
+                        definition += " AUTO_INCREMENT"
+                    on_update = re.search(r"\bon update\s+(.+)$", extra_text, re.IGNORECASE)
+                    if on_update:
+                        definition += f" ON UPDATE {on_update.group(1)}"
+                definition += f" COMMENT {self._literal(comment.comment)}"
+                cur.execute(
+                    f"ALTER TABLE {_q(table_name)} MODIFY COLUMN {_q(column_name)} {definition}"
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def apply_grant(self, grant: GrantDef) -> None:
+        # Grantees are not created by the platform; target permissions decide
+        # whether this direct MySQL statement can be applied.
+        target_database = validate_identifier(self._config["database"], "database")
+        object_name = grant.object_name.rsplit(".", 1)[-1]
+        validate_identifier(object_name, "object")
+        with self._conn.cursor() as cur:
+            object_type = "PROCEDURE" if grant.object_type == "PROCEDURE" else ("FUNCTION" if grant.object_type == "FUNCTION" else "TABLE")
+            try:
+                cur.execute(f"GRANT {grant.privileges} ON {object_type} {_qname(target_database, object_name)} TO {grant.grantee}")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def upsert_batch(self, object_name: str, rows: Iterator[dict[str, Any]], schema: Schema | None = None) -> UpsertResult:
         validate_identifier(object_name, "table")
@@ -196,7 +897,15 @@ class MySQLTargetConnector(TargetConnector):
             return result
 
         with self._conn.cursor() as cur:
-            columns = list(batch[0].keys())
+            generated_columns = {col.name for col in (schema.columns if schema else []) if col.generated}
+            set_columns = {}
+            if self._config.get("source_engine") == "mysql":
+                set_columns = {
+                    col.name: col.source_type
+                    for col in (schema.columns if schema else [])
+                    if col.source_type.strip().lower().startswith("set(")
+                }
+            columns = [column for column in batch[0].keys() if column not in generated_columns]
             col_names = ", ".join(columns)
             placeholders = ", ".join(["%s"] * len(columns))
             update_set = ", ".join(
@@ -211,7 +920,12 @@ class MySQLTargetConnector(TargetConnector):
 
             try:
                 for row in batch:
-                    values = [row.get(col) for col in columns]
+                    values = [
+                        _normalize_mysql_set_value(row.get(col), set_columns[col])
+                        if col in set_columns
+                        else row.get(col)
+                        for col in columns
+                    ]
                     cur.execute(sql, values)
                 self._conn.commit()
                 result.success_count = len(batch)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
-from core.audit_logger import get_run_id
+from core.audit_logger import audit_log, get_run_id
 
 # ---------------------------------------------------------------------------
 # Live dashboard HTML (served at GET /)
@@ -65,6 +66,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     .errors-panel ul { list-style: none; }
     .errors-panel li { font-size: 0.82rem; padding: 0.3rem 0; color: #fca5a5; border-bottom: 1px solid rgba(239,68,68,0.15); }
     .refresh-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--success); margin-right: 0.4rem; animation: pulse 2s infinite; }
+    .object-status-migrated { color: #34d399; font-weight: 700; }
+    .object-status-blocked, .object-status-failed { color: #f87171; font-weight: 700; }
+    .object-status-unsupported { color: #fbbf24; font-weight: 700; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
     footer { text-align: center; color: var(--muted); font-size: 0.78rem; padding: 2rem; margin-top: 1rem; }
   </style>
@@ -117,6 +121,14 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="panel" style="margin-top:1.5rem">
+    <h3>Object Migration Results</h3>
+    <table>
+      <thead><tr><th>Category</th><th>Source</th><th>Migrated</th><th>Blocked</th><th>Unsupported</th><th>Failed</th><th>Status</th></tr></thead>
+      <tbody id="object-migration"></tbody>
+    </table>
+  </div>
+
   <div id="errors-panel" class="errors-panel">
     <h3>⚠ Errors</h3>
     <ul id="error-list"></ul>
@@ -143,7 +155,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       apply_constraints:'Indexes + Constraints', row_level_security:'Row-Level Security',
       advance_sequences:'Advance Sequences', views:'Views',
       materialized_views:'Materialized Views', functions:'Functions & Procedures',
-      triggers:'Triggers', comments:'Comments', grants:'Grants', validation:'Validation'
+      triggers:'Triggers', comments:'Comments', grants:'Grants',
+      partition_testing:'Partition Testing', validation:'Validation'
     }[k] || k;
   }
 
@@ -205,6 +218,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         }).join('');
       }
 
+      const objectBody = document.getElementById('object-migration');
+      const categories = (d.object_migration || {}).categories || {};
+      const categoryEntries = Object.entries(categories);
+      objectBody.innerHTML = categoryEntries.length === 0
+        ? '<tr><td colspan="7" style="color:var(--muted);text-align:center">No object results yet</td></tr>'
+        : categoryEntries.map(([name, row]) => { const status = (row.status || 'UNKNOWN').toLowerCase(); const label = name === 'functions' ? 'FUNCTION' : name === 'triggers' ? 'TRIGGER' : ''; const detail = row.status === 'BLOCKED' && label ? `${label}: BLOCKED<br>Please ask a MySQL administrator to run once:<br><code>SET PERSIST log_bin_trust_function_creators = ON;</code><br>This server configuration persists across MySQL restarts.<br>Then re-run the migration.` : (row.details || []).join('<br>'); return `<tr><td>${name.replaceAll('_', ' ').replace(/\\b\\w/g, c => c.toUpperCase())}</td><td>${fmt(row.source_count || 0)}</td><td>${fmt(row.migrated || 0)}</td><td>${fmt(row.blocked || 0)}</td><td>${fmt(row.unsupported || 0)}</td><td>${fmt(row.failed || 0)}</td><td><span class="object-status-${status}">${row.status || 'UNKNOWN'}</span><br><small>${detail}</small></td></tr>`; }).join('');
+
       // Errors
       const errs = d.errors || [];
       const ep = document.getElementById('errors-panel');
@@ -249,6 +269,7 @@ class StatusHandler(BaseHTTPRequestHandler):
                 "started_at": getattr(srv, "_start_time", None),
                 "elapsed_s": round(elapsed, 1),
                 "table_stats": getattr(srv, "_table_stats", {}),
+                "object_migration": getattr(srv, "_object_migration", {}),
                 "phases_done": getattr(srv, "_phases_done", []),
             }
             body = json.dumps(status).encode("utf-8")
@@ -353,6 +374,10 @@ class StatusHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _StatusHTTPServer(HTTPServer):
+    allow_reuse_address = False
+
+
 # ---------------------------------------------------------------------------
 # StatusServer
 # ---------------------------------------------------------------------------
@@ -362,22 +387,60 @@ class StatusServer:
         self._host = host
         self._port = port
         self._server: HTTPServer | None = None
+        self._serving = False
 
     # ------------------------------------------------------------------ init
     def start(self) -> None:
-        self._server = HTTPServer((self._host, self._port), StatusHandler)
+        try:
+            self._server = _StatusHTTPServer((self._host, self._port), StatusHandler)
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            unavailable = exc.errno in {errno.EACCES, errno.EADDRINUSE} or winerror in {10013, 10048}
+            if unavailable:
+                raise RuntimeError(
+                    f"Status server port {self._port} is unavailable on {self._host}. "
+                    "Stop the process using that port and retry the migration."
+                ) from exc
+            raise
+        else:
+            audit_log(
+                phase="status_server",
+                status="started",
+                details={"requested_port": self._port, "bound_port": self.port, "host": self.bound_host},
+            )
         self._server._current_phase = "idle"
         self._server._progress = 0
         self._server._errors: list[str] = []
         self._server._table_stats: dict[str, dict] = {}
+        self._server._object_migration: dict[str, Any] = {}
         self._server._phases_done: list[str] = []
         self._server._mode = ""
         self._server._start_time = time.time()
         self._server._reports_dir = "reports"   # served at /reports/
 
     def stop(self) -> None:
-        if self._server is not None:
-            self._server.shutdown()
+        if self._server is None:
+            return
+        if self._serving: self._server.shutdown()
+        self._server.server_close()
+        self._server = None
+        self._serving = False
+
+    @property
+    def host(self) -> str:
+        return self._host
+
+    @property
+    def bound_host(self) -> str:
+        if self._server is None:
+            return self._host
+        return str(self._server.server_address[0])
+
+    @property
+    def port(self) -> int:
+        if self._server is None:
+            return self._port
+        return int(self._server.server_address[1])
 
     def set_mode(self, mode: str) -> None:
         if self._server is not None:
@@ -408,8 +471,15 @@ class StatusServer:
             "failure": failure,
         }
 
+    def record_object_migration(self, result: dict[str, Any]) -> None:
+        if self._server is not None:
+            self._server._object_migration = result
+
     # -------------------------------------------------------------- blocking run
     def run(self) -> None:
         if self._server is None:
             self.start()
-        self._server.serve_forever()
+        self._serving = True
+        try: self._server.serve_forever()
+        except BaseException: self._serving = False; raise
+        self._serving = False
