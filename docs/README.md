@@ -11,7 +11,12 @@ This directory contains project documentation organized by topic.
 | [USER_GUIDE.md](USER_GUIDE.md) | Complete user guide: install, config reference, CLI, troubleshooting |
 | [PHASE_0.md](PHASE_0.md) | Phase 0 stabilization: cross-engine type safety, error isolation, WAL safety |
 | [postgresql/README.md](postgresql/README.md) | PostgreSQL documentation entry point |
+| [mssql/README.md](mssql/README.md) | MSSQL documentation entry point |
 | [postgresql/POSTGRESQL_LOCAL_AUDIT_PHASE_1.md](postgresql/POSTGRESQL_LOCAL_AUDIT_PHASE_1.md) | Final PostgreSQL local audit report |
 | [postgresql/POSTGRESQL_OBJECT_SUPPORT_MATRIX.md](postgresql/POSTGRESQL_OBJECT_SUPPORT_MATRIX.md) | PostgreSQL object migration support matrix |
 | [postgresql/POSTGRESQL_TEST_GUIDE.md](postgresql/POSTGRESQL_TEST_GUIDE.md) | PostgreSQL E2E test guide with exact commands |
 | [postgresql/POSTGRESQL_LIMITATIONS.md](postgresql/POSTGRESQL_LIMITATIONS.md) | Current PostgreSQL migration limitations |
+| [mssql/MSSQL_LOCAL_AUDIT.md](mssql/MSSQL_LOCAL_AUDIT.md) | MSSQL Local→Local final audit report |
+| [mssql/MSSQL_OBJECT_SUPPORT_MATRIX.md](mssql/MSSQL_OBJECT_SUPPORT_MATRIX.md) | MSSQL object migration support matrix |
+| [mssql/MSSQL_TEST_GUIDE.md](mssql/MSSQL_TEST_GUIDE.md) | MSSQL E2E test guide with exact commands |
+| [mssql/MSSQL_LIMITATIONS.md](mssql/MSSQL_LIMITATIONS.md) | Current MSSQL migration limitations |
