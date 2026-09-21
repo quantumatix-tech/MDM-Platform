@@ -69,8 +69,8 @@ Three complete E2E migration directions are tracked:
 | Direction | Description | Config |
 |---|---|---|
 | **Local → Local** | Local MSSQL → local MSSQL | `config/mssql_local_test.yaml` |
-| **Local → Cloud** | Local MSSQL → Azure SQL | `config/mssql_local_cloud.yaml` (to be created) |
-| **Cloud → Local** | Azure SQL → local MSSQL | `config/mssql_cloud_to_local.yaml` (to be created) |
+| **Local → Cloud** | Local MSSQL → Azure SQL | `config/mssql_local_cloud.yaml` |
+| **Cloud → Local** | Azure SQL → local MSSQL | `config/mssql_cloud_local_e2e.yaml` |
 
 ### A. Local → Local — COMPLETED
 
@@ -233,7 +233,7 @@ Config: `config/mssql_local_cloud.yaml`
 **Metadata validation tests:** 54/54 passed.
 **Existing MSSQL DDL tests:** 129/129 passed (1 pre-existing unrelated failure: `test_cross_engine_type_safety`).
 
-Config: `config/mssql_local_cloud.yaml`
+Config: `config/mssql_cloud_local_e2e.yaml`
 
 ---
 

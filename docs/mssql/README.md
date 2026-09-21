@@ -19,11 +19,13 @@ MSSQL-specific documentation for the Migration Platform.
 |---|---|
 | **Local → Local** | COMPLETED — See [MSSQL_LOCAL_AUDIT.md](MSSQL_LOCAL_AUDIT.md) |
 | **Local → Cloud** | COMPLETED — See [MSSQL_CLOUD_AUDIT.md](MSSQL_CLOUD_AUDIT.md) |
-| **Cloud → Local** | NOT YET VALIDATED |
+| **Cloud → Local** | COMPLETED / VALIDATED — See [MSSQL_CLOUD_AUDIT.md](MSSQL_CLOUD_AUDIT.md) |
 
 ## Quick links
 
 - Local E2E config: `config/mssql_local_test.yaml`
+- Local → Cloud config: `config/mssql_local_cloud.yaml`
+- Cloud → Local E2E config: `config/mssql_cloud_local_e2e.yaml`
 - MSSQL connector: `core/connectors/mssql.py`
 
 ## Running a local E2E test (Local → Local)
@@ -42,7 +44,7 @@ python -m migration_platform --config config/mssql_local_test.yaml --mode full -
 ## Running other E2E directions
 
 - **Local → Cloud**: Configure `config/mssql_local_cloud.yaml` with Azure SQL target details. Set `SECRET_mssql_source_pass` and `SECRET_mssql_target_pass`. Results will be recorded in `MSSQL_CLOUD_AUDIT.md` upon completion.
-- **Cloud → Local**: Configure `config/mssql_cloud_to_local.yaml` with Azure SQL source and local target details. Results will be recorded in `MSSQL_CLOUD_TO_LOCAL_AUDIT.md` upon completion.
+- **Cloud → Local**: Use `config/mssql_cloud_local_e2e.yaml` (fresh E2E) or `config/mssql_cloud_local.yaml` (reusable) with Azure SQL source and local target details. Results are recorded in `MSSQL_CLOUD_AUDIT.md`.
 
 ## Reference
 
