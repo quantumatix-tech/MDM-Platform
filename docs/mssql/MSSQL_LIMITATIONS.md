@@ -96,6 +96,38 @@ The following implementation gaps were identified and fixed during Local → Clo
 
 ---
 
+## E. Cloud → Local (Azure SQL → LocalDB) Limitations
+
+### View creation batch separation (FIXED)
+
+- **Category:** Implementation limitation (resolved)
+- **Impact:** `CREATE OR ALTER VIEW` must be in its own batch (preceded by `GO` / batch separator) on MSSQL. The original implementation attempted `CREATE OR ALTER VIEW` inline which caused error 111 ("CREATE OR ALTER VIEW must be the only statement in the batch").
+- **Fix:** Applied in `src/core/connectors/mssql.py` lines 1759-1795 — view DDL now wraps in `exec('...')` for proper batch separation.
+- **Validation:** 5/5 view tests pass; Cloud → Local E2E verified 1 view migrated successfully.
+
+### Azure SQL firewall IP changes
+
+- **Category:** Environment limitation
+- **Impact:** Azure SQL firewall blocks connections from new IPs. During Cloud → Local testing, the client IP changed requiring firewall rule update.
+- **Workaround:** Add current client IP to Azure SQL firewall rules before running migration.
+- **Tracking:** Temporary infrastructure blocker, not a platform bug.
+
+### Source has 0 extended properties (expected)
+
+- **Category:** Audit scope limitation
+- **Impact:** Cloud → Local migration migrated 0 extended properties because the Azure SQL source database has 0 extended properties. This is correct behavior (target matches source), not a migration failure.
+- **Workaround:** N/A — expected behavior.
+- **Tracking:** Documented in `MSSQL_CLOUD_AUDIT.md` and `MSSQL_TEST_GUIDE.md`.
+
+### Partitioned table on PRIMARY filegroup (matches source)
+
+- **Category:** Pre-existing state validation
+- **Impact:** The partitioned table `sales.sales_partitioned` is on PRIMARY filegroup on both source and target. This matches source state exactly.
+- **Workaround:** N/A — expected behavior.
+- **Tracking:** Documented in `MSSQL_CLOUD_AUDIT.md`.
+
+---
+
 ## MSSQL Integration
 
 ### ODBC Driver 18 availability

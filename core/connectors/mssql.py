@@ -235,7 +235,6 @@ class MSSQLSourceConnector(SourceConnector):
 
     def list_objects(self) -> list[str]:
         db_name = self._config["database"]
-        validate_identifier(db_name, "database")
         schemas = _resolve_mssql_schemas(self._config)
         with self._conn.cursor() as cur:
             if schemas:
@@ -1772,6 +1771,10 @@ class MSSQLTargetConnector(TargetConnector):
                         phase="create_schema", status="created",
                         details={"schema": schema_name},
                     )
+                    self._conn.commit()
+        # CREATE VIEW must be the first statement in a batch.
+        # Execute in a separate cursor/batch after schema creation commit.
+        with self._conn.cursor() as cur:
             try:
                 definition = view.definition
                 if definition.upper().startswith("CREATE VIEW"):

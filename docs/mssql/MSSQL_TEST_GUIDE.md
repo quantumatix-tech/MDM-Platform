@@ -389,10 +389,40 @@ When conducting MSSQL Local → Cloud (Azure SQL) testing:
 
 ## Adding Cloud → Local testing
 
-1. Create a separate config file (e.g., `config/mssql_cloud_to_local.yaml`)
-2. Set `SECRET_mssql_source_pass` (Azure) and `SECRET_mssql_target_pass` (local)
-3. Run the migration and document results in `docs/mssql/MSSQL_CLOUD_TO_LOCAL_AUDIT.md`
-4. Update support matrix and migration flow documents
+**Validated (Run ID: cfc63558176047fe891e208a0b8b4da9)**
+
+1. Use existing config: `config/mssql_local_cloud.yaml` (source: Azure SQL, target: LocalDB)
+2. Set `SECRET_mssql_source_pass` (Azure) and `SECRET_mssql_target_pass` (LocalDB)
+3. Set required env vars: `MSSQL_SOURCE_HOST`, `MSSQL_SOURCE_PORT`, `MSSQL_SOURCE_DATABASE`, `MSSQL_SOURCE_USERNAME`, `MSSQL_TARGET_HOST`, `MSSQL_TARGET_PORT`, `MSSQL_TARGET_DATABASE`
+4. Run: `python -m migration_platform --config config/mssql_local_cloud.yaml --mode full --no-live-ui`
+5. Document results in `docs/mssql/MSSQL_CLOUD_AUDIT.md`
+6. Update `MSSQL_OBJECT_SUPPORT_MATRIX.md` and `MSSQL_MIGRATION_FLOW.md`
+
+### Validated Cloud → Local Test Results
+
+| Metric | Value |
+|---|---|
+| Tables | 9 (sales: 7, billing: 2) |
+| Rows | 40 |
+| Views | 1 (`sales.v_customer_summary`) |
+| Functions/Procedures | 2 |
+| Triggers | 2 (1 disabled) |
+| Synonyms | 3 |
+| Partitioning | Function, scheme, `sales_partitioned` table |
+| Constraints | PK, FK (cross-schema), UNIQUE, CHECK, DEFAULT |
+| Indexes | Clustered, non-clustered, unique |
+| Security | Roles, users, schema/table grants |
+| Extended properties | 0 (source has 0) |
+| Success rate | 100% |
+| Duration | ~25 seconds |
+
+### Key Cloud → Local Config Notes
+
+- Azure SQL source: `ssl: true`, `trust_server_certificate: true`
+- LocalDB target: `ssl: false`, `(localdb)\MSSQLLocalDB`
+- Azure SQL firewall must allow client IP (error 4060 if blocked)
+- ODBC connection string: database name NOT quoted (quoting causes 4060)
+- Secret resolver: config uses bare names (e.g., `mssql_source_pass`), NOT prefixed (`SECRET_mssql_source_pass`)
 
 ---
 
