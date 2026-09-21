@@ -29,4 +29,5 @@ class PartitionedTableDef:
     schema_name: str = "dbo"
     index_name: str | None = None
     partition_function_name: str = ""
+    partition_scheme_name: str = ""
     partition_column: str = ""

@@ -115,21 +115,71 @@ Full evidence in `MSSQL_LOCAL_AUDIT.md`.
 **Metadata validation tests:** 54/54 passed.
 **Existing MSSQL DDL tests:** 108/108 passed.
 
-### B. Local → Cloud — NOT YET VALIDATED
+### B. Local → Cloud — COMPLETED / VALIDATED
 
-> **This direction has not been executed or validated yet.**
->
-> Planned: Local MSSQL → Azure SQL Database / Azure SQL Managed Instance.
->
-> When completed, populate this section with:
-> - Run ID
-> - Environment details (source version, Azure SQL tier/version)
-> - Tables migrated, rows migrated, failed objects
-> - Objects verified (roles, grants, SSL, Azure-specific considerations)
-> - Implementation fixes required during testing
-> - Full evidence file: `MSSQL_CLOUD_AUDIT.md`
+**Status:** COMPLETED / VALIDATED
 
-Config placeholder: `config/mssql_local_cloud.yaml`
+**Verified results:**
+
+- **Run ID (normal E2E):** `8ce7abd3a0b449d78d71bdec56e272ba`
+- **Run ID (dedicated verification E2E):** `fbdf961ad9d84e4fb8c8624b3dbf2055`
+- **Engine:** Microsoft SQL Server
+- **Source:** `localhost,1533` / `mssql_migration_test` (MSSQL Local)
+- **Target:** `mssql-mig-test-01.database.windows.net` / `mssql-migration-cloud` (Azure SQL Database)
+- **Schemas:** `sales`, `billing`
+- **Migration mode:** `full`
+- **Tables migrated:** 9
+- **Rows migrated:** 28
+- **Failed:** 0
+- **Success rate:** 100%
+- **Duration:** 146s (normal E2E) / 58s (verification E2E)
+
+**Objects verified in normal E2E:**
+
+- Schemas (`sales`, `billing`)
+- Tables with data (9 tables across 2 schemas)
+- Primary keys, foreign keys (including cross-schema `billing.customer_addresses → sales.customers`)
+- Identity columns
+- Computed columns
+- Indexes
+- Views (1/1 validated)
+- Functions / Procedures (2/2 validated)
+- Sequences (1/1 validated)
+- Triggers (2/2 validated, one disabled)
+- Synonyms (3/3 validated)
+- UDTs (1/1 validated)
+- Partition function / scheme (1/1 validated)
+- Users / Roles / Permissions
+- Comments / Extended Properties
+
+**Dedicated verification E2E (unique schema `sales_e2e_verify`):**
+
+This verification used uniquely named objects to prove categories not conclusively proven by the normal E2E (due to pre-existing target state):
+
+| Category | Object | Verification |
+|---|---|---|
+| **Sequence** | `seq_test_verification` | START 5000, INCREMENT 10, MIN 1000, MAX 1000000, NO CYCLE, CACHE 20. `NEXT VALUE FOR` works: 5000 → 5010 |
+| **Function** | `fn_test_verify` | Definition matches; `fn_test_verify(10)` = 120 |
+| **Procedure** | `sp_test_verify` | Definition matches; execution succeeds |
+| **Partitioning** | `pf_verify_date`, `ps_verify_date`, `partitioned_verify_table` | RANGE RIGHT boundaries (2024-01-01, 2024-07-01, 2025-01-01). Table ON `ps_verify_date(event_date)` — **proves Step 16 fresh-target fix works** |
+| **Extended Properties** | Table, column, function, procedure | 4/5 migrated. Sequence EP failed (Azure SQL limitation) |
+
+**Dependency ordering tests:** 13/13 passed (including Step 16 fix regression tests).
+**Cross-schema / reference tests:** 6/6 passed.
+**Error isolation tests:** 9/9 passed.
+**Metadata validation tests:** 54/54 passed.
+**Existing MSSQL DDL tests:** 129/129 passed (1 pre-existing unrelated failure: `test_cross_engine_type_safety`).
+
+**Implementation fixes required during Local→Cloud testing:**
+
+1. **Step 16 fix (fresh-target partitioned table orchestration):** Partitioned tables were incorrectly created in Phase 4 as regular tables, then skipped in Phase 4.5. Fixed by excluding partitioned tables from `create_tables` phase.
+2. **Step 17 fix (cross-schema trigger parent-table schema):** Added `table_schema` to `TriggerDef`, updated source query to capture `OBJECT_SCHEMA_NAME(p.object_id)`, updated target ALTER TABLE to use schema-qualified parent table.
+3. **Step 18 fix (error isolation + rollback/audit):** Added try/except/rollback/audit_log to 7 MSSQL connector methods (`create_sequence`, `create_partition_function`, `create_partition_scheme`, `create_partitioned_table`, `create_role_if_not_exists`, `create_user_if_not_exists`, `create_role_membership`) with regression tests.
+4. **Partition scheme reference fix:** Modified `create_partitioned_table` to use partition scheme name (not partition function name) in `ON` clause, and updated orchestrator to pass `partition_scheme_name` from `PartitionedTableDef`.
+
+Full evidence in `MSSQL_CLOUD_AUDIT.md`.
+
+Config: `config/mssql_local_cloud.yaml`
 
 ### C. Cloud → Local — NOT YET VALIDATED
 

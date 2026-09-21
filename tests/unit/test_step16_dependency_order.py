@@ -25,6 +25,7 @@ from core.connectors.base import (
     UserDef,
     RoleMembershipDef,
 )
+from core.connectors.mssql import PartitionedTableDef
 from core.orchestrator import MigrationOrchestrator
 
 
@@ -75,6 +76,106 @@ def _orchestrator_for_order_test():
         {"migration": {"stop_on_error": False}},
     )
     return orchestrator, source, target
+
+
+def _orchestrator_with_partitioned_table():
+    """Create orchestrator with a partitioned table."""
+    source = MagicMock()  # No spec to allow get_partitioned_tables
+    target = MagicMock()  # No spec to allow create_partitioned_table
+
+    # Regular table and partitioned table
+    objects = ["regular_table", "partitioned_table"]
+    schemas_map = {
+        "regular_table": _schema("regular_table"),
+        "partitioned_table": _schema("partitioned_table"),
+    }
+
+    source.list_objects.return_value = objects
+    source.get_schema.side_effect = lambda name, **kw: schemas_map[name]
+    source.get_object_count.return_value = 1
+    source.export_full.side_effect = lambda name, **kw: iter([{"id": 1}])
+    source.list_extensions.return_value = []
+    source.list_schemas.return_value = [MagicMock(name="dbo")]
+    source.list_types.return_value = []
+    del source.list_all_sequences
+    del source.list_partitions
+    source.list_views.return_value = []
+    source.list_materialized_views.return_value = []
+    source.list_functions.return_value = []
+    source.list_synonyms.return_value = []
+    source.get_all_triggers.return_value = []
+    source.list_comments.return_value = []
+    source.list_roles.return_value = []
+    source.list_users.return_value = []
+    source.list_role_memberships.return_value = []
+    source.list_grants.return_value = []
+
+    # Partitioned table metadata - returned by get_partitioned_tables()
+    pt_def = PartitionedTableDef(
+        table_name="partitioned_table",
+        schema_name="dbo",
+        index_name="idx_partitioned_table",
+        partition_function_name="pf_date",
+        partition_scheme_name="ps_date",
+        partition_column="created_date",
+    )
+    source.get_partitioned_tables.return_value = [pt_def]
+
+    # Partition function/scheme creation
+    source.list_partition_functions.return_value = [
+        MagicMock(name="pf_date", schema_name="dbo", data_type="datetime2", boundaries=[], range_desc="RANGE RIGHT")
+    ]
+    source.list_partition_schemes.return_value = [
+        MagicMock(name="ps_date", schema_name="dbo", partition_function_name="pf_date", filegroups=["PRIMARY"])
+    ]
+
+    target.get_object_count.return_value = 1
+    target.upsert_batch.return_value = UpsertResult(success_count=1)
+
+    orchestrator = MigrationOrchestrator(
+        source,
+        target,
+        {"migration": {"stop_on_error": False}},
+    )
+    return orchestrator, source, target
+
+
+def test_partitioned_table_excluded_from_create_tables_phase():
+    """
+    Partitioned tables should NOT be created in Phase 4 (create_tables).
+    They should be created in Phase 4.5 (create_partitions) via create_partitioned_table.
+    """
+    orchestrator, source, target = _orchestrator_with_partitioned_table()
+
+    result = orchestrator.run_full()
+
+    # Verify create_object_if_missing was NOT called for partitioned_table
+    create_calls = [call.args[0].name for call in target.create_object_if_missing.call_args_list]
+    assert "regular_table" in create_calls, "Regular table should be created in create_tables phase"
+    assert "partitioned_table" not in create_calls, "Partitioned table should NOT be created in create_tables phase"
+
+    # Verify create_partitioned_table WAS called for partitioned_table
+    partitioned_calls = [call.args[0].name for call in target.create_partitioned_table.call_args_list]
+    assert "partitioned_table" in partitioned_calls, "Partitioned table should be created in create_partitions phase"
+
+
+def test_partitioned_table_excluded_from_create_tables_incremental():
+    """
+    Partitioned tables should NOT be created in Phase 4 (create_tables) for run_cdc.
+    They should be created in Phase 4.5 (create_partitions) via create_partitioned_table.
+    """
+    orchestrator, source, target = _orchestrator_with_partitioned_table()
+
+    result = orchestrator.run_cdc(max_iterations=1)
+
+    # Verify create_object_if_missing was NOT called for partitioned_table
+    create_calls = [call.args[0].name for call in target.create_object_if_missing.call_args_list]
+    assert "regular_table" in create_calls, "Regular table should be created in create_tables phase"
+    assert "partitioned_table" not in create_calls, "Partitioned table should NOT be created in create_tables phase"
+
+    # Verify create_partitioned_table WAS called for partitioned_table
+    partitioned_calls = [call.args[0].name for call in target.create_partitioned_table.call_args_list]
+    assert "partitioned_table" in partitioned_calls, "Partitioned table should be created in create_partitions phase"
 
 
 def test_phase_order_schemas_before_tables():

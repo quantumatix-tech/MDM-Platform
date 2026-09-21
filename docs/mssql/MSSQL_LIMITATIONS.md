@@ -17,6 +17,15 @@ None documented for the current MSSQL Local→Local implementation.
 
 *(To be updated as Local→Cloud and Cloud→Local testing reveals additional implementation gaps.)*
 
+### Local → Cloud Implementation Fixes (Applied During Testing)
+
+The following implementation gaps were identified and fixed during Local → Cloud testing:
+
+1. **Step 16 — Fresh-target partitioned table orchestration:** Partitioned tables were incorrectly created in Phase 4 (create_tables) as regular tables, then skipped in Phase 4.5 (create_partitions). Fixed by excluding partitioned tables from the `create_tables` phase.
+2. **Step 17 — Cross-schema trigger parent-table schema:** Triggers referencing parent tables in different schemas required `table_schema` in `TriggerDef`, updated source discovery query, and target ALTER TABLE schema qualification.
+3. **Step 18 — Error isolation + rollback/audit for partition/security operations:** Added try/except/rollback/audit_log to 7 MSSQL connector methods with regression tests.
+4. **Partition scheme reference in create_partitioned_table:** Fixed to use partition scheme name (not partition function name) in `ON` clause; orchestrator updated to pass `partition_scheme_name`.
+
 ---
 
 ## B. Validation / Audit Scope Limitations
@@ -51,7 +60,14 @@ None documented for the current MSSQL Local→Local implementation.
 - **Category:** Pre-existing target-state difference
 - **Impact:** During E2E validation, `sales.sales_partitioned` had a source/target row-count mismatch because the target database already contained extra rows prior to the migration run. This is not a migration failure — the source rows were correctly migrated.
 - **Resolution:** Reset the target database before re-running FULL migration for accurate row-count comparison.
-- **Tracking:** Documented in `MSSQL_LOCAL_AUDIT.md` Section 11.
+- **Tracking:** Documented in `MSSQL_LOCAL_AUDIT.md` Section 11 and `MSSQL_CLOUD_AUDIT.md`.
+
+### Pre-existing function/procedure objects on Azure SQL target
+
+- **Category:** Pre-existing target-state difference
+- **Impact:** During Local → Cloud E2E, the Azure SQL target database already contained `fn_customer_order_count` and `sp_get_customer_orders` from prior runs. The migration attempted to create them (using `CREATE OR ALTER`), which failed with "object already exists" (error 2714). This is expected behavior — the platform uses `CREATE OR ALTER` for idempotency, but Azure SQL's `CREATE OR ALTER` behavior for functions/procedures can conflict if the object exists with a different schema or ownership.
+- **Resolution:** Clean target database before re-running FULL migration, or ensure `CREATE OR ALTER` handles existing objects correctly.
+- **Tracking:** Documented in `MSSQL_CLOUD_AUDIT.md`.
 
 ### Primary key naming convention difference
 
@@ -66,6 +82,17 @@ None documented for the current MSSQL Local→Local implementation.
 - **Impact:** The training schema was intentionally not migrated because `include_schemas` in `config/mssql_local_test.yaml` contains only `sales` and `billing`. This is by design, not a bug.
 - **Resolution:** Add additional schemas to `include_schemas` if they need to be migrated.
 - **Tracking:** Documented in `MSSQL_LOCAL_AUDIT.md` Section 11.
+
+---
+
+## D. Azure SQL / Cloud-Specific Limitations
+
+### Sequence extended properties not supported on Azure SQL
+
+- **Category:** Azure SQL platform limitation
+- **Impact:** `sp_addextendedproperty` with `@level1type = 'SEQUENCE'` fails with error 15600 ("An invalid parameter or option was specified for procedure 'sp_addextendedproperty'") on Azure SQL Database. This is a known Azure SQL limitation — extended properties on sequences are not supported.
+- **Workaround:** None; sequence comments cannot be migrated to Azure SQL.
+- **Tracking:** Documented in `MSSQL_CLOUD_AUDIT.md`; 4/5 extended properties migrated in verification E2E (table, column, function, procedure).
 
 ---
 

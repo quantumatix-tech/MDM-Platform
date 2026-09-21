@@ -28,6 +28,8 @@ from core.connectors.base import (
     TriggerDef,
     validate_identifier,
     quote_identifier,
+    CheckConstraint,
+    DefaultConstraint,
 )
 from core.driver_installer import ensure_driver
 from core.retry import retry_with_backoff
@@ -74,6 +76,7 @@ class PartitionedTableDef:
     schema_name: str = "dbo"
     index_name: str | None = None
     partition_function_name: str = ""
+    partition_scheme_name: str = ""
     partition_column: str = ""
 
 
@@ -489,6 +492,35 @@ class MSSQLSourceConnector(SourceConnector):
                 fk_map[fk_name].ref_columns.append(ref_col)
             foreign_keys = list(fk_map.values())
 
+            # --- CHECK Constraints ---
+            cur.execute(
+                "SELECT cc.name, cc.definition "
+                "FROM sys.check_constraints cc "
+                "JOIN sys.tables t ON cc.parent_object_id = t.object_id "
+                "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                "WHERE t.name = ? AND s.name = ? AND cc.is_disabled = 0 "
+                "ORDER BY cc.name",
+                (object_name, schema_name),
+            )
+            check_constraints = [
+                CheckConstraint(name=r[0], expression=r[1]) for r in cur.fetchall()
+            ]
+
+            # --- DEFAULT Constraints ---
+            cur.execute(
+                "SELECT dc.name, COL_NAME(dc.parent_object_id, dc.parent_column_id), dc.definition "
+                "FROM sys.default_constraints dc "
+                "JOIN sys.tables t ON dc.parent_object_id = t.object_id "
+                "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                "WHERE t.name = ? AND s.name = ? "
+                "ORDER BY dc.name",
+                (object_name, schema_name),
+            )
+            default_constraints = [
+                DefaultConstraint(name=r[0], column=r[1], definition=r[2])
+                for r in cur.fetchall()
+            ]
+
         return Schema(
             name=object_name,
             schema_name=schema_name,
@@ -496,6 +528,8 @@ class MSSQLSourceConnector(SourceConnector):
             primary_key=primary_key,
             indexes=indexes,
             foreign_keys=foreign_keys,
+            check_constraints=check_constraints,
+            default_constraints=default_constraints,
         )
 
     def list_views(self) -> list["ViewDefinition"]:
@@ -1054,6 +1088,7 @@ class MSSQLSourceConnector(SourceConnector):
                     "SELECT t.name, s.name AS schema_name, "
                     "i.name AS index_name, "
                     "pf.name AS pf_name, "
+                    "ps.name AS ps_name, "
                     "c.name AS partition_column "
                     "FROM sys.tables t "
                     "JOIN sys.schemas s ON t.schema_id = s.schema_id "
@@ -1075,6 +1110,7 @@ class MSSQLSourceConnector(SourceConnector):
                     "SELECT t.name, s.name AS schema_name, "
                     "i.name AS index_name, "
                     "pf.name AS pf_name, "
+                    "ps.name AS ps_name, "
                     "c.name AS partition_column "
                     "FROM sys.tables t "
                     "JOIN sys.schemas s ON t.schema_id = s.schema_id "
@@ -1091,12 +1127,13 @@ class MSSQLSourceConnector(SourceConnector):
                     "ORDER BY t.name, i.name"
                 )
             for row in cur.fetchall():
-                table_name, schema_name, index_name, pf_name, partition_column = row
+                table_name, schema_name, index_name, pf_name, ps_name, partition_column = row
                 results.append(PartitionedTableDef(
                     table_name=table_name,
                     schema_name=schema_name,
                     index_name=index_name,
                     partition_function_name=pf_name,
+                    partition_scheme_name=ps_name,
                     partition_column=partition_column,
                 ))
         return results
@@ -1216,7 +1253,7 @@ class MSSQLSourceConnector(SourceConnector):
                 placeholders = ", ".join("?" for _ in schemas)
                 cur.execute(
                     "SELECT OBJECT_SCHEMA_NAME(t.object_id), "
-                    "t.name, p.name, "
+                    "t.name, OBJECT_SCHEMA_NAME(p.object_id), p.name, "
                     "CAST(m.definition AS NVARCHAR(MAX)) AS definition, "
                     "t.is_disabled "
                     "FROM sys.triggers t "
@@ -1230,7 +1267,7 @@ class MSSQLSourceConnector(SourceConnector):
             else:
                 cur.execute(
                     "SELECT OBJECT_SCHEMA_NAME(t.object_id), "
-                    "t.name, p.name, "
+                    "t.name, OBJECT_SCHEMA_NAME(p.object_id), p.name, "
                     "CAST(m.definition AS NVARCHAR(MAX)) AS definition, "
                     "t.is_disabled "
                     "FROM sys.triggers t "
@@ -1241,7 +1278,7 @@ class MSSQLSourceConnector(SourceConnector):
                     "AND t.type = 'TR' "
                     "ORDER BY OBJECT_SCHEMA_NAME(t.object_id), p.name, t.name",
                 )
-            for schema_name, trig_name, table_name, definition, is_disabled in cur.fetchall():
+            for schema_name, trig_name, table_schema, table_name, definition, is_disabled in cur.fetchall():
                 validate_identifier(trig_name, "trigger")
                 validate_identifier(schema_name, "schema")
                 results.append(
@@ -1249,6 +1286,7 @@ class MSSQLSourceConnector(SourceConnector):
                         name=trig_name,
                         table=table_name,
                         schema_name=schema_name,
+                        table_schema=table_schema or schema_name,
                         ddl=definition,
                         is_disabled=bool(is_disabled),
                     )
@@ -1282,13 +1320,10 @@ class MSSQLTargetConnector(TargetConnector):
 
     def ensure_database_exists(self) -> None:
         db_name = self._config["database"]
-        validate_identifier(db_name, "database")
         with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT name FROM sys.databases WHERE name = ?", (db_name,)
-            )
+            cur.execute("SELECT name FROM sys.databases WHERE name = ?", (db_name,))
             if cur.fetchone() is None:
-                cur.execute(f"CREATE DATABASE {db_name}")
+                cur.execute(f"CREATE DATABASE {quote_identifier(db_name)}")
                 audit_log(phase="ensure_database", status="created", details={"database": db_name})
 
     def create_sequence(self, seq: "SequenceDef") -> None:
@@ -1335,13 +1370,21 @@ class MSSQLTargetConnector(TargetConnector):
                 f"{cycle_clause} "
                 f"{cache_clause}"
             )
-            cur.execute(ddl)
-            self._conn.commit()
-            audit_log(
-                phase="create_sequence",
-                status="created",
-                details={"sequence": seq_qname, "owned_by": seq.owned_by},
-            )
+            try:
+                cur.execute(ddl)
+                self._conn.commit()
+                audit_log(
+                    phase="create_sequence",
+                    status="created",
+                    details={"sequence": seq_qname, "owned_by": seq.owned_by},
+                )
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(
+                    phase="create_sequence", status="failed",
+                    details={"sequence": seq_qname, "reason": str(exc)},
+                )
+                raise
 
     def create_type(self, type_def: "TypeDef") -> None:
         """Create a user-defined (alias) data type on the target.
@@ -1642,6 +1685,78 @@ class MSSQLTargetConnector(TargetConnector):
                         details={"fk": fk.name, "reason": str(exc)},
                     )
 
+            # --- CHECK Constraints (idempotent) ---
+            existing_checks = set()
+            try:
+                cur.execute(
+                    "SELECT name FROM sys.check_constraints "
+                    "WHERE parent_object_id = OBJECT_ID(?)",
+                    (table_qname,),
+                )
+                existing_checks = {row[0] for row in cur.fetchall()}
+            except Exception:
+                pass
+            for chk in schema.check_constraints:
+                if chk.name in existing_checks:
+                    audit_log(
+                        phase="create_check", status="skipped",
+                        details={"check": chk.name, "reason": "already exists"},
+                    )
+                    continue
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {table_qname} "
+                        f"ADD CONSTRAINT {quote_identifier(chk.name)} "
+                        f"CHECK {chk.expression}"
+                    )
+                    self._conn.commit()
+                    audit_log(
+                        phase="create_check", status="created",
+                        details={"table": schema.name, "check": chk.name},
+                    )
+                except Exception as exc:
+                    self._conn.rollback()
+                    audit_log(
+                        phase="create_check", status="skipped",
+                        details={"check": chk.name, "reason": str(exc)},
+                    )
+
+            # --- DEFAULT Constraints (idempotent) ---
+            existing_defaults = set()
+            try:
+                cur.execute(
+                    "SELECT name FROM sys.default_constraints "
+                    "WHERE parent_object_id = OBJECT_ID(?)",
+                    (table_qname,),
+                )
+                existing_defaults = {row[0] for row in cur.fetchall()}
+            except Exception:
+                pass
+            for dfl in schema.default_constraints:
+                if dfl.name in existing_defaults:
+                    audit_log(
+                        phase="create_default", status="skipped",
+                        details={"default": dfl.name, "reason": "already exists"},
+                    )
+                    continue
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {table_qname} "
+                        f"ADD CONSTRAINT {quote_identifier(dfl.name)} "
+                        f"DEFAULT {dfl.definition} FOR {quote_identifier(dfl.column)}"
+                    )
+                    self._conn.commit()
+                    audit_log(
+                        phase="create_default", status="created",
+                        details={"table": schema.name, "default": dfl.name},
+                    )
+                except Exception as exc:
+                    self._conn.rollback()
+                    audit_log(
+                        phase="create_default", status="skipped",
+                        details={"default": dfl.name, "reason": str(exc)},
+                    )
+
     def create_view(self, view: ViewDefinition) -> None:
         validate_identifier(view.name, "view")
         schema_name = view.schema_name or "dbo"
@@ -1660,7 +1775,10 @@ class MSSQLTargetConnector(TargetConnector):
             try:
                 definition = view.definition
                 if definition.upper().startswith("CREATE VIEW"):
-                    definition = definition[len("CREATE VIEW") :].lstrip()
+                    definition = definition[len("CREATE VIEW"):].lstrip()
+                    as_idx = definition.upper().find(" AS ")
+                    if as_idx >= 0:
+                        definition = definition[as_idx + 4:].lstrip()
                 cur.execute(
                     f"CREATE OR ALTER VIEW {view_qname} AS {definition}"
                 )
@@ -1724,12 +1842,15 @@ class MSSQLTargetConnector(TargetConnector):
         The enabled/disabled state is re-applied after creation so the target
         matches the source regardless of whether ``CREATE OR ALTER`` preserved
         a pre-existing state.
+
+        Supports cross-schema triggers via trigger.table_schema.
         """
         validate_identifier(trigger.name, "trigger")
         schema_name = trigger.schema_name or "dbo"
         validate_identifier(schema_name, "schema")
         trigger_qname = f"[{schema_name}].[{trigger.name}]"
-        table_qname = _qualify(schema_name, trigger.table)
+        table_schema = trigger.table_schema or schema_name
+        table_qname = _qualify(table_schema, trigger.table)
 
         with self._conn.cursor() as cur:
             # Ensure the target schema exists (dbo always exists in SQL Server).
@@ -1747,7 +1868,7 @@ class MSSQLTargetConnector(TargetConnector):
             cur.execute(
                 "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
                 "WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ?",
-                (trigger.table, schema_name),
+                (trigger.table, table_schema),
             )
             if cur.fetchone() is None:
                 audit_log(
@@ -1891,12 +2012,20 @@ class MSSQLTargetConnector(TargetConnector):
                 f"({pf.data_type}) "
                 f"AS {pf.range_desc} FOR VALUES ({boundaries})"
             )
-            cur.execute(ddl)
-            self._conn.commit()
-            audit_log(
-                phase="create_partition_function", status="created",
-                details={"function": f"{pf_schema}.{pf.name}"},
-            )
+            try:
+                cur.execute(ddl)
+                self._conn.commit()
+                audit_log(
+                    phase="create_partition_function", status="created",
+                    details={"function": f"{pf_schema}.{pf.name}"},
+                )
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(
+                    phase="create_partition_function", status="failed",
+                    details={"function": f"{pf_schema}.{pf.name}", "reason": str(exc)},
+                )
+                raise
 
     def create_partition_scheme(self, ps: "PartitionSchemeDef") -> None:
         """Create a partition scheme from metadata."""
@@ -1931,24 +2060,32 @@ class MSSQLTargetConnector(TargetConnector):
                 f"AS PARTITION {quote_identifier(ps.partition_function_name)} "
                 f"TO ({filegroups})"
             )
-            cur.execute(ddl)
-            self._conn.commit()
-            audit_log(
-                phase="create_partition_scheme", status="created",
-                details={"scheme": f"{ps_schema}.{ps.name}"},
-            )
+            try:
+                cur.execute(ddl)
+                self._conn.commit()
+                audit_log(
+                    phase="create_partition_scheme", status="created",
+                    details={"scheme": f"{ps_schema}.{ps.name}"},
+                )
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(
+                    phase="create_partition_scheme", status="failed",
+                    details={"scheme": f"{ps_schema}.{ps.name}", "reason": str(exc)},
+                )
+                raise
 
     def create_partitioned_table(
         self,
         schema: "Schema",
-        partition_function_name: str,
+        partition_scheme_name: str,
         partition_column: str,
     ) -> None:
         """Create a table with partitioning applied."""
         validate_identifier(schema.name, "table")
         schema_name = schema.schema_name or "dbo"
         validate_identifier(schema_name, "schema")
-        validate_identifier(partition_function_name, "partition function")
+        validate_identifier(partition_scheme_name, "partition scheme")
         validate_identifier(partition_column, "column")
         qualified = _qualify(schema_name, schema.name)
 
@@ -1993,14 +2130,22 @@ class MSSQLTargetConnector(TargetConnector):
 
             ddl = (
                 f"CREATE TABLE {qualified} ({', '.join(col_defs)}) "
-                f"ON {partition_function_name}({partition_column})"
+                f"ON {partition_scheme_name}({partition_column})"
             )
-            cur.execute(ddl)
-            self._conn.commit()
-            audit_log(
-                phase="create_partitioned_table", status="created",
-                details={"table": qualified},
-            )
+            try:
+                cur.execute(ddl)
+                self._conn.commit()
+                audit_log(
+                    phase="create_partitioned_table", status="created",
+                    details={"table": qualified},
+                )
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(
+                    phase="create_partitioned_table", status="failed",
+                    details={"table": qualified, "reason": str(exc)},
+                )
+                raise
 
     # ------------------------------------------------------------------
     # Step 14 — Security: Roles, Users & Role Memberships (target creation)
@@ -2024,12 +2169,20 @@ class MSSQLTargetConnector(TargetConnector):
                     details={"role": role_name},
                 )
                 return
-            cur.execute(f"CREATE ROLE [{role_name}]")
-            self._conn.commit()
-            audit_log(
-                phase="create_role", status="created",
-                details={"role": role_name},
-            )
+            try:
+                cur.execute(f"CREATE ROLE [{role_name}]")
+                self._conn.commit()
+                audit_log(
+                    phase="create_role", status="created",
+                    details={"role": role_name},
+                )
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(
+                    phase="create_role", status="failed",
+                    details={"role": role_name, "reason": str(exc)},
+                )
+                raise
 
     def create_user_if_not_exists(self, user_name: str) -> None:
         """Create a database user on the target if it does not already exist.
@@ -2055,15 +2208,23 @@ class MSSQLTargetConnector(TargetConnector):
                 (user_name,),
             )
             login_exists = cur.fetchone() is not None
-            if login_exists:
-                cur.execute(f"CREATE USER [{user_name}] FOR LOGIN [{user_name}]")
-            else:
-                cur.execute(f"CREATE USER [{user_name}] WITHOUT LOGIN")
-            self._conn.commit()
-            audit_log(
-                phase="create_user", status="created",
-                details={"user": user_name},
-            )
+            try:
+                if login_exists:
+                    cur.execute(f"CREATE USER [{user_name}] FOR LOGIN [{user_name}]")
+                else:
+                    cur.execute(f"CREATE USER [{user_name}] WITHOUT LOGIN")
+                self._conn.commit()
+                audit_log(
+                    phase="create_user", status="created",
+                    details={"user": user_name},
+                )
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(
+                    phase="create_user", status="failed",
+                    details={"user": user_name, "reason": str(exc)},
+                )
+                raise
 
     def create_role_membership(self, member_name: str, role_name: str) -> None:
         """Add a database principal to a database role (idempotent)."""
@@ -2085,14 +2246,22 @@ class MSSQLTargetConnector(TargetConnector):
                     details={"member": member_name, "role": role_name},
                 )
                 return
-            cur.execute(
-                f"ALTER ROLE [{role_name}] ADD MEMBER [{member_name}]"
-            )
-            self._conn.commit()
-            audit_log(
-                phase="create_role_membership", status="created",
-                details={"member": member_name, "role": role_name},
-            )
+            try:
+                cur.execute(
+                    f"ALTER ROLE [{role_name}] ADD MEMBER [{member_name}]"
+                )
+                self._conn.commit()
+                audit_log(
+                    phase="create_role_membership", status="created",
+                    details={"member": member_name, "role": role_name},
+                )
+            except Exception as exc:
+                self._conn.rollback()
+                audit_log(
+                    phase="create_role_membership", status="failed",
+                    details={"member": member_name, "role": role_name, "reason": str(exc)},
+                )
+                raise
 
     def apply_grant(self, grant: GrantDef) -> None:
         """Apply a GRANT statement using MSSQL-native syntax.
@@ -2157,6 +2326,14 @@ class MSSQLTargetConnector(TargetConnector):
         Idempotent: adds if missing, updates if already present.
         """
         from core.connectors.base import CommentDef
+
+        if not comment.comment:
+            audit_log(
+                phase="apply_comment", status="skipped",
+                details={"object": comment.object_name, "schema": comment.schema_name or "dbo",
+                         "reason": "null or empty comment"},
+            )
+            return
 
         escaped = comment.comment.replace("'", "''")
         schema_name = comment.schema_name or "dbo"

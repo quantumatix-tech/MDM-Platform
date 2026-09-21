@@ -85,6 +85,13 @@ class CheckConstraint:
 
 
 @dataclass
+class DefaultConstraint:
+    name: str
+    column: str
+    definition: str
+
+
+@dataclass
 class Schema:
     name: str
     schema_name: str = "public"
@@ -94,6 +101,7 @@ class Schema:
     indexes: list[Index] = field(default_factory=list)
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     check_constraints: list[CheckConstraint] = field(default_factory=list)
+    default_constraints: list[DefaultConstraint] = field(default_factory=list)
     sequences: list[str] = field(default_factory=list)     # column names backed by sequences
     rls_enabled: bool = False
     partition_key: str | None = None    # e.g. "RANGE (created_at)" for partitioned tables
@@ -183,6 +191,7 @@ class TriggerDef:
     table: str
     ddl: str            # complete DDL from pg_get_triggerdef / sys.sql_modules — ready to execute
     schema_name: str = "public"
+    table_schema: str | None = None  # schema of the parent table (for cross-schema triggers)
     is_disabled: bool = False  # True if the trigger is disabled on the source
 
 

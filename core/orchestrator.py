@@ -139,6 +139,15 @@ class MigrationOrchestrator:
             objects = self._source.list_objects()
             result["phases"]["discover"] = {"objects": objects}
 
+            # Identify partitioned tables to exclude from Phase 4 (created in Phase 4.5 instead)
+            partitioned_table_keys: set[tuple[str, str]] = set()
+            try:
+                for pt in self._source.get_partitioned_tables():
+                    schema_name = pt.schema_name or "dbo"
+                    partitioned_table_keys.add((schema_name, pt.table_name))
+            except AttributeError:
+                pass
+
             # ---------- Phase 1: Extensions ----------
             ext_results: dict[str, str] = {}
             try:
@@ -207,6 +216,11 @@ class MigrationOrchestrator:
             for obj_name in objects:
                 try:
                     schema = self._source.get_schema(obj_name)
+                    schema_name = schema.schema_name or "dbo"
+                    if (schema_name, obj_name) in partitioned_table_keys:
+                        # Partitioned tables are created in Phase 4.5 with partition scheme applied
+                        all_schemas[obj_name] = schema
+                        continue
                     self._apply_field_mappings(schema)
                     self._target.create_object_if_missing(schema)
                     all_schemas[obj_name] = schema
@@ -255,7 +269,7 @@ class MigrationOrchestrator:
                     for pt in self._source.get_partitioned_tables():
                         try:
                             schema = self._source.get_schema(pt.table_name)
-                            self._target.create_partitioned_table(schema, pt.partition_function_name, pt.partition_column)
+                            self._target.create_partitioned_table(schema, pt.partition_scheme_name, pt.partition_column)
                             partition_results[pt.table_name] = f"partitioned table created"
                         except Exception as exc:
                             partition_results[pt.table_name] = f"skipped: {exc}"
@@ -899,11 +913,25 @@ class MigrationOrchestrator:
             result["phases"]["create_sequences"] = seq_create_results
             self._update_status("create_sequences", 13, all_errors)
 
+            # Identify partitioned tables to exclude from Phase 4 (created in Phase 4.5 instead)
+            partitioned_table_keys: set[tuple[str, str]] = set()
+            try:
+                for pt in self._source.get_partitioned_tables():
+                    schema_name = pt.schema_name or "dbo"
+                    partitioned_table_keys.add((schema_name, pt.table_name))
+            except AttributeError:
+                pass
+
             # Phase 4: Create Tables
             objects = self._source.list_objects()
             all_schemas: dict[str, Any] = {}
             for obj_name in objects:
                 schema = self._source.get_schema(obj_name)
+                schema_name = schema.schema_name or "dbo"
+                if (schema_name, obj_name) in partitioned_table_keys:
+                    # Partitioned tables are created in Phase 4.5 with partition scheme applied
+                    all_schemas[obj_name] = schema
+                    continue
                 self._apply_field_mappings(schema)
                 self._target.create_object_if_missing(schema)
                 all_schemas[obj_name] = schema
@@ -936,7 +964,7 @@ class MigrationOrchestrator:
                     for pt in self._source.get_partitioned_tables():
                         try:
                             schema = self._source.get_schema(pt.table_name)
-                            self._target.create_partitioned_table(schema, pt.partition_function_name, pt.partition_column)
+                            self._target.create_partitioned_table(schema, pt.partition_scheme_name, pt.partition_column)
                             partition_results[pt.table_name] = f"partitioned table created"
                         except Exception as exc:
                             partition_results[pt.table_name] = f"skipped: {exc}"

@@ -18,7 +18,7 @@ MSSQL-specific documentation for the Migration Platform.
 | Direction | Status |
 |---|---|
 | **Local → Local** | COMPLETED — See [MSSQL_LOCAL_AUDIT.md](MSSQL_LOCAL_AUDIT.md) |
-| **Local → Cloud** | NOT YET VALIDATED |
+| **Local → Cloud** | COMPLETED — See [MSSQL_CLOUD_AUDIT.md](MSSQL_CLOUD_AUDIT.md) |
 | **Cloud → Local** | NOT YET VALIDATED |
 
 ## Quick links

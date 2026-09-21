@@ -63,6 +63,8 @@ def test_source_get_schema_matches_columns_and_pk():
         [],
         [("id",)],
         [],
+        [],  # check constraints (empty)
+        [],  # default constraints (empty)
     ]
     conn, _ = _mock_conn(fetchone=("sales",), fetchall=[], description=[])
     conn.cursor.return_value.__enter__.return_value = cur
@@ -131,6 +133,8 @@ def test_source_get_schema_extracts_foreign_keys():
         [],
         [("id",)],
         [("fk_orders_cust", "customer_id", "id", "sales", "customers", 1)],
+        [],  # check constraints (empty)
+        [],  # default constraints (empty)
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -176,6 +180,8 @@ def test_source_get_schema_identity_and_computed():
         [],
         [("id",)],
         [],
+        [],  # check constraints (empty)
+        [],  # default constraints (empty)
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -223,6 +229,8 @@ def test_source_get_schema_discovers_indexes():
          ("IX_name", 0, 0, 1, 2, 1, True, "status", None)],
         [("id",)],
         [],
+        [],  # check constraints (empty)
+        [],  # default constraints (empty)
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -425,6 +433,8 @@ def test_source_get_schema_resolves_udt_columns():
         [],
         [("code",)],
         [],
+        [],  # check constraints (empty)
+        [],  # default constraints (empty)
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -493,7 +503,7 @@ def test_source_list_partition_schemes_matches():
 def test_source_get_partitioned_tables_matches():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("partitioned_orders", "sales", "PK_ord", "pf_dates", "order_date"),
+        ("partitioned_orders", "sales", "PK_ord", "pf_dates", "ps_dates", "order_date"),
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -508,6 +518,7 @@ def test_source_get_partitioned_tables_matches():
     assert pt.table_name == "partitioned_orders"
     assert pt.schema_name == "sales"
     assert pt.partition_function_name == "pf_dates"
+    assert pt.partition_scheme_name == "ps_dates"
     assert pt.partition_column == "order_date"
 
 
@@ -615,7 +626,7 @@ def test_target_apply_comment_matches():
 def test_source_get_all_triggers_matches():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("sales", "trg_audit", "orders", "CREATE TRIGGER trg_audit ON orders FOR INSERT AS BEGIN 1 END", 0),
+        ("sales", "trg_audit", "sales", "orders", "CREATE TRIGGER trg_audit ON orders FOR INSERT AS BEGIN 1 END", 0),
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -629,6 +640,7 @@ def test_source_get_all_triggers_matches():
     assert triggers[0].name == "trg_audit"
     assert triggers[0].table == "orders"
     assert triggers[0].schema_name == "sales"
+    assert triggers[0].table_schema == "sales"
     assert triggers[0].is_disabled is False
 
 

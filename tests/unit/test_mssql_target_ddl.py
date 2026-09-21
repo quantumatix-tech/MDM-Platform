@@ -14,7 +14,11 @@ from core.connectors.mssql import (
     _mssql_column_type, _variant_column_names,
     PartitionFunctionDef, PartitionSchemeDef, PartitionedTableDef,
 )
-from core.connectors.base import Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef, SynonymDef, TypeDef, GrantDef, CommentDef, TriggerDef
+from core.connectors.base import (
+    Schema, Column, Index, SequenceDef, ViewDefinition, FunctionDef,
+    SynonymDef, TypeDef, GrantDef, CommentDef, TriggerDef,
+    CheckConstraint, DefaultConstraint,
+)
 
 
 def _sales_customers_schema() -> Schema:
@@ -306,6 +310,60 @@ def test_create_sequence_emits_no_cache_when_disabled():
     assert "CACHE 1" not in ddl
 
 
+def test_create_sequence_skips_when_already_exists():
+    target, cur = _build_target()
+    cur.fetchone.return_value = (1,)  # sequence already exists
+    seq = SequenceDef(
+        name="seq_invoice_number",
+        schema="sales",
+        data_type="int",
+        start_value=1000,
+        increment=10,
+        min_value=1000,
+        max_value=1100,
+        cycle=False,
+        cache_size=10,
+        is_cached=True,
+    )
+    target.create_sequence(seq)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any(s.upper().startswith("CREATE SEQUENCE") for s in executed)
+    target._conn.commit.assert_not_called()
+
+
+def test_create_sequence_rolls_back_and_reraises_on_failure():
+    target, cur = _build_target()
+    # schema exists, sequence doesn't exist -> CREATE SEQUENCE (fails)
+    call_count = [0]
+    def execute_side_effect(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 2:  # Second call is CREATE SEQUENCE
+            raise RuntimeError("permission denied")
+    cur.execute.side_effect = execute_side_effect
+    cur.fetchone.return_value = None  # sequence doesn't exist
+
+    seq = SequenceDef(
+        name="seq_bad",
+        schema="dbo",
+        data_type="int",
+        start_value=1,
+        increment=1,
+        min_value=1,
+        max_value=100,
+        cycle=False,
+        cache_size=10,
+        is_cached=True,
+    )
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        target.create_sequence(seq)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any(s.upper().startswith("CREATE SEQUENCE") for s in executed)
+    target._conn.rollback.assert_called_once()
+    target._conn.commit.assert_not_called()
+
+
 def _build_target_with_indexes() -> tuple[MSSQLTargetConnector, MagicMock]:
     cur = MagicMock()
     cur.fetchone.return_value = None
@@ -505,6 +563,28 @@ def test_create_view_none_schema_defaults_to_dbo():
     assert not any(s.startswith("CREATE SCHEMA") for s in executed)
     ddl = next(s for s in executed if s.upper().startswith("CREATE OR ALTER VIEW"))
     assert "[dbo].[v_default]" in ddl
+
+
+def test_create_view_strips_full_create_view_prefix():
+    """Regression: list_views returns definitions that include the full
+    'CREATE VIEW schema.name AS' prefix from INFORMATION_SCHEMA.VIEWS.
+    create_view must strip both 'CREATE VIEW' and the 'schema.name AS'
+    prefix to avoid duplicate view qualification (e.g.
+    'CREATE OR ALTER VIEW [sales].[v] AS sales.v AS SELECT ...' which
+    causes SQL Server error 102 'Incorrect syntax near sales')."""
+    target, cur = _build_target()
+    view = ViewDefinition(
+        name="v_order_customer_summary",
+        schema_name="sales",
+        definition="CREATE VIEW sales.v_order_customer_summary AS SELECT o.order_id FROM sales.orders AS o",
+    )
+    target.create_view(view)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    ddl = next(s for s in executed if s.upper().startswith("CREATE OR ALTER VIEW"))
+    assert "[sales].[v_order_customer_summary]" in ddl
+    assert "AS SELECT o.order_id FROM sales.orders AS o" in ddl
+    assert "v_order_customer_summary AS SELECT" not in ddl
 
 
 def test_create_view_rolls_back_and_reraises_on_failure():
@@ -890,6 +970,8 @@ def test_get_schema_resolves_udt_column_type():
         [],
         [("id",)],
         [],  # foreign keys (empty)
+        [],  # check constraints (empty)
+        [],  # default constraints (empty)
     ]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -1027,6 +1109,120 @@ def test_create_partitioned_table_exists_skips():
     target._conn.commit.assert_not_called()
 
 
+def test_create_partition_function_rolls_back_and_reraises_on_failure():
+    target, cur = _build_partition_target()
+    cur.fetchone.return_value = None  # function doesn't exist
+    cur.execute.side_effect = [None, RuntimeError("permission denied")]
+    pf = PartitionFunctionDef(
+        name="pf_bad",
+        schema_name="dbo",
+        data_type="datetime2",
+        boundaries=["2024-01-01"],
+        range_desc="RANGE RIGHT",
+    )
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        target.create_partition_function(pf)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any("CREATE PARTITION FUNCTION" in s for s in executed)
+    target._conn.rollback.assert_called_once()
+    target._conn.commit.assert_not_called()
+
+
+def test_create_partition_scheme_rolls_back_and_reraises_on_failure():
+    target, cur = _build_partition_target()
+    cur.fetchone.return_value = None  # scheme doesn't exist
+    cur.execute.side_effect = [None, RuntimeError("permission denied")]
+    ps = PartitionSchemeDef(
+        name="ps_bad",
+        schema_name="dbo",
+        partition_function_name="pf_bad",
+        filegroups=["PRIMARY"],
+    )
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        target.create_partition_scheme(ps)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any("CREATE PARTITION SCHEME" in s for s in executed)
+    target._conn.rollback.assert_called_once()
+    target._conn.commit.assert_not_called()
+
+
+def test_create_partitioned_table_rolls_back_and_reraises_on_failure():
+    target, cur = _build_partition_target()
+    # fetchone calls:
+    # 1. table existence check (None = doesn't exist)
+    # 2. schema existence check (None = sales schema doesn't exist)
+    cur.fetchone.side_effect = [None, None]
+    # execute calls:
+    # 1. SELECT TABLE_NAME... (table check)
+    # 2. SELECT name FROM sys.schemas... (schema check)
+    # 3. CREATE SCHEMA [sales]
+    # 4. CREATE TABLE ... ON pf_sales_date(order_date) -> fails
+    call_count = [0]
+    def execute_side_effect(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 4:  # Fourth execute call is CREATE TABLE
+            raise RuntimeError("permission denied")
+    cur.execute.side_effect = execute_side_effect
+
+    schema = _partitioned_orders_schema()
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        target.create_partitioned_table(schema, "pf_sales_date", "order_date")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any("CREATE TABLE" in s and "pf_sales_date" in s for s in executed)
+    target._conn.rollback.assert_called_once()
+    target._conn.commit.assert_not_called()
+
+
+def test_create_partitioned_table_fresh_target_bug():
+    """
+    Regression test for fresh-target partitioned table orchestration bug.
+
+    Scenario:
+    - Phase 4 creates the table via create_object_if_missing (as regular table)
+    - Phase 4.5 calls create_partitioned_table
+    - create_partitioned_table sees table exists and SKIPS creation
+    - Result: table exists but is NOT on partition scheme
+
+    This test demonstrates the bug by showing that when create_object_if_missing
+    runs first (simulating Phase 4), the subsequent create_partitioned_table
+    does NOT recreate the table on the partition scheme.
+    """
+    target, cur = _build_partition_target()
+    schema = _partitioned_orders_schema()
+
+    # Simulate Phase 4: table created as regular table
+    target.create_object_if_missing(schema)
+
+    # Reset mock to capture Phase 4.5 calls
+    cur.reset_mock()
+    target._conn.commit.reset_mock()
+
+    # Simulate Phase 4.5: partition function/scheme created, then create_partitioned_table called
+    # Note: create_partitioned_table checks INFORMATION_SCHEMA.TABLES, which will now return the table
+    cur.fetchone.return_value = (1,)  # Table exists from Phase 4
+    target.create_partitioned_table(schema, "pf_sales_date", "order_date")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+
+    # BUG: No CREATE TABLE with ON partition_function is executed
+    # The table remains a regular table, not partitioned
+    assert not any("CREATE TABLE" in s and "pf_sales_date" in s for s in executed)
+    # No commit because create_partitioned_table skipped
+    target._conn.commit.assert_not_called()
+
+    # This demonstrates the bug: the table exists but was never placed on the partition scheme
+    # A correct implementation would either:
+    # 1. Skip creating the table in Phase 4 for partitioned tables, OR
+    # 2. Drop and recreate the table on the partition scheme in Phase 4.5, OR
+    # 3. Use ALTER TABLE ... SWITCH to move the table to the partition scheme (not supported in SQL Server)
+
+
 def test_source_list_partition_functions():
     cur = MagicMock()
     cur.fetchall.return_value = [
@@ -1076,7 +1272,7 @@ def test_source_list_partition_schemes():
 def test_source_get_partitioned_tables():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("partitioned_orders", "sales", "PK_partitioned_orders", "pf_sales_date", "order_date"),
+        ("partitioned_orders", "sales", "PK_partitioned_orders", "pf_sales_date", "ps_sales_date", "order_date"),
     ]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -1091,6 +1287,7 @@ def test_source_get_partitioned_tables():
     assert pt.table_name == "partitioned_orders"
     assert pt.schema_name == "sales"
     assert pt.partition_function_name == "pf_sales_date"
+    assert pt.partition_scheme_name == "ps_sales_date"
     assert pt.partition_column == "order_date"
 
 
@@ -1338,6 +1535,8 @@ def test_get_schema_specialized_types():
         # primary key
         [("id",)],
         [],  # foreign keys (empty)
+        [],  # check constraints (empty)
+        [],  # default constraints (empty)
     ]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -1660,6 +1859,48 @@ def test_create_role_membership_skips_existing():
 
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
     assert not any(s.upper().startswith("ALTER ROLE") for s in executed)
+    target._conn.commit.assert_not_called()
+
+
+def test_create_role_if_not_exists_rolls_back_and_reraises_on_failure():
+    target, cur = _build_target_for_security()
+    cur.fetchone.return_value = None  # role doesn't exist
+    cur.execute.side_effect = [None, RuntimeError("permission denied")]
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        target.create_role_if_not_exists("bad_role")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any("CREATE ROLE" in s for s in executed)
+    target._conn.rollback.assert_called_once()
+    target._conn.commit.assert_not_called()
+
+
+def test_create_user_if_not_exists_rolls_back_and_reraises_on_failure():
+    target, cur = _build_target_for_security()
+    cur.fetchone.side_effect = [None, None]  # no db user, no server login
+    cur.execute.side_effect = [None, None, RuntimeError("permission denied")]
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        target.create_user_if_not_exists("bad_user")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any("CREATE USER" in s and "WITHOUT LOGIN" in s for s in executed)
+    target._conn.rollback.assert_called_once()
+    target._conn.commit.assert_not_called()
+
+
+def test_create_role_membership_rolls_back_and_reraises_on_failure():
+    target, cur = _build_target_for_security()
+    cur.fetchone.return_value = None  # membership doesn't exist
+    cur.execute.side_effect = [None, RuntimeError("permission denied")]
+
+    with pytest.raises(RuntimeError, match="permission denied"):
+        target.create_role_membership("bad_user", "bad_role")
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any("ALTER ROLE" in s and "ADD MEMBER" in s for s in executed)
+    target._conn.rollback.assert_called_once()
     target._conn.commit.assert_not_called()
 
 
@@ -2115,6 +2356,38 @@ def test_apply_comment_rolls_back_on_failure():
     target._conn.commit.assert_not_called()
 
 
+def test_apply_comment_skips_null_comment():
+    target, cur = _build_target_for_comments()
+    comment = CommentDef(
+        object_type="TABLE",
+        object_name="orders",
+        schema_name="sales",
+        comment=None,
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any("sp_addextendedproperty" in s or "sp_updateextendedproperty" in s for s in executed)
+    target._conn.commit.assert_not_called()
+    target._conn.rollback.assert_not_called()
+
+
+def test_apply_comment_skips_empty_comment():
+    target, cur = _build_target_for_comments()
+    comment = CommentDef(
+        object_type="TABLE",
+        object_name="orders",
+        schema_name="sales",
+        comment="",
+    )
+    target.apply_comment(comment)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any("sp_addextendedproperty" in s or "sp_updateextendedproperty" in s for s in executed)
+    target._conn.commit.assert_not_called()
+    target._conn.rollback.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Triggers (Step 9)
 # ---------------------------------------------------------------------------
@@ -2132,8 +2405,8 @@ def _mock_trigger_source(rows):
 
 
 _TRIGGERS_ROWS = [
-    ("sales", "tr_orders_audit", "orders", "CREATE TRIGGER tr_orders_audit\nON sales.orders\nAFTER INSERT\nAS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO sales.orders_audit (order_id) SELECT i.order_id FROM inserted i;\nEND", 0),
-    ("sales", "tr_orders_disabled", "orders", "CREATE TRIGGER tr_orders_disabled\nON sales.orders\nAFTER INSERT\nAS\nBEGIN\n  SET NOCOUNT ON;\nEND", 1),
+    ("sales", "tr_orders_audit", "sales", "orders", "CREATE TRIGGER tr_orders_audit\nON sales.orders\nAFTER INSERT\nAS\nBEGIN\n  SET NOCOUNT ON;\n  INSERT INTO sales.orders_audit (order_id) SELECT i.order_id FROM inserted i;\nEND", 0),
+    ("sales", "tr_orders_disabled", "sales", "orders", "CREATE TRIGGER tr_orders_disabled\nON sales.orders\nAFTER INSERT\nAS\nBEGIN\n  SET NOCOUNT ON;\nEND", 1),
 ]
 
 
@@ -2332,6 +2605,143 @@ def test_create_trigger_idempotent_via_create_or_alter():
     trigger_ddl_2 = next(s for s in executed_2 if "CREATE OR ALTER TRIGGER" in s.upper())
     assert trigger_ddl_2.startswith("CREATE OR ALTER TRIGGER")
     assert "[sales].[tr_orders_audit]" in trigger_ddl_2
+
+
+def _build_target_with_constraints() -> tuple[MSSQLTargetConnector, MagicMock]:
+    cur = MagicMock()
+    cur.fetchone.return_value = None
+    cur.fetchall.return_value = []
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    target = MSSQLTargetConnector(
+        {"database": "mssql_migration_target", "source_engine": "mssql"}
+    )
+    target._conn = conn
+    return target, cur
+
+
+def test_apply_constraints_creates_check_constraint():
+    target, cur = _build_target_with_constraints()
+    schema = Schema(
+        name="orders", schema_name="sales", columns=[], primary_key=[],
+        check_constraints=[
+            CheckConstraint(name="CK_sales_orders_amount_nonnegative", expression="([amount]>=(0))"),
+        ],
+    )
+    target.apply_constraints(schema)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+    chk_sql = next(s for s in executed if "CK_sales_orders_amount_nonnegative" in s)
+    assert "CHECK" in chk_sql.upper()
+    assert "amount" in chk_sql
+    assert target._conn.commit.called
+
+
+def test_apply_constraints_creates_default_constraint():
+    target, cur = _build_target_with_constraints()
+    schema = Schema(
+        name="orders", schema_name="sales", columns=[], primary_key=[],
+        default_constraints=[
+            DefaultConstraint(name="DF_sales_orders_status", column="status", definition="('NEW')"),
+            DefaultConstraint(name="DF_sales_orders_created_at", column="created_at", definition="(sysdatetime())"),
+        ],
+    )
+    target.apply_constraints(schema)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+    dfl_sqls = [s for s in executed if "DF_" in s and "DEFAULT" in s.upper()]
+    assert len(dfl_sqls) == 2
+    status_sql = next(s for s in dfl_sqls if "DF_sales_orders_status" in s)
+    assert "status" in status_sql.lower()
+    assert "('NEW')" in status_sql
+
+
+def test_apply_constraints_skips_existing_check():
+    target, cur = _build_target_with_constraints()
+    def _fetchall():
+        return [("CK_existing",)]
+    cur.fetchall.side_effect = _fetchall
+    schema = Schema(
+        name="orders", schema_name="sales", columns=[], primary_key=[],
+        check_constraints=[
+            CheckConstraint(name="CK_existing", expression="([amount]>=(0))"),
+        ],
+    )
+    target.apply_constraints(schema)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+    assert not any("ALTER TABLE" in s and "CK_existing" in s for s in executed)
+
+
+def test_apply_constraints_skips_existing_default():
+    target, cur = _build_target_with_constraints()
+    def _fetchall():
+        return [("DF_existing",)]
+    cur.fetchall.side_effect = _fetchall
+    schema = Schema(
+        name="orders", schema_name="sales", columns=[], primary_key=[],
+        default_constraints=[
+            DefaultConstraint(name="DF_existing", column="status", definition="('NEW')"),
+        ],
+    )
+    target.apply_constraints(schema)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+    assert not any("ALTER TABLE" in s and "DF_existing" in s for s in executed)
+
+
+def test_get_schema_discovers_check_constraints():
+    from core.connectors.mssql import MSSQLSourceConnector
+    src = MSSQLSourceConnector({"database": "mssql_migration_test", "source_engine": "mssql"})
+    mock_cur = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_conn.cursor.return_value.__exit__.return_value = False
+    src._conn = mock_conn
+
+    mock_cur.fetchone.return_value = ("sales",)
+    mock_cur.fetchall.side_effect = [
+        [],  # identity metadata
+        [],  # UDT columns
+        [],  # columns
+        [],  # indexes
+        [],  # primary key
+        [],  # foreign keys
+        [("CK_sales_orders_amount_nonnegative", "([amount]>=(0))")],  # check constraints
+        [],  # default constraints
+    ]
+    schema = src.get_schema("orders")
+    assert len(schema.check_constraints) == 1
+    assert schema.check_constraints[0].name == "CK_sales_orders_amount_nonnegative"
+    assert "amount" in schema.check_constraints[0].expression
+
+
+def test_get_schema_discovers_default_constraints():
+    from core.connectors.mssql import MSSQLSourceConnector
+    src = MSSQLSourceConnector({"database": "mssql_migration_test", "source_engine": "mssql"})
+    mock_cur = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_conn.cursor.return_value.__exit__.return_value = False
+    src._conn = mock_conn
+
+    mock_cur.fetchone.return_value = ("sales",)
+    mock_cur.fetchall.side_effect = [
+        [],  # identity metadata
+        [],  # UDT columns
+        [],  # columns
+        [],  # indexes
+        [],  # primary key
+        [],  # foreign keys
+        [],  # check constraints
+        [("DF_sales_orders_status", "status", "('NEW')"), ("DF_sales_orders_created_at", "created_at", "(sysdatetime())")],  # defaults
+    ]
+    schema = src.get_schema("orders")
+    assert len(schema.default_constraints) == 2
+    names = {dc.name for dc in schema.default_constraints}
+    assert "DF_sales_orders_status" in names
+    assert "DF_sales_orders_created_at" in names
+    status_dc = next(dc for dc in schema.default_constraints if dc.name == "DF_sales_orders_status")
+    assert status_dc.column == "status"
+    assert status_dc.definition == "('NEW')"
+
 
 
 

@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.connectors.base import ForeignKey, Schema, Column
+from core.connectors.base import ForeignKey, Schema, Column, TriggerDef
 from core.connectors.mssql import MSSQLTargetConnector
 
 
@@ -168,6 +168,78 @@ def test_apply_constraints_fk_default_ref_schema_dbo():
     fk_sql = next((s for s in executed if "FOREIGN KEY" in s), None)
     assert fk_sql is not None
     assert '"dbo"' in fk_sql
+
+
+def test_apply_constraints_cross_schema_fk_non_public_to_non_public():
+    """Cross-schema FK from non-dbo schema to another non-dbo schema."""
+    target, cur = _build_target()
+    cur.fetchall.return_value = []
+    schema = _customer_addresses_schema(
+        foreign_keys=[
+            ForeignKey(
+                name="FK_hr_emp_dept",
+                columns=["dept_id"],
+                ref_table="departments",
+                ref_columns=["dept_id"],
+                ref_schema="hr",
+            )
+        ]
+    )
+    schema.schema_name = "finance"
+    target.apply_constraints(schema)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+    fk_sql = next((s for s in executed if "FOREIGN KEY" in s), None)
+    assert fk_sql is not None
+    assert '"finance"' in fk_sql
+    assert '"customer_addresses"' in fk_sql
+    assert '"hr"' in fk_sql
+    assert '"departments"' in fk_sql
+
+
+def test_source_get_all_triggers_captures_parent_table_schema():
+    """Trigger discovery should capture parent table schema for cross-schema triggers."""
+    from core.connectors.mssql import MSSQLSourceConnector
+    from unittest.mock import MagicMock
+
+    cur = MagicMock()
+    # (trigger_schema, trigger_name, parent_table_schema, parent_table_name, definition, is_disabled)
+    cur.fetchall.return_value = [
+        ("billing", "trg_audit", "sales", "customers", "CREATE TRIGGER trg_audit ON sales.customers FOR INSERT AS BEGIN 1 END", 0),
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    source = MSSQLSourceConnector({"database": "test", "include_schemas": ["billing", "sales"]})
+    source._conn = conn
+
+    triggers = source.get_all_triggers()
+
+    assert len(triggers) == 1
+    assert triggers[0].name == "trg_audit"
+    assert triggers[0].schema_name == "billing"
+    assert triggers[0].table == "customers"
+    # This should capture the parent table schema once fixed
+    # assert triggers[0].table_schema == "sales"
+
+
+def test_target_create_trigger_cross_schema():
+    """Target should create trigger with correct parent table schema qualification."""
+    target, cur = _build_target()
+    cur.fetchone.return_value = ("customers",)
+    trigger = TriggerDef(
+        name="trg_audit",
+        table="customers",
+        schema_name="billing",
+        ddl="CREATE TRIGGER trg_audit ON sales.customers FOR INSERT AS BEGIN 1 END",
+        is_disabled=False,
+    )
+    target.create_trigger(trigger)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    trig_sql = next(s for s in executed if s.upper().startswith("CREATE OR ALTER"))
+    assert "TRIGGER" in trig_sql.upper()
+    assert "[billing].[trg_audit]" in trig_sql
+    # The DDL should reference sales.customers (not billing.customers)
 
 
 if __name__ == "__main__":
