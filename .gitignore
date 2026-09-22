@@ -34,3 +34,5 @@ reports/
 # OS noise
 .DS_Store
 Thumbs.db
+
+.pytest-local/
