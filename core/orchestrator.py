@@ -19,6 +19,7 @@ from core.connectors.base import (
     SourceConnector,
     TargetConnector,
     UpsertResult,
+    SynonymDef,
 )
 from core.schema_mapping.registry import TypeMappingRegistry
 from core.secrets import create_secret_provider
@@ -138,6 +139,15 @@ class MigrationOrchestrator:
             objects = self._source.list_objects()
             result["phases"]["discover"] = {"objects": objects}
 
+            # Identify partitioned tables to exclude from Phase 4 (created in Phase 4.5 instead)
+            partitioned_table_keys: set[tuple[str, str]] = set()
+            try:
+                for pt in self._source.get_partitioned_tables():
+                    schema_name = pt.schema_name or "dbo"
+                    partitioned_table_keys.add((schema_name, pt.table_name))
+            except AttributeError:
+                pass
+
             # ---------- Phase 1: Extensions ----------
             ext_results: dict[str, str] = {}
             try:
@@ -206,6 +216,11 @@ class MigrationOrchestrator:
             for obj_name in objects:
                 try:
                     schema = self._source.get_schema(obj_name)
+                    schema_name = schema.schema_name or "dbo"
+                    if (schema_name, obj_name) in partitioned_table_keys:
+                        # Partitioned tables are created in Phase 4.5 with partition scheme applied
+                        all_schemas[obj_name] = schema
+                        continue
                     self._apply_field_mappings(schema)
                     self._target.create_object_if_missing(schema)
                     all_schemas[obj_name] = schema
@@ -238,8 +253,28 @@ class MigrationOrchestrator:
                     except Exception as exc:
                         partition_results[part.name] = f"skipped: {exc}"
             except AttributeError:
-                # Non-PostgreSQL sources don't have list_partitions — skip silently
-                pass
+                try:
+                    for pf in self._source.list_partition_functions():
+                        try:
+                            self._target.create_partition_function(pf)
+                            partition_results[pf.name] = f"partition function created"
+                        except Exception as exc:
+                            partition_results[pf.name] = f"skipped: {exc}"
+                    for ps in self._source.list_partition_schemes():
+                        try:
+                            self._target.create_partition_scheme(ps)
+                            partition_results[ps.name] = f"partition scheme created"
+                        except Exception as exc:
+                            partition_results[ps.name] = f"skipped: {exc}"
+                    for pt in self._source.get_partitioned_tables():
+                        try:
+                            schema = self._source.get_schema(pt.table_name)
+                            self._target.create_partitioned_table(schema, pt.partition_scheme_name, pt.partition_column)
+                            partition_results[pt.table_name] = f"partitioned table created"
+                        except Exception as exc:
+                            partition_results[pt.table_name] = f"skipped: {exc}"
+                except AttributeError:
+                    pass
             except Exception as exc:
                 partition_results["_error"] = str(exc)
             result["phases"]["create_partitions"] = partition_results
@@ -421,7 +456,25 @@ class MigrationOrchestrator:
             result["phases"]["functions"] = func_results
             self._update_status("functions", 80, all_errors)
 
-            # ---------- Phase 14: Triggers ----------
+            # ---------- Phase 14: Synonyms ----------
+            synonym_results: dict[str, str] = {}
+            try:
+                for synonym in self._source.list_synonyms():
+                    syn_key = (
+                        synonym.name if synonym.schema_name == "public"
+                        else f"{synonym.schema_name}.{synonym.name}"
+                    )
+                    try:
+                        self._target.create_synonym(synonym)
+                        synonym_results[syn_key] = "created"
+                    except Exception as exc:
+                        synonym_results[syn_key] = f"skipped: {exc}"
+            except Exception as exc:
+                synonym_results["_error"] = str(exc)
+            result["phases"]["synonyms"] = synonym_results
+            self._update_status("synonyms", 82, all_errors)
+
+            # ---------- Phase 15: Triggers ----------
             trigger_results: dict[str, str] = {}
             try:
                 for trigger in self._source.get_all_triggers():
@@ -440,7 +493,7 @@ class MigrationOrchestrator:
             result["phases"]["triggers"] = trigger_results
             self._update_status("triggers", 85, all_errors)
 
-            # ---------- Phase 15: Comments ----------
+            # ---------- Phase 16: Comments ----------
             comment_results: dict[str, str] = {}
             try:
                 for comment in self._source.list_comments():
@@ -458,6 +511,38 @@ class MigrationOrchestrator:
                 comment_results["_error"] = str(exc)
             result["phases"]["comments"] = comment_results
             self._update_status("comments", 88, all_errors)
+
+            # ---------- Phase: Users, Roles & Role Memberships (Step 14) ----------
+            security_results: dict[str, str] = {}
+            try:
+                for role in self._source.list_roles():
+                    try:
+                        self._target.create_role_if_not_exists(role.name)
+                        security_results[f"role:{role.name}"] = "created"
+                    except Exception as exc:
+                        security_results[f"role:{role.name}"] = f"skipped: {exc}"
+                for user in self._source.list_users():
+                    try:
+                        self._target.create_user_if_not_exists(user.name)
+                        security_results[f"user:{user.name}"] = "created"
+                    except Exception as exc:
+                        security_results[f"user:{user.name}"] = f"skipped: {exc}"
+                for membership in self._source.list_role_memberships():
+                    try:
+                        self._target.create_role_membership(
+                            membership.member_name, membership.role_name
+                        )
+                        security_results[
+                            f"membership:{membership.member_name}->{membership.role_name}"
+                        ] = "created"
+                    except Exception as exc:
+                        security_results[
+                            f"membership:{membership.member_name}->{membership.role_name}"
+                        ] = f"skipped: {exc}"
+            except Exception as exc:
+                security_results["_error"] = str(exc)
+            result["phases"]["security"] = security_results
+            self._update_status("security", 89, all_errors)
 
             # ---------- Phase 16: Grants ----------
             grant_results: list[str] = []
@@ -828,11 +913,25 @@ class MigrationOrchestrator:
             result["phases"]["create_sequences"] = seq_create_results
             self._update_status("create_sequences", 13, all_errors)
 
+            # Identify partitioned tables to exclude from Phase 4 (created in Phase 4.5 instead)
+            partitioned_table_keys: set[tuple[str, str]] = set()
+            try:
+                for pt in self._source.get_partitioned_tables():
+                    schema_name = pt.schema_name or "dbo"
+                    partitioned_table_keys.add((schema_name, pt.table_name))
+            except AttributeError:
+                pass
+
             # Phase 4: Create Tables
             objects = self._source.list_objects()
             all_schemas: dict[str, Any] = {}
             for obj_name in objects:
                 schema = self._source.get_schema(obj_name)
+                schema_name = schema.schema_name or "dbo"
+                if (schema_name, obj_name) in partitioned_table_keys:
+                    # Partitioned tables are created in Phase 4.5 with partition scheme applied
+                    all_schemas[obj_name] = schema
+                    continue
                 self._apply_field_mappings(schema)
                 self._target.create_object_if_missing(schema)
                 all_schemas[obj_name] = schema
@@ -849,7 +948,28 @@ class MigrationOrchestrator:
                     except Exception as exc:
                         partition_results[part.name] = f"skipped: {exc}"
             except AttributeError:
-                pass
+                try:
+                    for pf in self._source.list_partition_functions():
+                        try:
+                            self._target.create_partition_function(pf)
+                            partition_results[pf.name] = f"partition function created"
+                        except Exception as exc:
+                            partition_results[pf.name] = f"skipped: {exc}"
+                    for ps in self._source.list_partition_schemes():
+                        try:
+                            self._target.create_partition_scheme(ps)
+                            partition_results[ps.name] = f"partition scheme created"
+                        except Exception as exc:
+                            partition_results[ps.name] = f"skipped: {exc}"
+                    for pt in self._source.get_partitioned_tables():
+                        try:
+                            schema = self._source.get_schema(pt.table_name)
+                            self._target.create_partitioned_table(schema, pt.partition_scheme_name, pt.partition_column)
+                            partition_results[pt.table_name] = f"partitioned table created"
+                        except Exception as exc:
+                            partition_results[pt.table_name] = f"skipped: {exc}"
+                except AttributeError:
+                    pass
             except Exception as exc:
                 partition_results["_error"] = str(exc)
             result["phases"]["create_partitions"] = partition_results
@@ -1004,7 +1124,25 @@ class MigrationOrchestrator:
             result["phases"]["functions"] = func_results
             self._update_status("functions", 60, all_errors)
 
-            # Phase 14: Triggers
+            # Phase 14: Synonyms
+            synonym_results: dict[str, str] = {}
+            try:
+                for synonym in self._source.list_synonyms():
+                    syn_key = (
+                        synonym.name if synonym.schema_name == "public"
+                        else f"{synonym.schema_name}.{synonym.name}"
+                    )
+                    try:
+                        self._target.create_synonym(synonym)
+                        synonym_results[syn_key] = "created"
+                    except Exception as exc:
+                        synonym_results[syn_key] = f"skipped: {exc}"
+            except Exception as exc:
+                synonym_results["_error"] = str(exc)
+            result["phases"]["synonyms"] = synonym_results
+            self._update_status("synonyms", 61, all_errors)
+
+            # Phase 15: Triggers
             trigger_results: dict[str, str] = {}
             try:
                 for trigger in self._source.get_all_triggers():
@@ -1023,7 +1161,7 @@ class MigrationOrchestrator:
             result["phases"]["triggers"] = trigger_results
             self._update_status("triggers", 62, all_errors)
 
-            # Phase 15: Comments
+            # Phase 16: Comments
             comment_results: dict[str, str] = {}
             try:
                 for comment in self._source.list_comments():

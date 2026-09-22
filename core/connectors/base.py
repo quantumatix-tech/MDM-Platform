@@ -48,6 +48,13 @@ class Column:
     size: int | None = None
     default: str | None = None          # column default expression (non-sequence)
     generated: str | None = None        # GENERATED ALWAYS AS (expr) STORED expression
+    is_identity: bool = False
+    identity_seed: int | None = None
+    identity_increment: int | None = None
+    is_computed: bool = False
+    computed_definition: str | None = None
+    precision: int | None = None
+    scale: int | None = None
 
 
 @dataclass
@@ -56,6 +63,8 @@ class Index:
     columns: list[str]
     unique: bool = False
     ddl: str | None = None              # full DDL from pg_get_indexdef (handles partial/expression)
+    included_columns: list[str] = field(default_factory=list)  # INCLUDE (col1, col2)
+    filter_definition: str | None = None  # WHERE clause for filtered indexes
 
 
 @dataclass
@@ -76,6 +85,13 @@ class CheckConstraint:
 
 
 @dataclass
+class DefaultConstraint:
+    name: str
+    column: str
+    definition: str
+
+
+@dataclass
 class Schema:
     name: str
     schema_name: str = "public"
@@ -85,6 +101,7 @@ class Schema:
     indexes: list[Index] = field(default_factory=list)
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     check_constraints: list[CheckConstraint] = field(default_factory=list)
+    default_constraints: list[DefaultConstraint] = field(default_factory=list)
     sequences: list[str] = field(default_factory=list)     # column names backed by sequences
     rls_enabled: bool = False
     partition_key: str | None = None    # e.g. "RANGE (created_at)" for partitioned tables
@@ -104,7 +121,7 @@ class PartitionDef:
 
 @dataclass
 class SequenceDef:
-    """A PostgreSQL sequence — standalone or column-owned."""
+    """A database sequence — standalone or column-owned."""
     name: str
     start_value: int
     min_value: int
@@ -114,6 +131,9 @@ class SequenceDef:
     last_value: int | None = None
     owned_by: str | None = None    # e.g. "orders.id" if column-owned
     schema: str | None = None      # source schema; None means "public" or unknown
+    data_type: str = "bigint"
+    cache_size: int = 1
+    is_cached: bool = True
 
 
 @dataclass
@@ -169,8 +189,10 @@ class TriggerDef:
     ddl contains the complete CREATE TRIGGER statement."""
     name: str
     table: str
-    ddl: str            # complete DDL from pg_get_triggerdef — ready to execute
+    ddl: str            # complete DDL from pg_get_triggerdef / sys.sql_modules — ready to execute
     schema_name: str = "public"
+    table_schema: str | None = None  # schema of the parent table (for cross-schema triggers)
+    is_disabled: bool = False  # True if the trigger is disabled on the source
 
 
 @dataclass
@@ -202,6 +224,35 @@ class GrantDef:
     object_name: str    # schema-qualified when applicable
     grantee: str
     schema_name: str = "public"
+
+
+@dataclass
+class SynonymDef:
+    """A database synonym (alias for another object)."""
+    name: str
+    schema_name: str
+    base_object: str    # fully qualified base object name, e.g. "schema.table"
+
+
+@dataclass
+class RoleDef:
+    """A database role principal."""
+    name: str
+    type: str = "R"     # 'R' = database role, 'C' = application role
+
+
+@dataclass
+class UserDef:
+    """A database user principal."""
+    name: str
+    type: str = "S"     # 'S' = SQL user, 'U' = Windows user
+
+
+@dataclass
+class RoleMembershipDef:
+    """A mapping of a database principal to a database role."""
+    member_name: str
+    role_name: str
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +384,18 @@ class SourceConnector(abc.ABC):
     def list_grants(self) -> list[GrantDef]:
         return []
 
+    def list_users(self) -> list[UserDef]:
+        return []
+
+    def list_roles(self) -> list[RoleDef]:
+        return []
+
+    def list_role_memberships(self) -> list[RoleMembershipDef]:
+        return []
+
+    def list_synonyms(self) -> list[SynonymDef]:
+        return []
+
 
 class TargetConnector(abc.ABC):
     """Writes data and schema to the target database."""
@@ -402,7 +465,17 @@ class TargetConnector(abc.ABC):
     def apply_grant(self, grant: GrantDef) -> None:
         pass
 
+    def create_synonym(self, synonym: SynonymDef) -> None:
+        pass
+
+
     def create_role_if_not_exists(self, role_name: str) -> None:
+        pass
+
+    def create_user_if_not_exists(self, user_name: str) -> None:
+        pass
+
+    def create_role_membership(self, member_name: str, role_name: str) -> None:
         pass
 
 
