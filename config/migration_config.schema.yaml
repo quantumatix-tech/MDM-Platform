@@ -23,6 +23,10 @@ target:
     database: { type: string }
     username: { type: string }
     password_secret: { type: string }
+    routine_definer:
+      type: string
+      optional: true
+      description: Optional MySQL DEFINER override in user@host format for migrated routines, triggers, and events. Defaults to SELECT CURRENT_USER() on the target.
     ssl: { type: boolean, default: true }
     ssl_ca_cert: { type: string, optional: true }
 
@@ -42,6 +46,30 @@ migration:
   stop_on_error:
     type: boolean
     default: false
+  one_time_event_safety_lead_seconds:
+    type: integer
+    default: 300
+    minimum: 0
+    description: Block enabled MySQL one-time Events that are due or scheduled within this window at source snapshot or target creation. This prevents silently changing their execution semantics.
+  security_principals:
+    type: object
+    optional: true
+    description: Optional persisted MySQL server-principal allowlist. Prefer runtime --security-user/--security-role selection; omit to skip MySQL users, roles, role edges, and security-scope grants safely.
+    properties:
+      users:
+        type: array
+        items:
+          type: object
+          properties:
+            user: { type: string }
+            host: { type: string, default: "%" }
+      roles:
+        type: array
+        items:
+          type: object
+          properties:
+            user: { type: string }
+            host: { type: string, default: "%" }
   dry_run:
     type: boolean
     default: false

@@ -948,6 +948,8 @@ target:
     database: new_db
     username: admin
     password_secret: mysql_target_pass
+    # Optional. Defaults to the target account returned by SELECT CURRENT_USER().
+    # routine_definer: admin@%
     ssl: true
 
 migration:
@@ -960,6 +962,12 @@ secrets:
 validation:
   mode: count
 ```
+
+For MySQL targets, migrated functions, procedures, triggers, and events with an
+explicit `DEFINER` are recreated under the account returned by `SELECT
+CURRENT_USER()` on the target. Set `target.connection.routine_definer` to an
+explicit `user@host` only when the target account policy requires a different
+existing account.
 
 ---
 

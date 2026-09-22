@@ -158,9 +158,12 @@ not imply that the DMS supports the object.
 
 | Object | Support | E2E Validation | Evidence / Notes |
 |---|---|---|---|
-| `CREATE EVENT` | **Supported / Verified** | Local → Local | Event discovered and created on target |
-| Event definition | **Supported / Verified** | Local → Local | Target metadata/definition verified |
-| One-time event | **Supported / Verified** | Local → Local | One-time event fixture migrated |
+| `CREATE EVENT` | **Supported / Verified** | Local → Local; Azure metadata evidence | Source Event DDL is snapshotted at migration start and created on target |
+| Event definition | **Supported / Verified** | Local → Local; Azure recurring evidence | Authoritative `SHOW CREATE EVENT` DDL is replayed with target definer rewriting |
+| Event status / recurring schedule | **Supported / Verified** | Azure run `474f0d5157784c4d9bdf8d25f35d9523` | `ENABLED`, `EVERY`, `STARTS`, `ENDS`, and `ON COMPLETION` were retained for `evt_recurring_event_test` |
+| One-time event, safely future-dated | **Supported / Unit verified** | Live Azure re-test pending configured credentials | Enabled Events are created only when outside the configured safety window at both snapshot and creation |
+| One-time event due or near due | **Supported safety behavior / Unit verified** | Live Azure re-test pending configured credentials | Reported as `EVENT: BLOCKED`; DMS does not drop or replace the target Event and does not claim preservation |
+| Target-only stale Events during FULL | **Not reconciled by design** | Azure run `740ba5585c394826acd9257260c3332e` | FULL creates/replaces only Events present in the source snapshot; no managed-Event ownership registry exists, so target-only Events are retained |
 | Event Scheduler dependency | **Partial / Environment dependent** | Local → Local | Runtime execution depends on MySQL Event Scheduler being enabled |
 | Event definer/privilege dependency | **Partial / Environment dependent** | Not exhaustively tested | Execution depends on valid target definer and required privileges |
 | Recurring event scheduling | **Partial** | Not exhaustively E2E tested | One-time event verified; broader recurring scheduler scenarios are not exhaustively covered |
@@ -199,6 +202,11 @@ not imply that the DMS supports the object.
 ---
 
 ## Grants
+
+> **Task 13 update:** allowlisted user/role creation, role edges, and scoped
+> grants are supported. Local → Azure run `39c9933250be4f2daadacaf44ccdc45f`
+> verified the three configured principals, two role edges, and target grants.
+> No global privileges/passwords are migrated; Local → Local is not executed.
 
 | Object | Support | E2E Validation | Evidence / Notes |
 |---|---|---|---|

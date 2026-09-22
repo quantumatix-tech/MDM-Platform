@@ -105,6 +105,27 @@ def instantiate_connector(connector_cls, connection_config):
     return connector_cls(connection_config)
 
 
+def _parse_security_accounts(values: list[str], flag: str) -> list[dict[str, str]]:
+    """Parse repeated runtime user@host selections without reading secrets."""
+    accounts: list[dict[str, str]] = []
+    for value in values:
+        user, separator, host = value.rpartition("@")
+        if not separator or not user or not host:
+            raise ValueError(f"{flag} must use user@host, for example security_test_user@%")
+        accounts.append({"user": user, "host": host})
+    return accounts
+
+
+def _runtime_security_principals(users: list[str], roles: list[str]) -> dict[str, list[dict[str, str]]] | None:
+    """Return an opt-in runtime scope; no selection deliberately means none."""
+    if not users and not roles:
+        return None
+    return {
+        "users": _parse_security_accounts(users, "--security-user"),
+        "roles": _parse_security_accounts(roles, "--security-role"),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Migration Platform — enterprise-grade data migration tool",
@@ -129,6 +150,14 @@ def main():
         "--dry-run", action="store_true",
         help="Build a PostgreSQL full-migration plan without DDL or DML",
     )
+    parser.add_argument(
+        "--security-user", action="append", default=[], metavar="USER@HOST",
+        help="MySQL user account to migrate; repeat for each selected account",
+    )
+    parser.add_argument(
+        "--security-role", action="append", default=[], metavar="ROLE@HOST",
+        help="MySQL role to migrate; repeat for each selected role",
+    )
     args = parser.parse_args()
 
     if args.port != 8080:
@@ -136,6 +165,10 @@ def main():
 
     with open(args.config, encoding="utf-8") as f:
         config = yaml.safe_load(f)
+
+    runtime_security_principals = _runtime_security_principals(args.security_user, args.security_role)
+    if runtime_security_principals is not None:
+        config.setdefault("migration", {})["security_principals"] = runtime_security_principals
 
     source_cfg = config.get("source", {})
     target_cfg = config.get("target", {})
@@ -150,7 +183,11 @@ def main():
     if target_type not in TARGET_CONNECTORS:
         raise SystemExit(f"Unknown target engine: {target_type!r}. Available: {list(TARGET_CONNECTORS)}")
 
-    source = instantiate_connector(SOURCE_CONNECTORS[source_type], source_cfg.get("connection", {}))
+    source_connection = dict(source_cfg.get("connection", {}))
+    # Connectors own the interpretation of this optional, engine-neutral
+    # migration scope.  MySQL uses it to avoid broad server-principal reads.
+    source_connection["security_principals"] = config.get("migration", {}).get("security_principals")
+    source = instantiate_connector(SOURCE_CONNECTORS[source_type], source_connection)
     target_connection = dict(target_cfg.get("connection", {}))
     target_connection["source_engine"] = source_type
     target = instantiate_connector(TARGET_CONNECTORS[target_type], target_connection)

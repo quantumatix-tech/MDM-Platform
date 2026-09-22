@@ -1,5 +1,11 @@
 # MySQL Local Audit — Final Report
 
+> **Task 13 update:** Earlier statements that users/roles are unsupported
+> predate the allowlisted security-principal implementation. Canonical Local →
+> Azure evidence is in `MYSQL_LOCAL_TO_AZURE_AUDIT.md`, run
+> `39c9933250be4f2daadacaf44ccdc45f`. Local → Local security-principal
+> verification remains not yet executed.
+
 **Project:** Migration Platform  
 **Branch:** `feature/unified-dms-platform`  
 **Environment:** MySQL Community Server 26.7.0, local source → local target  
@@ -545,6 +551,50 @@ Event execution is environment-dependent on Event Scheduler state, definer, and
 privileges; the audit therefore verifies the migrated event definition and the
 tested one-time fixture rather than claiming exhaustive scheduler coverage.
 
+#### Task 9 Event state and schedule safety
+
+The earlier Event implementation read only an Event name and `SHOW CREATE EVENT`
+at the late Event phase. This could silently observe a preserved one-time Event
+after it fired, at which point MySQL reports it as `DISABLED`.
+
+The implementation now snapshots `EVENT_TYPE`, `STATUS`, `EXECUTE_AT`, interval,
+`STARTS`, `ENDS`, `ON_COMPLETION`, `TIME_ZONE`, definer metadata, and authoritative
+`SHOW CREATE EVENT` immediately after source connection. It creates the target
+Event from that snapshot, rewrites only the definer, and uses the recorded Event
+time zone while replaying literal schedules.
+
+An enabled one-time Event that is due or falls within the configured 300-second
+default safety window at either source snapshot or target creation is reported
+as `EVENT: BLOCKED`. DMS does not drop or replace the target Event in that case;
+it also does not force an expired Event back to `ENABLED`.
+
+Existing Azure metadata evidence, migration run
+`474f0d5157784c4d9bdf8d25f35d9523`, verified `evt_recurring_event_test` as
+`RECURRING`, `ENABLED`, `EVERY 1 MINUTE`, `STARTS 2026-09-21 13:06:28`, no end,
+and `ON COMPLETION PRESERVE`; `SHOW CREATE EVENT` retained that schedule and
+rewrote the definer to `mysql_admin@%`. The Azure target `event_scheduler` was
+`OFF`, so target runtime execution is **BLOCKED / NOT EXECUTED**, not passed.
+
+The Task 9 dedicated Local → Azure re-test requires the configured
+`mysql_source_pass` and `mysql_target_pass` environment secrets. They were not
+available in the current execution environment, so no new source test Events,
+migration run, target inspection, or cleanup evidence is claimed here.
+
+#### Task 9 final Azure Event reconciliation observation
+
+After Task 9 test-object cleanup, the source contained only
+`evt_migration_e2e_final`. The final Local → Azure FULL migration,
+`740ba5585c394826acd9257260c3332e`, reported Events `MIGRATED=1`,
+`BLOCKED=0`, and `FAILED=0`.
+
+The target retained prior test Events `evt_live_event_test`,
+`evt_live_event_test_2`, `evt_recurring_event_test`,
+`evt_task9_one_time_future`, and `evt_task9_recurring_enabled`, in addition to
+`evt_migration_e2e_final`. This is intentional: FULL Event processing is scoped
+to the source snapshot and has no managed-Event ownership registry or global
+target Event deletion policy. The DMS must not infer ownership from test-like
+names, alter target scheduler state, or delete these target-only Events.
+
 ### Partitions
 
 The source `tbl_partition_test` uses:
@@ -1017,7 +1067,7 @@ These are not migration-code failures.
 | `log_bin_trust_function_creators=OFF` with binary logging enabled | **Resolved for final audit** | Administrator applied `SET PERSIST log_bin_trust_function_creators = ON` and verified after restart |
 | Cross-account grant metadata visibility | **Blocked for live scenario** | Requires appropriate metadata visibility or administrator-assisted grant handling |
 | Event Scheduler / definer privileges | **Environment-dependent** | Configure target scheduler and required target account/privileges |
-| Azure MySQL connectivity, TLS, firewall, and permissions | **Not tested** | Requires dedicated Azure E2E environment |
+| Azure MySQL connectivity, TLS, firewall, and permissions | **See dedicated Local → Azure audit** | Targeted Azure evidence and limitations are in `MYSQL_LOCAL_TO_AZURE_AUDIT.md` |
 | Dedicated cross-schema test database creation | **Permission blocked during one test attempt** | Scenario was retested inside existing privileged migration databases |
 
 The DMS does not grant `SUPER`, change server-global variables, disable binary

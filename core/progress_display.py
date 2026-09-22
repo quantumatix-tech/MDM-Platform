@@ -48,6 +48,7 @@ _PHASE_LABELS: list[tuple[str, str]] = [
     ("functions",          "Functions & Procs"),
     ("triggers",           "Triggers"),
     ("comments",           "Comments"),
+    ("security_principals", "Security & Access"),
     ("grants",             "Grants"),
     ("validation",         "Validation"),
 ]

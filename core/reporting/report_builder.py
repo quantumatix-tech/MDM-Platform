@@ -61,6 +61,7 @@ _PHASE_META: list[tuple[str, str, str]] = [
     ("triggers",           "Triggers",               "⚡"),
     ("events",             "Events",                 "⏰"),
     ("comments",           "Comments",               "💬"),
+    ("security_principals", "Security & Access",       "👤"),
     ("grants",             "Grants",                 "🛡"),
     ("validation",         "Validation",             "✅"),
 ]
@@ -222,6 +223,20 @@ class ReportBuilder:
             for name, row in object_summary.get("categories", {}).items()
         )
         object_html = ('<section class="section"><h2 class="section-title">🧩 Object Migration Results</h2><div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Category</th><th style="text-align:right">Source</th><th style="text-align:right">Migrated</th><th style="text-align:right">Blocked</th><th style="text-align:right">Unsupported</th><th style="text-align:right">Failed</th><th>Status</th></tr></thead><tbody>' + object_rows + '</tbody></table></div></section>') if object_rows else ''
+        security = phases.get("security_principals", {})
+        security_html = ""
+        if isinstance(security, dict):
+            entries = [(key, value) for key, value in security.items() if not key.startswith("_")]
+            failed = lambda values: sum(str(value).lower().startswith(("failed:", "error:")) for value in values)
+            user_values = [value for key, value in entries if key.startswith("USER ")]
+            role_values = [value for key, value in entries if key.startswith("ROLE ")]
+            membership_values = [value for key, value in entries if " TO " in key and not key.startswith(("DATABASE ", "COLUMN ", "TABLE ", "PROCEDURE ", "FUNCTION "))]
+            grant_values = [value for key, value in entries if key.startswith(("DATABASE ", "COLUMN ", "TABLE ", "PROCEDURE ", "FUNCTION "))]
+            failure_count = failed(user_values) + failed(role_values) + failed(membership_values) + failed(grant_values)
+            skipped = security.get("_status") == "SKIPPED_NOT_AUTHORIZED"
+            status = "Skipped — target authorization required" if skipped else ("Successfully migrated" if failure_count == 0 else "Completed with issues")
+            explanation = "Security migration was not attempted because target authorization is required." if skipped else "User accounts, roles, role relationships, and permissions were migrated to the target."
+            security_html = f'''<section class="section"><h2 class="section-title">👤 Security &amp; Access</h2><p class="section-sub">{explanation}</p><table class="data-table"><thead><tr><th>Type</th><th>Migrated</th><th>Failed</th></tr></thead><tbody><tr><td>Accounts</td><td>{len(user_values)}</td><td>{failed(user_values)}</td></tr><tr><td>Roles</td><td>{len(role_values)}</td><td>{failed(role_values)}</td></tr><tr><td>Role relationships</td><td>{len(membership_values)}</td><td>{failed(membership_values)}</td></tr><tr><td>Permissions</td><td>{len(grant_values)}</td><td>{failed(grant_values)}</td></tr><tr><td><strong>Status</strong></td><td colspan="2"><strong>{status}</strong></td></tr></tbody></table></section>'''
 
         # ---- Status badge ----
         if status in ("success", "completed"):
@@ -550,6 +565,8 @@ class ReportBuilder:
 
   <!-- Object-level capability-aware outcome -->
   {object_html}
+
+  {security_html}
 
   <!-- PostgreSQL Preflight / Plan -->
   {preflight_html}

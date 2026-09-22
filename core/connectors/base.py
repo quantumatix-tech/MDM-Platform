@@ -4,6 +4,7 @@ import abc
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -59,6 +60,7 @@ class Index:
     columns: list[str]
     unique: bool = False
     ddl: str | None = None              # full DDL from pg_get_indexdef (handles partial/expression)
+    index_type: str | None = None       # e.g. BTREE, FULLTEXT, SPATIAL
 
 
 @dataclass
@@ -195,6 +197,18 @@ class EventDef:
     name: str
     ddl: str
     schema_name: str = "public"
+    event_type: str | None = None
+    status: str | None = None
+    execute_at: datetime | None = None
+    interval_value: str | None = None
+    interval_field: str | None = None
+    starts: datetime | None = None
+    ends: datetime | None = None
+    on_completion: str | None = None
+    time_zone: str | None = None
+    definer: str | None = None
+    snapshot_at: datetime | None = None
+    safety_lead_seconds: int = 300
 
 
 @dataclass
@@ -226,6 +240,28 @@ class GrantDef:
     object_name: str    # schema-qualified when applicable
     grantee: str
     schema_name: str = "public"
+    grant_option: bool = False
+
+
+@dataclass
+class SecurityPrincipalDef:
+    """A database account or role; authentication secrets are never included."""
+    user: str
+    host: str
+    principal_type: str  # USER or ROLE
+    authentication_plugin: str | None = None
+    account_locked: bool | None = None
+    password_expired: bool | None = None
+
+
+@dataclass
+class RoleMembershipDef:
+    """A MySQL role edge from role to either a user or another role."""
+    role_user: str
+    role_host: str
+    grantee_user: str
+    grantee_host: str
+    with_admin_option: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +408,20 @@ class SourceConnector(abc.ABC):
     def list_grants(self) -> list[GrantDef]:
         return []
 
+    def list_security_principals(self) -> list[SecurityPrincipalDef]:
+        return []
+
+    def list_role_memberships(self) -> list[RoleMembershipDef]:
+        return []
+
+    def list_security_grants(self) -> list[GrantDef]:
+        """Privileges outside the connector's historical object-grant scope."""
+        return []
+
+    def security_scope_status(self) -> str | None:
+        """Optional connector-owned explanation of its security migration scope."""
+        return None
+
 
 class TargetConnector(abc.ABC):
     """Writes data and schema to the target database."""
@@ -476,6 +526,16 @@ class TargetConnector(abc.ABC):
 
     def apply_grant(self, grant: GrantDef) -> None:
         pass
+
+    def create_security_principal(self, principal: SecurityPrincipalDef) -> None:
+        raise NotImplementedError("Target does not support security principal migration")
+
+    def apply_role_membership(self, membership: RoleMembershipDef) -> None:
+        raise NotImplementedError("Target does not support role membership migration")
+
+    def security_migration_authorization(self) -> tuple[bool, str]:
+        """Return whether target security writes may be attempted."""
+        return True, ""
 
 
 class CDCEngine(abc.ABC):

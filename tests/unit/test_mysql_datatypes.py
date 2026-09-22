@@ -4,7 +4,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.connectors.base import Column, CommentDef, GrantDef, Schema
+from core.connectors.base import (
+    Column, CommentDef, GrantDef, Index, RoleMembershipDef, Schema,
+    SecurityPrincipalDef,
+)
 from core.connectors.mysql import (
     MySQLSourceConnector,
     MySQLTargetConnector,
@@ -59,6 +62,60 @@ def test_non_set_values_are_unchanged():
     assert _normalize_mysql_set_value("email,sms", "SET('email','sms')") == "email,sms"
     assert _normalize_mysql_set_value(b"binary", "BLOB") == b"binary"
     assert _normalize_mysql_set_value({"email"}, "ENUM('email')") == {"email"}
+
+
+@pytest.mark.parametrize(
+    ("index_type", "expected_ddl"),
+    [
+        ("FULLTEXT", "CREATE FULLTEXT INDEX `ft_content` ON `documents` (`content`)"),
+        ("SPATIAL", "CREATE SPATIAL INDEX `sp_location` ON `documents` (`location`)"),
+    ],
+)
+def test_mysql_special_index_types_are_preserved_when_created(index_type, expected_ddl):
+    target, cursor, connection = _target()
+    column = "content" if index_type == "FULLTEXT" else "location"
+    cursor.fetchone.return_value = None
+
+    target.apply_constraints(Schema(
+        name="documents",
+        indexes=[Index(
+            name="ft_content" if index_type == "FULLTEXT" else "sp_location",
+            columns=[column],
+            index_type=index_type,
+        )],
+    ))
+
+    assert cursor.execute.call_args_list[1].args[0] == expected_ddl
+    connection.commit.assert_called_once()
+
+
+def test_mysql_schema_discovery_retains_fulltext_index_type():
+    cursor = MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.__exit__.return_value = False
+    cursor.fetchone.return_value = (None, "InnoDB", "utf8mb4_0900_ai_ci")
+    cursor.fetchall.side_effect = [
+        [
+            ("title", "VARCHAR(255)", "YES", 255, None, "", None, None),
+            ("content", "TEXT", "YES", None, None, "", None, None),
+        ],
+        [],
+        [
+            ("ft_content", 1, "title", "FULLTEXT"),
+            ("ft_content", 1, "content", "FULLTEXT"),
+        ],
+        [], [], [], [],
+    ]
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({"database": "source"})
+    source._conn = connection
+
+    schema = source.get_schema("documents")
+
+    assert schema.indexes == [
+        Index(name="ft_content", columns=["title", "content"], index_type="FULLTEXT")
+    ]
 
 
 def test_mysql_comment_discovery_includes_base_tables_and_ignores_views():
@@ -302,3 +359,136 @@ def test_mysql_table_grant_rolls_back_and_raises_on_target_failure():
 
     connection.rollback.assert_called_once()
     connection.commit.assert_not_called()
+
+
+def test_mysql_security_principals_preserve_user_host_without_password_material():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.return_value = [
+        ("app_user", "%", "caching_sha2_password", "N", "N"),
+        ("reporting_role", "%", "", "N", "N"),
+    ]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({
+        "database": "source",
+        "security_principals": {
+            "users": [{"user": "app_user", "host": "%"}],
+            "roles": [{"user": "reporting_role", "host": "%"}],
+        },
+    }); source._conn = connection
+
+    assert source.list_security_principals() == [
+        SecurityPrincipalDef("app_user", "%", "USER", "caching_sha2_password", False, False),
+        SecurityPrincipalDef("reporting_role", "%", "ROLE", "", False, False),
+    ]
+    assert "authentication_string" not in cursor.execute.call_args.args[0]
+    assert "is_role" not in cursor.execute.call_args.args[0]
+
+
+def test_mysql_26_security_principal_query_uses_allowlist_types_without_is_role():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.return_value = [
+        ("read_role", "%", "", "N", "N"),
+        ("security_test_user", "%", "caching_sha2_password", "N", "N"),
+    ]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({
+        "database": "source",
+        "security_principals": {
+            "users": [{"user": "security_test_user", "host": "%"}],
+            "roles": [{"user": "read_role", "host": "%"}],
+        },
+    }); source._conn = connection
+
+    principals = source.list_security_principals()
+    assert [(p.user, p.principal_type) for p in principals] == [
+        ("read_role", "ROLE"), ("security_test_user", "USER"),
+    ]
+    sql = cursor.execute.call_args.args[0]
+    assert "is_role" not in sql and "authentication_string" not in sql
+
+
+def test_mysql_security_without_allowlist_discovers_non_system_principals():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.side_effect = [
+        [("reporting_role", "%", "security_test_user", "%", "N")],
+        [("mysql.sys", "localhost", "", "N", "N"), ("reporting_role", "%", "", "N", "N"), ("security_test_user", "%", "plugin", "N", "N")],
+        [("reporting_role", "%", "security_test_user", "%", "N")],
+        [], [],
+    ]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({"database": "source"}); source._conn = connection
+
+    assert [(p.user, p.principal_type) for p in source.list_security_principals()] == [("reporting_role", "ROLE"), ("security_test_user", "USER")]
+    assert source.list_role_memberships() == [RoleMembershipDef("reporting_role", "%", "security_test_user", "%", False)]
+    assert source.list_security_grants() == []
+    assert "mysql.sys" in cursor.execute.call_args_list[1].args[0]
+
+
+def test_mysql_security_allowlist_filters_role_edges_and_grants():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.return_value = [
+        ("reporting_role", "%", "security_test_user", "%", "Y"),
+        ("unrelated_role", "%", "security_test_user", "%", "N"),
+    ]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({
+        "database": "source",
+        "security_principals": {
+            "users": [{"user": "security_test_user", "host": "%"}],
+            "roles": [{"user": "reporting_role", "host": "%"}],
+        },
+    }); source._conn = connection
+
+    assert source.list_role_memberships() == [
+        RoleMembershipDef("reporting_role", "%", "security_test_user", "%", True)
+    ]
+
+    cursor.fetchall.side_effect = [
+        [("'security_test_user'@'%'", "source", "SELECT", "YES"),
+         ("'unrelated_user'@'%'", "source", "SELECT", "YES")],
+        [],
+    ]
+    grants = source.list_security_grants()
+    assert len(grants) == 1 and grants[0].grantee == "'security_test_user'@'%'"
+    executed = " ".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "USER_PRIVILEGES" not in executed
+
+
+def test_mysql_allowlist_filters_existing_table_grants_without_regression():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.side_effect = [[
+        ("'security_test_user'@'%'", "source", "customers", "SELECT", "YES"),
+        ("'unrelated_user'@'%'", "source", "customers", "SELECT", "YES"),
+    ], []]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({
+        "database": "source",
+        "security_principals": {"users": [{"user": "security_test_user", "host": "%"}]},
+    }); source._conn = connection
+
+    assert source.list_grants() == [GrantDef(
+        privileges="SELECT", object_type="TABLE", object_name="customers",
+        grantee="'security_test_user'@'%'", schema_name="source", grant_option=True,
+    )]
+
+
+def test_mysql_target_security_creation_role_edge_and_grant_option():
+    target, cursor, connection = _target()
+    target.create_security_principal(SecurityPrincipalDef("reporting_role", "%", "ROLE"))
+    target.create_security_principal(SecurityPrincipalDef("report_user", "localhost", "USER"))
+    target.apply_role_membership(RoleMembershipDef("reporting_role", "%", "report_user", "localhost", True))
+    target.apply_grant(GrantDef("SELECT", "DATABASE", "source", "`reporting_role`@`%`", "source", True))
+
+    sql = [call.args[0] for call in cursor.execute.call_args_list]
+    assert "CREATE ROLE IF NOT EXISTS `reporting_role`@`%`" in sql
+    assert "CREATE USER IF NOT EXISTS `report_user`@`localhost`" in sql
+    assert "GRANT `reporting_role`@`%` TO `report_user`@`localhost` WITH ADMIN OPTION" in sql
+    assert "GRANT SELECT ON `target`.* TO `reporting_role`@`%` WITH GRANT OPTION" in sql
+
+
+def test_mysql_target_security_authorization_preflight_skips_known_denial():
+    target, cursor, _connection = _target()
+    cursor.fetchall.return_value = [("GRANT SELECT ON `target`.* TO `mysql_admin`@`%`",)]
+    allowed, message = target.security_migration_authorization()
+    assert not allowed
+    assert "CREATE USER" in message

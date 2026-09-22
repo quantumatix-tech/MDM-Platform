@@ -5,8 +5,9 @@ the current MySQL Local → Local test configuration. It preserves the
 MySQL-specific testing already documented in the project, including datatype,
 partition, function/trigger policy, view isolation, and grant-visibility testing.
 
-Azure / remote MySQL testing is **NOT STARTED**. Do not mark an Azure path
-verified until an actual migration run and target inspection have been completed.
+Targeted Local → Azure testing is complete for the evidence recorded in
+[MYSQL_LOCAL_TO_AZURE_AUDIT.md](MYSQL_LOCAL_TO_AZURE_AUDIT.md). Do not mark
+unrecorded Azure behavior verified from Local → Local evidence alone.
 
 ---
 
@@ -672,6 +673,30 @@ and values.
 
 # Step 8 — Task 13: Users / Roles / Grants Testing
 
+> **Task 13 update:** users, roles, role edges, and scoped grants are now
+> supported only through `migration.security_principals`. Omit this allowlist
+> to skip server-principal migration safely. MySQL 26.7 classification comes
+> from the configured user/role lists rather than `mysql.user.is_role`; no
+> passwords, hashes, or global privileges are read or migrated. Local → Azure
+> run `39c9933250be4f2daadacaf44ccdc45f` verified users/roles/edges/grants,
+> SELECT allowed, and CREATE/INSERT/UPDATE denied. DELETE/ALTER/DROP/GRANT and
+> Local → Local Task 13 behavior remain not executed.
+
+For normal interactive PowerShell runs, select security principals at runtime
+rather than storing identities in YAML. Repeat each option as needed:
+
+```powershell
+python -m migration_platform --config config/mysql_local_test.yaml --mode full `
+  --security-user security_test_user@% `
+  --security-role reporting_role@% `
+  --security-role read_role@%
+```
+
+No `--security-user` or `--security-role` option means security-principal
+migration is safely skipped. The browser dashboard currently displays migration
+progress/results after the run begins; runtime selection is made through the
+existing CLI/PowerShell launch flow.
+
 Current MySQL DMS grant scope is:
 
 - Explicit table grants.
@@ -835,7 +860,9 @@ Required Azure evidence includes:
 - Event Scheduler behavior;
 - grant metadata visibility.
 
-**Azure testing is currently NOT STARTED.**
+Targeted Local → Azure testing is recorded in
+[MYSQL_LOCAL_TO_AZURE_AUDIT.md](MYSQL_LOCAL_TO_AZURE_AUDIT.md). Do not infer
+unrecorded Azure runtime coverage from Local → Local results.
 
 Do not classify Azure support as verified until an actual Azure migration and
 target inspection have occurred.

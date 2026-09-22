@@ -176,6 +176,25 @@ class MigrationOrchestrator:
             result["phases"]["connect"] = "success"
             self._update_status("connect", 2, [])
 
+            # Snapshot scheduled events before table/data work.  MySQL changes
+            # a preserved one-time event to DISABLED after it fires, so late
+            # discovery cannot represent migration-start state.
+            source_events = self._source.list_events()
+            event_safety_lead_seconds = int(
+                self._config.get("migration", {}).get("one_time_event_safety_lead_seconds", 300)
+            )
+            for event in source_events:
+                event.safety_lead_seconds = event_safety_lead_seconds
+            result["phases"]["snapshot_events"] = {
+                event.name: {
+                    "event_type": event.event_type,
+                    "status": event.status,
+                    "execute_at": str(event.execute_at) if event.execute_at else None,
+                    "time_zone": event.time_zone,
+                }
+                for event in source_events
+            }
+
             if plan is not None:
                 self._record_preflight(plan.to_dict())
                 if not plan.ready:
@@ -621,12 +640,12 @@ class MigrationOrchestrator:
             # ---------- Phase 14.5: Events (MySQL/MariaDB) ----------
             event_results: dict[str, str] = {}
             try:
-                for event in self._source.list_events():
+                for event in source_events:
                     try:
                         self._target.create_event(event)
                         event_results[event.name] = "created"
                     except Exception as exc:
-                        event_results[event.name] = f"error: {exc}"
+                        event_results[event.name] = str(exc) if "BLOCKED" in str(exc).upper() else f"error: {exc}"
                         all_errors.append(str(exc))
             except Exception as exc:
                 event_results["_error"] = str(exc)
@@ -653,6 +672,49 @@ class MigrationOrchestrator:
             self._update_status("comments", 88, all_errors)
 
             # ---------- Phase 16: Grants ----------
+            # Connector-owned security support is deliberately capability-gated:
+            # non-MySQL targets retain their existing migration behaviour.
+            security_results: dict[str, str] = {}
+            if self._target.get_capabilities().get("security_principals", {}).get("supported", False):
+                try:
+                    scope_status = self._source.security_scope_status()
+                    authorized, authorization_message = self._target.security_migration_authorization()
+                    if not authorized:
+                        security_results["_status"] = "SKIPPED_NOT_AUTHORIZED"
+                        security_results["_detail"] = authorization_message
+                    elif scope_status and scope_status.startswith("OUT_OF_SCOPE"):
+                        security_results["_status"] = scope_status
+                    else:
+                        if scope_status:
+                            security_results["_scope"] = scope_status
+                        principals = self._source.list_security_principals()
+                        for principal in principals:
+                            key = f"{principal.principal_type} {principal.user}@{principal.host}"
+                            try:
+                                self._target.create_security_principal(principal)
+                                security_results[key] = "created"
+                            except Exception as exc:
+                                security_results[key] = f"failed: {exc}"
+                        for membership in self._source.list_role_memberships():
+                            key = f"{membership.role_user}@{membership.role_host} TO {membership.grantee_user}@{membership.grantee_host}"
+                            try:
+                                self._target.apply_role_membership(membership)
+                                security_results[key] = "applied"
+                            except Exception as exc:
+                                security_results[key] = f"failed: {exc}"
+                        for grant in self._source.list_security_grants():
+                            key = f"{grant.object_type} {grant.object_name} TO {grant.grantee}"
+                            try:
+                                self._target.apply_grant(grant)
+                                security_results[key] = "applied"
+                            except Exception as exc:
+                                security_results[key] = f"failed: {exc}"
+                except Exception as exc:
+                    security_results["_error"] = str(exc)
+            else:
+                security_results["_status"] = "out_of_scope"
+            result["phases"]["security_principals"] = security_results
+            self._update_status("security_principals", 90, all_errors)
             grant_results: dict[str, str] = {}
             try:
                 for grant in self._source.list_grants():
@@ -841,6 +903,7 @@ class MigrationOrchestrator:
             "partitions": sum(len(getattr(s, "mysql_partitions", [])) for s in schemas.values()) or len(phases.get("create_partitions", {})),
             "comments": sum(bool(s.comment) + sum(bool(c.comment) for c in s.columns) for s in schemas.values()),
             "grants": len(phases.get("grants", {})),
+            "security_principals": len([value for key, value in phases.get("security_principals", {}).items() if not key.startswith("_")]),
             "views": len(phases.get("views", {})), "functions": inventory.get("functions", 0),
             "procedures": inventory.get("procedures", 0), "triggers": len(phases.get("triggers", {})), "events": len(phases.get("events", {})),
         }

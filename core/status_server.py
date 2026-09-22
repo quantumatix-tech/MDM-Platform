@@ -143,7 +143,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     'create_sequences','create_tables','create_partitions',
     'data','apply_constraints','row_level_security','advance_sequences',
     'views','materialized_views','functions','triggers',
-    'comments','grants','validation'
+      'comments','security_principals','grants','validation'
   ];
 
   function fmt(n) { return n >= 1000 ? n.toLocaleString() : String(n); }
@@ -155,7 +155,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       apply_constraints:'Indexes + Constraints', row_level_security:'Row-Level Security',
       advance_sequences:'Advance Sequences', views:'Views',
       materialized_views:'Materialized Views', functions:'Functions & Procedures',
-      triggers:'Triggers', comments:'Comments', grants:'Grants',
+      triggers:'Triggers', comments:'Comments', security_principals:'Security & Access', grants:'Grants',
       partition_testing:'Partition Testing', validation:'Validation'
     }[k] || k;
   }

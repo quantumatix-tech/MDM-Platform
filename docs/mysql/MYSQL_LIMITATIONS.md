@@ -22,6 +22,14 @@ Limitations are categorized as:
 
 ## Users, roles, and grants
 
+> **Task 13 update:** allowlisted users, roles, role edges, and scoped
+> database/column/table/routine grants now have a migration path. The allowlist
+> is mandatory for server principals; absent configuration is safely out of
+> scope. MySQL 26.7 lacks `mysql.user.is_role`, so configured type is used.
+> Passwords/hashes and global privileges are never migrated. Local → Azure is
+> verified; Local → Local remains unexecuted. DELETE/ALTER/DROP/GRANT behavior
+> and role-inheritance-only behavior remain unverified.
+
 ### MySQL users and roles are not migrated
 
 - **Category:** Implementation limitation
@@ -131,7 +139,12 @@ The platform reports affected objects as `FUNCTION: BLOCKED` or
   execute as intended when the required server capability or privileges are
   unavailable.
 - **Workaround:** Enable/configure Event Scheduler according to the target
-  server's administrative policy and provide the required privileges.
+  server's administrative policy. On the tested Azure target,
+  `SET GLOBAL event_scheduler = ON` returned Error 1227 because the migration
+  account lacks `SUPER`/`SYSTEM_VARIABLES_ADMIN`; DMS must not silently enable
+  the scheduler or obtain those privileges. Verify whether the actual Azure
+  server/version exposes a supported server-configuration parameter and have an
+  Azure administrator enable it if appropriate.
 - **Tracking:** The migration fixture included a one-time event and verified
   event metadata on the target.
 
@@ -146,6 +159,42 @@ The platform reports affected objects as `FUNCTION: BLOCKED` or
   controlled.
 - **Tracking:** The local audit used a safe one-time event fixture to avoid
   ambiguity from unrelated active events.
+  The dedicated Local → Azure audit records migration metadata/state as passed,
+  but automatic Event runtime as not verified while the Azure scheduler is OFF.
+
+### Enabled one-time Events inside the migration safety window are blocked
+
+- **Category:** Intentional safety behavior
+- **Impact:** An enabled one-time Event that is due, past due, or scheduled
+  within `migration.one_time_event_safety_lead_seconds` (default: 300 seconds)
+  cannot be migrated while guaranteeing its original execution semantics.
+- **Behavior:** DMS snapshots Event metadata and `SHOW CREATE EVENT` immediately
+  after source connection. It rechecks an enabled one-time Event in its source
+  Event time zone before target replacement. If either check is unsafe, DMS
+  records `EVENT: BLOCKED` and leaves an existing target Event untouched.
+- **Workaround:** Schedule the source Event sufficiently farther in the future
+  and rerun the migration. DMS never enables an expired Event to compensate.
+- **Tracking:** Recurring Event state/schedule preservation has Azure metadata
+  evidence from run `474f0d5157784c4d9bdf8d25f35d9523`; future and blocked
+  one-time paths are unit verified pending a credentialed Azure re-test.
+
+### FULL migration retains target-only Events
+
+- **Category:** Intentional safety boundary
+- **Impact:** FULL migration creates or replaces each Event in the source Event
+  snapshot, but does not delete target Events absent from that snapshot. This
+  includes stale Events from earlier migration tests.
+- **Reason:** The platform has no managed-Event ownership registry. A target
+  Event can be application-owned, created by another migration scope, or have
+  dependencies not represented by the Event catalog. Name/prefix matching
+  would not establish ownership safely.
+- **Safety behavior:** No target-wide Event inventory or `DROP EVENT` sweep is
+  performed. The only Event drop is the replacement of a same-named, current
+  source Event after one-time safety validation. Scheduler state is never
+  changed as part of this behavior.
+- **Tracking:** Azure FULL run `740ba5585c394826acd9257260c3332e` migrated the
+  sole source Event `evt_migration_e2e_final` and retained five target-only
+  Events. This is expected, not a migration failure.
 
 ---
 

@@ -18,6 +18,50 @@ from core.migration_plan import (
 )
 from core.orchestrator import MigrationOrchestrator
 from core.reporting.report_builder import ReportBuilder
+from migration_platform.__main__ import _runtime_security_principals
+
+
+def test_report_exposes_security_principal_phase_and_counts():
+    report = ReportBuilder({
+        "run_id": "security-run", "mode": "full", "status": "success",
+        "phases": {"security_principals": {
+            "_scope": "ALLOWLIST_ENFORCED",
+            "USER security_test_user@%": "created",
+            "ROLE reporting_role@%": "created",
+            "ROLE read_role@%": "created",
+            "read_role@% TO reporting_role@%": "applied",
+            "reporting_role@% TO security_test_user@%": "applied",
+            "DATABASE source TO 'read_role'@'%'": "applied",
+        }},
+    }, 0, 1).build_html()
+    assert "Security &amp; Access" in report
+    assert "Role relationships" in report
+    assert "Permissions" in report
+    assert "Successfully migrated" in report
+    main_report, _technical_details = report.split("<!-- Phase Details", 1)
+    assert "ALLOWLIST_ENFORCED" not in main_report
+
+
+def test_report_explains_skipped_security_authorization_without_raw_mysql_error():
+    report = ReportBuilder({"run_id": "skip", "mode": "full", "status": "success", "phases": {"security_principals": {
+        "_status": "SKIPPED_NOT_AUTHORIZED", "_detail": "raw error 1410",
+    }}}, 0, 1).build_html()
+    main_report, _technical = report.split("<!-- Phase Details", 1)
+    assert "Skipped — target authorization required" in main_report
+    assert "raw error 1410" not in main_report
+
+
+def test_runtime_security_selection_builds_scoped_principals():
+    assert _runtime_security_principals(
+        ["security_test_user@%"], ["reporting_role@%", "read_role@%"]
+    ) == {
+        "users": [{"user": "security_test_user", "host": "%"}],
+        "roles": [{"user": "reporting_role", "host": "%"}, {"user": "read_role", "host": "%"}],
+    }
+
+
+def test_no_runtime_security_selection_keeps_security_migration_opt_in():
+    assert _runtime_security_principals([], []) is None
 
 
 def _config() -> dict:
