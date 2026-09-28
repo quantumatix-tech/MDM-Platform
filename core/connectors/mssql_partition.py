@@ -1,33 +1,21 @@
-"""MSSQL Partition Function/Scheme definitions for Step 12."""
-from dataclasses import dataclass, field
-from typing import Any
+"""MSSQL Partition Function/Scheme definitions for Step 12.
 
+Compatibility shim.  The canonical definitions now live in
+:mod:`core.connectors.mssql._models`.  This module re-exports them so that
+existing ``from core.connectors.mssql_partition import PartitionFunctionDef``
+imports keep resolving to the same class objects as
+``from core.connectors.mssql import PartitionFunctionDef``.
+"""
+from __future__ import annotations
 
-@dataclass
-class PartitionFunctionDef:
-    """MSSQL partition function metadata."""
-    name: str
-    schema_name: str = "dbo"
-    data_type: str = "datetime2"
-    boundaries: list[Any] = field(default_factory=list)
-    range_desc: str = "RANGE RIGHT"
+from core.connectors.mssql._models import (
+    PartitionFunctionDef,
+    PartitionSchemeDef,
+    PartitionedTableDef,
+)
 
-
-@dataclass
-class PartitionSchemeDef:
-    """MSSQL partition scheme metadata."""
-    name: str
-    schema_name: str = "dbo"
-    partition_function_name: str = ""
-    filegroups: list[str] = field(default_factory=list)
-
-
-@dataclass
-class PartitionedTableDef:
-    """MSSQL partitioned table/index metadata."""
-    table_name: str
-    schema_name: str = "dbo"
-    index_name: str | None = None
-    partition_function_name: str = ""
-    partition_scheme_name: str = ""
-    partition_column: str = ""
+__all__ = [
+    "PartitionFunctionDef",
+    "PartitionSchemeDef",
+    "PartitionedTableDef",
+]
