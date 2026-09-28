@@ -173,6 +173,7 @@ Report: reports/20240101-120000-abc123.html
 ### MSSQL
 - **CDC Setup**: Requires SQL Server CDC feature enabled on the database and target tables. The CDC engine resumes from the last checkpoint LSN to avoid unbounded query growth.
 - **Upsert**: Uses `MERGE` statement. Ensure the target table has a primary key.
+- **Docs**: See `docs/mssql/README.md` for MSSQL-specific E2E documentation.
 
 ### Cosmos DB for MongoDB
 - **Rate Limiting**: Cosmos DB enforces RU limits. The connector uses exponential backoff on 429 responses.

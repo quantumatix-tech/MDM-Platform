@@ -141,7 +141,7 @@ All categories below were verified with real PostgreSQL CLI queries against
 ### Unit tests
 
 ```text
-94 passed, 0 failed
+100 passed, 0 failed
 ```
 
 ### Latest migration run
@@ -169,9 +169,10 @@ Success rate: 100%
 | audit_test | fk_child | 3 | 3 |
 | audit_test | procedure_test_log | 0 | 0 |
 
-### Key commit
+### Key commits
 
 - `906dc89` — fix: qualify PostgreSQL sequence synchronization
+- Subsequent commits — fix: cross-schema FK schema-qualified joins, role creation, sequence SELECT privilege extraction
 
 ---
 
@@ -224,7 +225,76 @@ SELECT * FROM test_customers;  -- returns rows for audit_user (permissive policy
 
 ---
 
-## 9. Known Limitations
+## 9. Cross-Schema Testing History
+
+During the audit, a cross-schema foreign key metadata isolation issue was
+discovered, fixed, and regression-tested.
+
+### Scenario Tested
+
+- Source database contains tables with the **same name and same PK constraint name**
+  in different schemas (e.g., `public.customers` with `customers_pkey` and
+  `cloud_test.customers` with `customers_pkey`).
+- A foreign key in one schema references the table in the other schema
+  (e.g., `cloud_test.orders → cloud_test.customers`).
+- The same PK constraint name exists in both schemas, creating a collision
+  in `information_schema.constraint_column_usage`.
+
+### Failure Observed
+
+Without schema-qualified joins in the FK metadata query:
+
+1. The join to `referential_constraints` matched rows across schemas because
+   `tc.constraint_name = rc.constraint_name` alone is not unique.
+2. The join to `constraint_column_usage` returned one row per colliding schema.
+3. The `fk_map` deduplication logic combined these into a single `ForeignKey`
+   object with **duplicated columns** (e.g., `["customer_id", "customer_id"]`)
+   and/or an incorrect `ref_schema` (sometimes picking `public` instead of
+   `cloud_test`).
+
+### Root Cause
+
+The FK query in `PostgresSourceConnector.get_schema()` (lines 304–319 in
+`core/connectors/postgresql.py`) was missing two schema-equality conditions:
+
+```sql
+-- Missing:
+AND tc.constraint_schema = rc.constraint_schema
+AND rc.unique_constraint_schema = ccu.constraint_schema
+```
+
+### Fix Implemented
+
+Added the two schema-equality join conditions to the FK query:
+
+```sql
+JOIN information_schema.referential_constraints rc
+  ON tc.constraint_name = rc.constraint_name
+  AND tc.constraint_schema = rc.constraint_schema          -- ADDED
+JOIN information_schema.constraint_column_usage ccu
+  ON rc.unique_constraint_name = ccu.constraint_name
+  AND rc.unique_constraint_schema = ccu.constraint_schema  -- ADDED
+```
+
+### Tests Added
+
+- `TestPostgresCrossSchemaMetadataIsolation.test_get_schema_fk_query_scoped_by_schema`
+  — verifies FK query filters by table_schema
+- `TestPostgresCrossSchemaMetadataIsolation.test_get_schema_fk_query_scopes_referential_constraints_and_column_usage_by_schema`
+  — verifies the two new join conditions are present in the generated SQL
+- `TestPostgresCrossSchemaMetadataIsolation.test_get_schema_fk_no_duplicate_columns_under_cross_schema_pk_collision`
+  — regression test simulating the collision scenario; asserts exactly one
+  FK row per constraint, no duplicated columns, and correct `ref_schema`
+
+### Final Result
+
+All cross-schema tests pass. The fixture includes a real cross-schema FK
+(`audit_test.fk_child → public.customers`) which migrates correctly with
+preserved `ref_schema = 'public'`.
+
+---
+
+## 10. Known Limitations
 
 These are confirmed gaps in the current implementation or audit scope.
 
@@ -239,16 +309,15 @@ These are confirmed gaps in the current implementation or audit scope.
 | Deferrable constraints not explicitly tested | Audit scope |
 | Circular cross-schema dependencies not tested | Audit scope |
 | FULL mode does not delete stale target rows | Implementation |
-| Roles are not created or migrated | Implementation |
 
 See `docs/postgresql/POSTGRESQL_LIMITATIONS.md` for detailed descriptions and
 workarounds.
 
 ---
 
-## 10. Environment Blockers
+## 11. Environment Blockers
 
-These are not implementation failures.  They are prerequisites that are not
+These are not implementation failures. They are prerequisites that are not
 met in the local environment.
 
 | Blocker | Status | Resolution |
@@ -258,25 +327,27 @@ met in the local environment.
 
 ---
 
-## 11. Final Assessment
+## 12. Final Assessment
 
 The `feature/postgresql-objects` branch delivers a verified PostgreSQL object
 migration implementation covering the full lifecycle of PostgreSQL metadata
 objects:
 
-- **94 unit tests** pass without regression.
+- **100 unit tests** pass without regression.
 - **Full E2E migration** of 8 tables, 37 rows, and 20+ non-table objects
   succeeds on PostgreSQL 17.4.
 - **Schema qualification** is correct for public and non-public schemas.
 - **Cross-schema dependencies** (FKs, grants, RLS) are preserved.
 - **Sequence lifecycle** (create → own → sync) is complete.
+- **Role creation** is automatic for grant grantees.
+- **Sequence privileges** (USAGE, SELECT) are fully extracted and migrated.
 
 The remaining gaps are documented limitations and environment prerequisites,
 not bugs in the verified object migration path.
 
 ---
 
-## 12. Reproduction Instructions
+## 13. Reproduction Instructions
 
 ```bash
 # 1. Clone and checkout the branch

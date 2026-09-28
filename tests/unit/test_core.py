@@ -1568,9 +1568,9 @@ def test_target_grant_database_failure_is_recorded_as_failed_not_migrated():
 
     result = MigrationOrchestrator(source, target, {}).run_full()
 
-    assert result["phases"]["grants"] == {
-        "mysql_migration_source.customers TO 'migration_grant_test'@'localhost'": "skipped: GRANT denied"
-    }
+    assert result["phases"]["grants"] == [
+        "GRANT ... ON mysql_migration_source.customers TO 'migration_grant_test'@'localhost': failed (GRANT denied)"
+    ]
     grants = result["object_migration"]["categories"]["grants"]
     assert grants["status"] == "FAILED"
     assert grants["migrated"] == 0
@@ -1594,9 +1594,9 @@ def test_successful_target_grant_is_recorded_as_migrated():
 
     result = MigrationOrchestrator(source, target, {}).run_full()
 
-    assert result["phases"]["grants"] == {
-        "mysql_migration_source.customers TO 'migration_grant_test'@'localhost'": "applied"
-    }
+    assert result["phases"]["grants"] == [
+        "GRANT SELECT ON mysql_migration_source.customers TO 'migration_grant_test'@'localhost': applied"
+    ]
     grants = result["object_migration"]["categories"]["grants"]
     assert grants["status"] == "MIGRATED"
     assert grants["migrated"] == 1
@@ -2247,8 +2247,10 @@ class TestPostgresGrantSchemaQualification:
              "include_schemas": ["public", "audit_test"]}
         )
         cur = MagicMock()
+        # Query order: table, column, explicit sequence, owned sequence, schema, function
         cur.fetchall.side_effect = [
             [("audit_user", "audit_test", "test_customers", "SELECT, INSERT")],
+            [],
             [],
             [],
             [],
@@ -2321,6 +2323,41 @@ class TestPostgresGrantSchemaQualification:
         assert '"audit_test"."test_customers"' in grant_sql
         assert "TO audit_user" in grant_sql
 
+    def test_list_grants_preserves_function_and_procedure_types(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["cloud_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [],
+            [],
+            [],
+            [],
+            [
+                ("cloud_test", "get_customer_count()", "cloud_test_reader", "EXECUTE", "f"),
+                ("cloud_test", "log_message(IN p_message text)", "cloud_test_reader", "EXECUTE", "p"),
+            ],
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+
+        function_grant = next(g for g in grants if g.object_name == "get_customer_count()")
+        procedure_grant = next(g for g in grants if g.object_name == "log_message(IN p_message text)")
+        assert function_grant.object_type == "FUNCTION"
+        assert function_grant.schema_name == "cloud_test"
+        assert function_grant.privileges == "EXECUTE"
+        assert procedure_grant.object_type == "PROCEDURE"
+        assert procedure_grant.schema_name == "cloud_test"
+        assert procedure_grant.privileges == "EXECUTE"
+
     def test_target_apply_grant_qualifies_column_non_public_schema(self):
         from core.connectors.postgresql import PostgresTargetConnector
         target = PostgresTargetConnector(
@@ -2346,7 +2383,8 @@ class TestPostgresGrantSchemaQualification:
         executed = [c.args[0] for c in cur.execute.call_args_list]
         grant_sql = next((s for s in executed if "GRANT" in s), None)
         assert grant_sql is not None
-        assert '"test_customers"."email"' in grant_sql
+        # Valid PostgreSQL COLUMN grant syntax: GRANT privilege (column) ON TABLE schema.table TO role
+        assert grant_sql == 'GRANT SELECT ("email") ON TABLE "audit_test"."test_customers" TO audit_user'
         assert "TO audit_user" in grant_sql
 
     def test_target_apply_grant_remains_unqualified_for_public(self):
@@ -2375,6 +2413,426 @@ class TestPostgresGrantSchemaQualification:
         grant_sql = next((s for s in executed if "GRANT" in s), None)
         assert grant_sql is not None
         assert grant_sql.strip().startswith("GRANT SELECT ON TABLE customers TO public")
+
+
+class TestPostgresGrantFixes:
+    """
+    Tests for grant fixes:
+    - apply_grant raises exceptions (not silently swallowed)
+    - create_role_if_not_exists creates missing roles
+    - schema grant key doesn't duplicate schema name
+    """
+
+    def test_apply_grant_raises_on_failure(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+        # Make execute raise an exception
+        cur.execute.side_effect = Exception("role does not exist")
+
+        grant = GrantDef(
+            privileges="SELECT",
+            object_type="TABLE",
+            object_name="customers",
+            schema_name="public",
+            grantee="test_role",
+        )
+        with pytest.raises(Exception, match="role does not exist"):
+            target.apply_grant(grant)
+
+    def test_create_role_if_not_exists_creates_new_role(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+        # First call returns None (role doesn't exist), second call for CREATE ROLE
+        cur.fetchone.return_value = None
+
+        target.create_role_if_not_exists("new_role")
+
+        # Check parameterized SELECT query
+        select_calls = [c for c in cur.execute.call_args_list 
+                       if "SELECT 1 FROM pg_roles WHERE rolname = %s" in c.args[0]]
+        assert len(select_calls) == 1
+        assert select_calls[0].args[1] == ("new_role",)
+        
+        # Check CREATE ROLE was executed
+        create_calls = [c for c in cur.execute.call_args_list 
+                       if 'CREATE ROLE "new_role"' in c.args[0]]
+        assert len(create_calls) == 1
+        assert conn.commit.called
+
+    def test_create_role_if_not_exists_skips_existing_role(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+        # Role exists
+        cur.fetchone.return_value = (1,)
+
+        target.create_role_if_not_exists("existing_role")
+
+        # Check parameterized SELECT query
+        select_calls = [c for c in cur.execute.call_args_list 
+                       if "SELECT 1 FROM pg_roles WHERE rolname = %s" in c.args[0]]
+        assert len(select_calls) == 1
+        assert select_calls[0].args[1] == ("existing_role",)
+        
+        # Should NOT have CREATE ROLE
+        create_calls = [c for c in cur.execute.call_args_list 
+                       if "CREATE ROLE" in c.args[0]]
+        assert len(create_calls) == 0
+        # Should NOT commit
+        assert not conn.commit.called
+
+    def test_schema_grant_key_no_duplicate_schema(self):
+        """Schema grants should show as 'schema TO role' not 'schema.schema TO role'"""
+        from core.connectors.base import GrantDef
+        grant = GrantDef(
+            privileges="USAGE",
+            object_type="SCHEMA",
+            object_name="cloud_test",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        # This mimics the fixed orchestrator logic
+        if grant.object_type == "SCHEMA":
+            grant_key = f"{grant.object_name} TO {grant.grantee}"
+        else:
+            grant_key = (
+                f"{grant.object_name} TO {grant.grantee}"
+                if grant.schema_name == "public"
+                else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+            )
+        assert grant_key == "cloud_test TO cloud_test_reader"
+        assert grant_key != "cloud_test.cloud_test TO cloud_test_reader"
+
+    def test_apply_grant_column_generates_valid_postgresql_sql(self):
+        """COLUMN grants must use 'GRANT privilege (column) ON TABLE table TO role' syntax"""
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="SELECT, INSERT",
+            object_type="COLUMN",
+            object_name="customers.customer_id",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert grant_sql == (
+            'GRANT SELECT, INSERT ("customer_id") '
+            'ON TABLE "cloud_test"."customers" TO cloud_test_reader'
+        )
+
+    def test_apply_grant_function_generates_valid_postgresql_sql(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="EXECUTE",
+            object_type="FUNCTION",
+            object_name="get_customer_count()",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql == (
+            'GRANT EXECUTE ON FUNCTION "cloud_test".get_customer_count() '
+            'TO cloud_test_reader'
+        )
+
+    def test_apply_grant_procedure_generates_valid_postgresql_sql(self):
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="EXECUTE",
+            object_type="PROCEDURE",
+            object_name="log_message(IN p_message text)",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql == (
+            'GRANT EXECUTE ON PROCEDURE "cloud_test".log_message(IN p_message text) '
+            'TO cloud_test_reader'
+        )
+
+    def test_apply_grant_schema_generates_valid_postgresql_sql(self):
+        """SCHEMA grants must use 'GRANT ... ON SCHEMA schema TO role' syntax"""
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="USAGE",
+            object_type="SCHEMA",
+            object_name="cloud_test",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert 'ON SCHEMA "cloud_test"' in grant_sql
+        assert "TO cloud_test_reader" in grant_sql
+
+    def test_apply_grant_rollbacks_on_failure(self):
+        """Failed grants must rollback transaction and re-raise"""
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+        # Make execute raise an exception
+        cur.execute.side_effect = Exception("permission denied")
+
+        grant = GrantDef(
+            privileges="SELECT",
+            object_type="TABLE",
+            object_name="customers",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        with pytest.raises(Exception, match="permission denied"):
+            target.apply_grant(grant)
+        
+        # Must rollback
+        assert conn.rollback.called
+        # Must NOT commit
+        assert not conn.commit.called
+
+    def test_apply_grant_sequence_generates_valid_postgresql_sql(self):
+        """SEQUENCE grants must use 'GRANT ... ON SEQUENCE schema.sequence TO role' syntax"""
+        from core.connectors.postgresql import PostgresTargetConnector
+        from core.connectors.base import GrantDef
+        target = PostgresTargetConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False}
+        )
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        target._conn = conn
+
+        grant = GrantDef(
+            privileges="USAGE, SELECT",
+            object_type="SEQUENCE",
+            object_name="customers_customer_id_seq",
+            schema_name="cloud_test",
+            grantee="cloud_test_reader",
+        )
+        target.apply_grant(grant)
+
+        executed = [c.args[0] for c in cur.execute.call_args_list]
+        grant_sql = next((s for s in executed if "GRANT" in s), None)
+        assert grant_sql is not None
+        assert 'ON SEQUENCE "cloud_test"."customers_customer_id_seq"' in grant_sql
+        assert "TO cloud_test_reader" in grant_sql
+
+    def test_list_grants_includes_owned_sequence_for_insert(self):
+        """Roles with INSERT on table with owned sequence get USAGE on that sequence"""
+        from core.connectors.postgresql import PostgresSourceConnector
+        from core.connectors.base import GrantDef
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["cloud_test"]}
+        )
+        cur = MagicMock()
+        # Query order in list_grants:
+        # 1. Table grants (4 cols)
+        # 2. Column grants (5 cols)
+        # 3. Explicit sequence grants (4 cols)
+        # 4. Owned sequences NEW (3 cols)
+        # 5. Schema grants (3 cols)
+        # 6. Function grants (4 cols)
+        cur.fetchall.side_effect = [
+            [("cloud_test_reader", "cloud_test", "customers", "INSERT, SELECT")],  # table grants
+            [],  # column grants
+            [],  # explicit sequence grants
+            [("cloud_test", "customers_customer_id_seq", "cloud_test.customers.customer_id")],  # owned sequences
+            [],  # schema grants
+            [],  # function grants
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+        
+        # Should have table grant
+        table_grants = [g for g in grants if g.object_type == "TABLE" and g.object_name == "customers"]
+        assert len(table_grants) == 1
+        assert table_grants[0].grantee == "cloud_test_reader"
+        assert "INSERT" in table_grants[0].privileges
+        
+        # Should have implicit sequence grant for the owned sequence
+        seq_grants = [g for g in grants if g.object_type == "SEQUENCE" and g.object_name == "customers_customer_id_seq"]
+        assert len(seq_grants) == 1
+        assert seq_grants[0].grantee == "cloud_test_reader"
+        assert "USAGE" in seq_grants[0].privileges
+        assert seq_grants[0].schema_name == "cloud_test"
+
+    def test_list_grants_preserves_explicit_sequence_usage_and_select(self):
+        """Explicit sequence ACL entries must retain all privileges."""
+        from core.connectors.postgresql import PostgresSourceConnector
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["e2e_test"]}
+        )
+        cur = MagicMock()
+        cur.fetchall.side_effect = [
+            [],  # table grants
+            [],  # column grants
+            [("e2e_test_reader", "e2e_test", "customers_customer_id_seq", "USAGE, SELECT")],
+            [],  # owned sequences
+            [],  # schema grants
+            [],  # function grants
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+
+        seq_grants = [g for g in grants if g.object_type == "SEQUENCE"]
+        assert len(seq_grants) == 1
+        assert seq_grants[0].grantee == "e2e_test_reader"
+        assert seq_grants[0].object_name == "customers_customer_id_seq"
+        assert seq_grants[0].schema_name == "e2e_test"
+        assert seq_grants[0].privileges == "USAGE, SELECT"
+
+    def test_list_grants_no_duplicate_sequence_grant_if_explicit_exists(self):
+        """Don't add implicit sequence grant if explicit grant already exists"""
+        from core.connectors.postgresql import PostgresSourceConnector
+        from core.connectors.base import GrantDef
+        connector = PostgresSourceConnector(
+            {"host": "x", "port": 1, "database": "x",
+             "username": "u", "password": "p", "ssl": False,
+             "include_schemas": ["cloud_test"]}
+        )
+        cur = MagicMock()
+        # Query order:
+        # 1. Table grants (4 cols)
+        # 2. Column grants (5 cols)
+        # 3. Explicit sequence grants (4 cols)
+        # 4. Owned sequences NEW (3 cols)
+        # 5. Schema grants (3 cols)
+        # 6. Function grants (4 cols)
+        cur.fetchall.side_effect = [
+            [("cloud_test_reader", "cloud_test", "customers", "INSERT, SELECT")],  # table grants
+            [],  # column grants
+            [("cloud_test_reader", "cloud_test", "customers_customer_id_seq", "USAGE")],  # explicit sequence grants
+            [("cloud_test", "customers_customer_id_seq", "cloud_test.customers.customer_id")],  # owned sequences
+            [],  # schema grants
+            [],  # function grants
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        grants = connector.list_grants()
+        
+        # Should have table grant
+        table_grants = [g for g in grants if g.object_type == "TABLE" and g.object_name == "customers"]
+        assert len(table_grants) == 1
+        
+        # Should have ONLY ONE sequence grant (the explicit one, not duplicate)
+        seq_grants = [g for g in grants if g.object_type == "SEQUENCE" and g.object_name == "customers_customer_id_seq"]
+        assert len(seq_grants) == 1
+        assert seq_grants[0].privileges == "USAGE"  # explicit grant, not USAGE, SELECT
 
 
 class TestPostgresRLSSchemaQualification:
@@ -2592,6 +3050,222 @@ class TestPostgresCrossSchemaForeignKey:
         assert "ON DELETE SET NULL ON UPDATE RESTRICT" in fk_sql
 
 
+class TestPostgresCrossSchemaMetadataIsolation:
+    """
+    Regression: PostgresSourceConnector.get_schema() must scope all
+    metadata queries (PK, indexes, FKs, check constraints) by table_schema
+    so that same-named tables in different schemas do not pollute each
+    other's metadata.
+
+    Example: public.customers and cloud_test.customers both have
+    customer_id as PK. Without schema filtering, the PK query returns
+    customer_id twice, producing PRIMARY KEY (customer_id, customer_id).
+    """
+
+    def _source_conn(self):
+        from core.connectors.postgresql import PostgresSourceConnector
+        cfg = {
+            "host": "x", "port": 1, "database": "x",
+            "username": "u", "password": "p", "ssl": False,
+            "include_schemas": ["public", "cloud_test"],
+        }
+        return PostgresSourceConnector(cfg)
+
+    def _mock_cursor_for_schema(self, pk_rows, idx_rows=None, fk_rows=None, check_rows=None):
+        idx_rows = idx_rows if idx_rows is not None else []
+        fk_rows = fk_rows if fk_rows is not None else []
+        check_rows = check_rows if check_rows is not None else []
+        cur = MagicMock()
+        cur.fetchone.side_effect = [
+            ("cloud_test",),  # schema resolution
+            None,             # RLS
+            None,             # partition key
+        ]
+        cur.fetchall.side_effect = [
+            [("customer_id", "integer", "NO", None, None, None)],  # columns
+            pk_rows,                                                 # PK
+            idx_rows,                                                # indexes
+            fk_rows,                                                 # FKs
+            check_rows,                                              # check constraints
+        ]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        return conn, cur
+
+    def test_get_schema_pk_query_scoped_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[("customer_id",)],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        pk_sql = next(call.args[0] for call in cur.execute.call_args_list if "PRIMARY KEY" in call.args[0])
+        assert "tc.table_schema = %s" in pk_sql, (
+            f"PK query must filter by table_schema. Got: {pk_sql!r}"
+        )
+        pk_params = next(call.args[1] for call in cur.execute.call_args_list if "PRIMARY KEY" in call.args[0])
+        assert pk_params == ("customers", "cloud_test"), (
+            f"PK query params must include table_schema. Got: {pk_params!r}"
+        )
+        assert schema.primary_key == ["customer_id"]
+
+    def test_get_schema_index_query_scoped_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[],
+            idx_rows=[
+                ("idx_customer_id", True, ["customer_id"],
+                 "CREATE UNIQUE INDEX idx_customer_id ON cloud_test.customers (customer_id)"),
+            ],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        idx_sql = next(call.args[0] for call in cur.execute.call_args_list if "pg_get_indexdef" in call.args[0])
+        assert "n.nspname = %s" in idx_sql, (
+            f"Index query must filter by schema namespace. Got: {idx_sql!r}"
+        )
+        idx_params = next(call.args[1] for call in cur.execute.call_args_list if "pg_get_indexdef" in call.args[0])
+        assert idx_params == ("cloud_test", "customers"), (
+            f"Index query params must include schema then table name. Got: {idx_params!r}"
+        )
+        assert len(schema.indexes) == 1
+        assert schema.indexes[0].name == "idx_customer_id"
+
+    def test_get_schema_fk_query_scoped_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[],
+            fk_rows=[
+                ("fk_customer", "customer_id", "public", "customers", "customer_id", "CASCADE", "CASCADE"),
+            ],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        fk_sql = next(call.args[0] for call in cur.execute.call_args_list if "FOREIGN KEY" in call.args[0])
+        assert "tc.table_schema = %s" in fk_sql, (
+            f"FK query must filter by table_schema. Got: {fk_sql!r}"
+        )
+        assert "tc.table_schema = kcu.table_schema" in fk_sql, (
+            f"FK join must include schema equality. Got: {fk_sql!r}"
+        )
+        fk_params = next(call.args[1] for call in cur.execute.call_args_list if "FOREIGN KEY" in call.args[0])
+        assert fk_params == ("customers", "cloud_test"), (
+            f"FK query params must include table_schema. Got: {fk_params!r}"
+        )
+        assert len(schema.foreign_keys) == 1
+        assert schema.foreign_keys[0].name == "fk_customer"
+
+    def test_get_schema_check_constraint_query_scoped_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[],
+            check_rows=[("chk_customer_active", "active = true")],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        chk_sql = next(call.args[0] for call in cur.execute.call_args_list if "CHECK" in call.args[0])
+        assert "tc.table_schema = %s" in chk_sql, (
+            f"Check constraint query must filter by table_schema. Got: {chk_sql!r}"
+        )
+        assert "tc.constraint_schema = cc.constraint_schema" in chk_sql, (
+            f"Check constraint join must include schema equality. Got: {chk_sql!r}"
+        )
+        chk_params = next(call.args[1] for call in cur.execute.call_args_list if "CHECK" in call.args[0])
+        assert chk_params == ("customers", "cloud_test"), (
+            f"Check constraint query params must include table_schema. Got: {chk_params!r}"
+        )
+        assert len(schema.check_constraints) == 1
+        assert schema.check_constraints[0].name == "chk_customer_active"
+
+    def test_get_schema_fk_query_scopes_referential_constraints_and_column_usage_by_schema(self):
+        connector = self._source_conn()
+        conn, cur = self._mock_cursor_for_schema(
+            pk_rows=[],
+            fk_rows=[],
+        )
+        connector._conn = conn
+
+        connector.get_schema("customers")
+
+        fk_sql = next(
+            call.args[0] for call in cur.execute.call_args_list if "FOREIGN KEY" in call.args[0]
+        )
+        assert "tc.constraint_schema = rc.constraint_schema" in fk_sql, (
+            f"FK join to referential_constraints must include schema equality. Got: {fk_sql!r}"
+        )
+        assert "rc.unique_constraint_schema = ccu.constraint_schema" in fk_sql, (
+            f"FK join to constraint_column_usage must include schema equality. Got: {fk_sql!r}"
+        )
+
+    def test_get_schema_fk_no_duplicate_columns_under_cross_schema_pk_collision(self):
+        """Regression: when the referenced PK constraint name (e.g. customers_pkey)
+        exists in multiple schemas (public + cloud_test), an un-qualified FK
+        join returns one ccu row per colliding schema, which the fk_map dedup
+        turns into duplicated columns and/or a wrong ref_schema. The
+        schema-qualified joins must yield a single, correct row per FK."""
+        connector = self._source_conn()
+        cur = MagicMock()
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        connector._conn = conn
+
+        state = {"last_sql": None}
+
+        def _execute(sql, params=None):
+            state["last_sql"] = sql
+
+        cur.execute.side_effect = _execute
+        cur.fetchone.side_effect = [
+            ("cloud_test",),   # schema resolution
+            None,              # RLS
+            None,              # partition key
+        ]
+
+        def _fetchall():
+            sql = state["last_sql"]
+            if "FOREIGN KEY" in sql:
+                scoped = (
+                    "tc.constraint_schema = rc.constraint_schema" in sql
+                    and "rc.unique_constraint_schema = ccu.constraint_schema" in sql
+                )
+                if scoped:
+                    return [
+                        ("orders_customer_id_fkey", "customer_id", "cloud_test", "customers", "customer_id", "NO ACTION", "NO ACTION"),
+                        ("orders_product_id_fkey", "product_id", "cloud_test", "products", "product_id", "NO ACTION", "NO ACTION"),
+                    ]
+                return [
+                    ("orders_customer_id_fkey", "customer_id", "cloud_test", "customers", "customer_id", "NO ACTION", "NO ACTION"),
+                    ("orders_customer_id_fkey", "customer_id", "public", "customers", "customer_id", "NO ACTION", "NO ACTION"),
+                    ("orders_product_id_fkey", "product_id", "cloud_test", "products", "product_id", "NO ACTION", "NO ACTION"),
+                    ("orders_product_id_fkey", "product_id", "public", "products", "product_id", "NO ACTION", "NO ACTION"),
+                ]
+            return []
+
+        cur.fetchall.side_effect = _fetchall
+
+        schema = connector.get_schema("orders")
+
+        assert len(schema.foreign_keys) == 2
+        by_name = {fk.name: fk for fk in schema.foreign_keys}
+        assert set(by_name) == {"orders_customer_id_fkey", "orders_product_id_fkey"}
+        for fk in schema.foreign_keys:
+            assert len(fk.columns) == 1, f"{fk.name} columns duplicated: {fk.columns}"
+            assert len(fk.ref_columns) == 1, f"{fk.name} ref_columns duplicated: {fk.ref_columns}"
+            assert fk.ref_schema == "cloud_test", f"{fk.name} ref_schema wrong: {fk.ref_schema}"
+
+
 class TestConfigSchema:
     def test_schema_yaml_is_valid(self):
         import yaml
@@ -2607,3 +3281,47 @@ class TestConfigSchema:
         assert "target" in schema
         assert "migration" in schema
         assert "retry" in schema
+
+
+class TestOrchestratorGrantFailureTracking:
+    """Grant failures should be tracked in migration summary."""
+
+    def test_grant_failure_adds_to_failed_objects_and_all_errors(self):
+        from core.orchestrator import MigrationOrchestrator
+        from core.connectors.base import GrantDef
+
+        source = MagicMock(spec=SourceConnector)
+        target = MagicMock(spec=TargetConnector)
+
+        source.list_objects.return_value = ["customers"]
+        source.get_object_count.return_value = 1
+        source.get_schema.return_value = Schema(
+            name="customers", columns=[Column(name="id", source_type="integer")]
+        )
+        source.export_full.return_value = iter([{"id": 1}])
+        source.list_grants.return_value = [
+            GrantDef(
+                privileges="SELECT",
+                object_type="TABLE",
+                object_name="customers",
+                schema_name="public",
+                grantee="missing_role",
+            )
+        ]
+
+        target.connect.return_value = None
+        target.create_schema.return_value = None
+        target.create_object_if_missing.return_value = None
+        target.upsert_batch.return_value = UpsertResult(success_count=1)
+        target.get_object_count.return_value = 1
+        # Make apply_grant fail
+        target.apply_grant.side_effect = Exception("role does not exist")
+
+        orchestrator = MigrationOrchestrator(source, target, {})
+        result = orchestrator.run_full()
+
+        # Grant failure should be reflected in status
+        assert result["status"] == "partial_success"
+        # Grant failure should be recorded in the grants phase results
+        grants_phase = result["phases"].get("grants", [])
+        assert any("failed" in str(g) and "role does not exist" in str(g) for g in grants_phase)

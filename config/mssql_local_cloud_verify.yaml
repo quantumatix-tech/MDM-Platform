@@ -1,0 +1,38 @@
+source:
+  engine: mssql
+  connection:
+    host: localhost
+    port: 1533
+    database: mssql_migration_test
+    username: sa
+    password_secret: mssql_source_pass
+    ssl: false
+
+target:
+  engine: mssql
+  connection:
+    host: mssql-mig-test-01.database.windows.net
+    port: 1433
+    database: mssql-migration-cloud
+    username: mssqladmin
+    password_secret: mssql_target_pass
+    ssl: true
+
+migration:
+  mode: full
+  batch_size: 1000
+  include_schemas:
+    - sales_e2e_verify
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO

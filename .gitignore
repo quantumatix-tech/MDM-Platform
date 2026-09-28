@@ -25,6 +25,7 @@ build/
 # Logs and reports generated at runtime
 logs/
 reports/
+test-results/
 
 # Local secrets and credentials — never commit
 .env

@@ -52,6 +52,13 @@ class Column:
     generated_kind: str | None = None   # engine-specific storage mode, e.g. VIRTUAL/STORED
     auto_increment: bool = False
     comment: str | None = None
+    is_identity: bool = False
+    identity_seed: int | None = None
+    identity_increment: int | None = None
+    is_computed: bool = False
+    computed_definition: str | None = None
+    precision: int | None = None
+    scale: int | None = None
 
 
 @dataclass
@@ -61,6 +68,8 @@ class Index:
     unique: bool = False
     ddl: str | None = None              # full DDL from pg_get_indexdef (handles partial/expression)
     index_type: str | None = None       # e.g. BTREE, FULLTEXT, SPATIAL
+    included_columns: list[str] = field(default_factory=list)  # INCLUDE (col1, col2)
+    filter_definition: str | None = None  # WHERE clause for filtered indexes
 
 
 @dataclass
@@ -81,6 +90,13 @@ class CheckConstraint:
 
 
 @dataclass
+class DefaultConstraint:
+    name: str
+    column: str
+    definition: str
+
+
+@dataclass
 class Schema:
     name: str
     schema_name: str = "public"
@@ -90,6 +106,7 @@ class Schema:
     indexes: list[Index] = field(default_factory=list)
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     check_constraints: list[CheckConstraint] = field(default_factory=list)
+    default_constraints: list[DefaultConstraint] = field(default_factory=list)
     sequences: list[str] = field(default_factory=list)     # column names backed by sequences
     rls_enabled: bool = False
     partition_key: str | None = None    # e.g. "RANGE (created_at)" for partitioned tables
@@ -121,7 +138,7 @@ class MySQLPartitionDef:
 
 @dataclass
 class SequenceDef:
-    """A PostgreSQL sequence — standalone or column-owned."""
+    """A database sequence — standalone or column-owned."""
     name: str
     start_value: int
     min_value: int
@@ -131,6 +148,9 @@ class SequenceDef:
     last_value: int | None = None
     owned_by: str | None = None    # e.g. "orders.id" if column-owned
     schema: str | None = None      # source schema; None means "public" or unknown
+    data_type: str = "bigint"
+    cache_size: int = 1
+    is_cached: bool = True
 
 
 @dataclass
@@ -187,8 +207,10 @@ class TriggerDef:
     ddl contains the complete CREATE TRIGGER statement."""
     name: str
     table: str
-    ddl: str            # complete DDL from pg_get_triggerdef — ready to execute
+    ddl: str            # complete DDL from pg_get_triggerdef / sys.sql_modules — ready to execute
     schema_name: str = "public"
+    table_schema: str | None = None  # schema of the parent table (for cross-schema triggers)
+    is_disabled: bool = False  # True if the trigger is disabled on the source
 
 
 @dataclass
@@ -255,13 +277,69 @@ class SecurityPrincipalDef:
 
 
 @dataclass
+class SynonymDef:
+    """A database synonym (alias for another object)."""
+    name: str
+    schema_name: str
+    base_object: str    # fully qualified base object name, e.g. "schema.table"
+
+
+@dataclass
+class RoleDef:
+    """A database role principal."""
+    name: str
+    type: str = "R"     # 'R' = database role, 'C' = application role
+
+
+@dataclass
+class UserDef:
+    """A database user principal."""
+    name: str
+    type: str = "S"     # 'S' = SQL user, 'U' = Windows user
+
+
+@dataclass(init=False)
 class RoleMembershipDef:
-    """A MySQL role edge from role to either a user or another role."""
-    role_user: str
-    role_host: str
-    grantee_user: str
-    grantee_host: str
+    """A role edge for either MySQL accounts or database principals."""
+    member_name: str | None = None
+    role_name: str | None = None
+    role_user: str | None = None
+    role_host: str | None = None
+    grantee_user: str | None = None
+    grantee_host: str | None = None
     with_admin_option: bool = False
+
+    def __init__(
+        self,
+        *args: str,
+        member_name: str | None = None,
+        role_name: str | None = None,
+        role_user: str | None = None,
+        role_host: str | None = None,
+        grantee_user: str | None = None,
+        grantee_host: str | None = None,
+        with_admin_option: bool = False,
+    ) -> None:
+        if args:
+            if len(args) in (2, 3) and member_name is None and role_name is None:
+                member_name, role_name = args[:2]
+                if len(args) == 3:
+                    with_admin_option = bool(args[2])
+            elif len(args) in (4, 5) and all(
+                value is None for value in (member_name, role_name, role_user, role_host, grantee_user, grantee_host)
+            ):
+                role_user, role_host, grantee_user, grantee_host = args[:4]
+                if len(args) == 5:
+                    with_admin_option = bool(args[4])
+            else:
+                raise TypeError("RoleMembershipDef accepts either (member_name, role_name) or (role_user, role_host, grantee_user, grantee_host)")
+        self.member_name = member_name
+        self.role_name = role_name
+        self.role_user = role_user
+        self.role_host = role_host
+        self.grantee_user = grantee_user
+        self.grantee_host = grantee_host
+        self.with_admin_option = with_admin_option
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +489,12 @@ class SourceConnector(abc.ABC):
     def list_security_principals(self) -> list[SecurityPrincipalDef]:
         return []
 
+    def list_users(self) -> list[UserDef]:
+        return []
+
+    def list_roles(self) -> list[RoleDef]:
+        return []
+
     def list_role_memberships(self) -> list[RoleMembershipDef]:
         return []
 
@@ -421,6 +505,9 @@ class SourceConnector(abc.ABC):
     def security_scope_status(self) -> str | None:
         """Optional connector-owned explanation of its security migration scope."""
         return None
+
+    def list_synonyms(self) -> list[SynonymDef]:
+        return []
 
 
 class TargetConnector(abc.ABC):
@@ -536,6 +623,19 @@ class TargetConnector(abc.ABC):
     def security_migration_authorization(self) -> tuple[bool, str]:
         """Return whether target security writes may be attempted."""
         return True, ""
+
+    def create_synonym(self, synonym: SynonymDef) -> None:
+        pass
+
+
+    def create_role_if_not_exists(self, role_name: str) -> None:
+        pass
+
+    def create_user_if_not_exists(self, user_name: str) -> None:
+        pass
+
+    def create_role_membership(self, member_name: str, role_name: str) -> None:
+        pass
 
 
 class CDCEngine(abc.ABC):
