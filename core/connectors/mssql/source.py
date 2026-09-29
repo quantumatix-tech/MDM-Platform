@@ -3,10 +3,9 @@
 Extracted from ``core/connectors/mssql.py`` — all discovery and export
 logic for the source database.
 
-Two helper functions (``_non_computed_column_names`` and
-``_variant_column_names``) are resolved through the ``core.connectors.mssql``
-package namespace at call time via local imports so that test patches on
-``core.connectors.mssql._non_computed_column_names`` are honoured.
+Table-specific discovery and export logic is delegated to
+``core.connectors.mssql.objects.table`` so that ``source.py`` acts as the
+connector-facing router.
 """
 from __future__ import annotations
 
@@ -29,7 +28,6 @@ from core.connectors.base import (
     TypeDef,
     UserDef,
     ViewDefinition,
-    quote_identifier,
     validate_identifier,
 )
 from core.driver_installer import ensure_driver
@@ -41,9 +39,11 @@ from core.connectors.mssql._models import (
     PartitionSchemeDef,
     PartitionedTableDef,
     _build_mssql_index_ddl,
+    _mssql_column_type,
     _qualify,
     _resolve_mssql_schemas,
 )
+from core.connectors.mssql.objects import table as _mssql_table
 
 
 class MSSQLSourceConnector(SourceConnector):
@@ -70,61 +70,26 @@ class MSSQLSourceConnector(SourceConnector):
         audit_log(phase="connect", status="success", details={"engine": "mssql", "role": "source"})
 
     def list_objects(self) -> list[str]:
-        schemas = _resolve_mssql_schemas(self._config)
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    f"SELECT DISTINCT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                    f"WHERE TABLE_TYPE = 'BASE TABLE' "
-                    f"AND TABLE_SCHEMA IN ({placeholders}) "
-                    f"ORDER BY TABLE_NAME",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    "SELECT DISTINCT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                    "WHERE TABLE_TYPE = 'BASE TABLE' "
-                    "AND TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') "
-                    "ORDER BY TABLE_NAME"
-                )
-            tables = [row[0] for row in cur.fetchall()]
-        for t in tables:
-            validate_identifier(t, "table")
-        return tables
+        """Return user base tables in the configured schemas.
+
+        Delegates to ``table.discover_tables`` for the table-discovery logic.
+        """
+        return _mssql_table.discover_tables(self._conn, self._config)
 
     def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
-        validate_identifier(object_name, "table")
-        qualified = _qualify(schema_name, object_name)
-        with self._conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {qualified}")
-            return cur.fetchone()[0]
+        """Count rows in a table. Delegates to ``table.get_table_row_count``."""
+        return _mssql_table.get_table_row_count(self._conn, object_name, schema_name)
 
     def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict]:
-        # Resolved through the package namespace so test patches on
-        # ``core.connectors.mssql._non_computed_column_names`` /
-        # ``_variant_column_names`` are honoured at call time.
-        from core.connectors.mssql import _non_computed_column_names, _variant_column_names
+        """Stream all rows from a table. Delegates to ``table.export_table_data``.
 
-        validate_identifier(object_name, "table")
-        qualified = _qualify(schema_name, object_name)
-        with self._conn.cursor() as cur:
-            cols = _non_computed_column_names(self._conn, object_name, schema_name)
-            if cols:
-                variant_cols = _variant_column_names(self._conn, object_name, schema_name)
-                col_exprs = [
-                    f"CAST({quote_identifier(c)} AS NVARCHAR(MAX)) AS {quote_identifier(c)}"
-                    if c in variant_cols
-                    else quote_identifier(c)
-                    for c in cols
-                ]
-                col_list = ", ".join(col_exprs)
-                cur.execute(f"SELECT {col_list} FROM {qualified}")
-            else:
-                cur.execute(f"SELECT * FROM {qualified}")
-            columns = [desc[0] for desc in cur.description]
-            for row in cur:
-                yield dict(zip(columns, row))
+        The column-introspection helpers ``_non_computed_column_names`` and
+        ``_variant_column_names`` are resolved inside ``table.py`` through the
+        ``core.connectors.mssql`` package namespace at call time so that test
+        patches on ``core.connectors.mssql._non_computed_column_names`` are
+        honoured.
+        """
+        yield from _mssql_table.export_table_data(self._conn, object_name, schema_name)
 
     def get_schema(self, object_name: str) -> Schema:
         validate_identifier(object_name, "table")

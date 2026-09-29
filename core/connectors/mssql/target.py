@@ -3,10 +3,9 @@
 Extracted from ``core/connectors/mssql.py`` — all DDL creation, constraint
 application, and write logic for the target database.
 
-The two column-introspection helpers ``_non_computed_column_names`` and
-``_variant_column_names`` are resolved through the ``core.connectors.mssql``
-package namespace at call time (via local imports inside ``export_full``) so
-that test patches on those names are honoured.
+Table-specific operations (creation, upsert, export, delete, row count)
+are delegated to ``core.connectors.mssql.objects.table`` so that
+``target.py`` acts as the connector-facing router.
 """
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ from core.connectors.base import (
     Schema,
     TargetConnector,
     UpsertResult,
-    UnmappedTypeError,
     ViewDefinition,
     FunctionDef,
     SynonymDef,
@@ -36,10 +34,9 @@ from core.audit_logger import audit_log
 from core.connectors.mssql._models import (
     PartitionFunctionDef,
     PartitionSchemeDef,
-    _mssql_column_type,
     _qualify,
-    _target_identity_columns,
 )
+from core.connectors.mssql.objects import table as _mssql_table
 
 
 class MSSQLTargetConnector(TargetConnector):
@@ -189,194 +186,29 @@ class MSSQLTargetConnector(TargetConnector):
                 raise
 
     def create_object_if_missing(self, schema: "Schema") -> None:
-        validate_identifier(schema.name, "table")
-        schema_name = schema.schema_name or "dbo"
-        validate_identifier(schema_name, "schema")
-        qualified = _qualify(schema_name, schema.name)
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ?",
-                (schema.name, schema_name),
-            )
-            if cur.fetchone() is not None:
-                return
-
-            # Ensure the target schema exists (dbo always exists in SQL Server).
-            if schema_name != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (schema_name,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(schema_name)}")
-                    audit_log(phase="create_schema", status="created", details={"schema": schema_name})
-
-            col_defs = []
-            for col in schema.columns:
-                if col.is_computed:
-                    # Computed columns: AS (<definition>). Nullability is inferred
-                    # from the expression (specifying NULL/NOT NULL requires PERSISTED, error 8183)
-                    # — so omit it and let SQL Server infer, matching the source.
-                    col_defs.append(f"{col.name} AS ({col.computed_definition})")
-                    continue
-                if col.target_type is None:
-                    if self._config.get("source_engine") == "mssql":
-                        col_type = col.source_type
-                    else:
-                        raise UnmappedTypeError(
-                            table=schema.name,
-                            column=col.name,
-                            source_type=col.source_type,
-                            source_engine=self._config.get("source_engine"),
-                            target_engine="mssql",
-                        )
-                else:
-                    col_type = col.target_type
-                col_type = _mssql_column_type(col_type, col.size, col.precision, col.scale)
-                identity_part = ""
-                if col.is_identity and col.identity_seed is not None and col.identity_increment is not None:
-                    identity_part = f" IDENTITY({col.identity_seed},{col.identity_increment})"
-                null_str = "NULL" if col.nullable else "NOT NULL"
-                col_defs.append(f"{col.name} {col_type}{identity_part} {null_str}")
-
-            if schema.primary_key:
-                pk_cols = ", ".join(schema.primary_key)
-                col_defs.append(f"PRIMARY KEY ({pk_cols})")
-
-            ddl = f"CREATE TABLE {qualified} ({', '.join(col_defs)})"
-            cur.execute(ddl)
-            self._conn.commit()
-            audit_log(phase="create_table", status="created", details={"table": qualified})
+        """Create a table if it doesn't exist. Delegates to ``table.create_table``."""
+        _mssql_table.create_table(self._conn, schema, self._config)
 
     def upsert_batch(
         self,
         object_name: str,
         rows: Iterator[dict[str, Any]],
         schema: "Schema | None" = None,
-    ) -> "UpsertResult":
-        validate_identifier(object_name, "table")
-        result = UpsertResult()
-        batch = list(rows)
-
-        if not batch:
-            return result
-
-        schema_name = (schema.schema_name or "dbo") if schema else None
-        qualified = _qualify(schema_name, object_name)
-        # Inspect the ACTUAL target table: only enable IDENTITY_INSERT when the
-        # destination column is really an IDENTITY column (preserves source ids).
-        # Pre-existing Step 4 tables created as plain INT are left untouched.
-        target_id_cols = set(_target_identity_columns(self._conn, object_name, schema_name))
-        # Source-side identity columns cannot appear in the UPDATE SET of a MERGE
-        # (SQL Server: "Cannot update identity column", error 8102), but they MUST
-        # stay in the INSERT list so the explicit source identity values are kept.
-        schema_id_cols = {c.name for c in (schema.columns if schema else []) if c.is_identity}
-        # Identify sql_variant columns — pyodbc cannot bind them as ? parameters;
-        # use CAST(? AS SQL_VARIANT) so the source string values are coerced.
-        variant_cols: set[str] = set()
-        if schema:
-            variant_cols = {
-                c.name
-                for c in schema.columns
-                if c.source_type and "sql_variant" in c.source_type.lower()
-            }
-        with self._conn.cursor() as cur:
-            columns = list(batch[0].keys())
-            col_names = ", ".join(columns)
-            placeholders = ", ".join(
-                "CAST(? AS SQL_VARIANT)" if col in variant_cols else "?"
-                for col in columns
-            )
-            updatable_cols = [c for c in columns if c not in schema_id_cols]
-            update_set = ", ".join(
-                f"target.{col} = source.{col}" for col in updatable_cols
-            )
-
-            pk_cols = schema.primary_key if schema else []
-            if pk_cols:
-                pk_clause = " AND ".join(f"target.{col} = source.{col}" for col in pk_cols)
-                on_clause = pk_clause
-            else:
-                on_clause = "1=0"
-
-            sql = (
-                f"MERGE INTO {qualified} AS target "
-                f"USING (SELECT {placeholders}) AS source ({col_names}) "
-                f"ON {on_clause} "
-                f"WHEN MATCHED THEN UPDATE SET {update_set} "
-                f"WHEN NOT MATCHED THEN INSERT ({col_names}) VALUES (source.{col_names});"
-            )
-
-            need_id_insert = bool(target_id_cols & set(columns))
-            try:
-                if need_id_insert:
-                    cur.execute(f"SET IDENTITY_INSERT {qualified} ON")
-                for row in batch:
-                    values = [row.get(col) for col in columns]
-                    cur.execute(sql, values)
-                self._conn.commit()
-                result.success_count = len(batch)
-                audit_log(phase="upsert_batch", status="success", details={"table": qualified, "count": len(batch)})
-            except Exception as exc:
-                self._conn.rollback()
-                result.failure_count = len(batch)
-                result.errors.append(str(exc))
-                result.failed_items.extend(batch)
-                audit_log(phase="upsert_batch", status="failure", details={"table": qualified, "error": str(exc)})
-            finally:
-                if need_id_insert:
-                    cur.execute(f"SET IDENTITY_INSERT {qualified} OFF")
-
-        return result
+    ) -> UpsertResult:
+        """Upsert a batch of rows. Delegates to ``table.upsert_table_data``."""
+        return _mssql_table.upsert_table_data(self._conn, object_name, rows, schema)
 
     def get_object_count(self, object_name: str, schema_name: str | None = None) -> int:
-        validate_identifier(object_name, "table")
-        qualified = _qualify(schema_name, object_name)
-        with self._conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {qualified}")
-            return cur.fetchone()[0]
+        """Count rows in a table. Delegates to ``table.get_table_row_count``."""
+        return _mssql_table.get_table_row_count(self._conn, object_name, schema_name)
 
     def delete(self, object_name: str, document: dict[str, Any], schema: "Schema | None" = None) -> None:
-        validate_identifier(object_name, "table")
-        schema_name = (schema.schema_name or "dbo") if schema else None
-        qualified = _qualify(schema_name, object_name)
-        with self._conn.cursor() as cur:
-            if schema and schema.primary_key:
-                conditions = []
-                values = []
-                for pk_col in schema.primary_key:
-                    conditions.append(f"{pk_col} = ?")
-                    values.append(document.get(pk_col))
-                where_clause = " AND ".join(conditions)
-                cur.execute(f"DELETE FROM {qualified} WHERE {where_clause}", values)
-            else:
-                cur.execute(f"DELETE FROM {qualified} WHERE id = ?", (document.get("id"),))
-            self._conn.commit()
-            audit_log(phase="cdc_delete", status="deleted", details={"table": qualified})
+        """Delete rows from a table. Delegates to ``table.delete_from_table``."""
+        _mssql_table.delete_from_table(self._conn, object_name, document, schema)
 
     def export_full(self, object_name: str, schema_name: str | None = None) -> Iterator[dict]:
-        # Resolved through the package namespace so test patches on
-        # ``core.connectors.mssql._non_computed_column_names`` /
-        # ``_variant_column_names`` are honoured at call time.
-        from core.connectors.mssql import _non_computed_column_names, _variant_column_names
-
-        validate_identifier(object_name, "table")
-        qualified = _qualify(schema_name, object_name)
-        with self._conn.cursor() as cur:
-            cols = _non_computed_column_names(self._conn, object_name, schema_name)
-            if cols:
-                variant_cols = _variant_column_names(self._conn, object_name, schema_name)
-                col_exprs = [
-                    f"CAST({quote_identifier(c)} AS NVARCHAR(MAX)) AS {quote_identifier(c)}"
-                    if c in variant_cols
-                    else quote_identifier(c)
-                    for c in cols
-                ]
-                col_list = ", ".join(col_exprs)
-                cur.execute(f"SELECT {col_list} FROM {qualified}")
-            else:
-                cur.execute(f"SELECT * FROM {qualified}")
-            columns = [desc[0] for desc in cur.description]
-            for row in cur:
-                yield dict(zip(columns, row))
+        """Stream all rows from a table. Delegates to ``table.export_table_data``."""
+        yield from _mssql_table.export_table_data(self._conn, object_name, schema_name)
 
     def apply_constraints(self, schema: "Schema") -> None:
         validate_identifier(schema.name, "table")
@@ -839,71 +671,10 @@ class MSSQLTargetConnector(TargetConnector):
         partition_scheme_name: str,
         partition_column: str,
     ) -> None:
-        """Create a table with partitioning applied."""
-        validate_identifier(schema.name, "table")
-        schema_name = schema.schema_name or "dbo"
-        validate_identifier(schema_name, "schema")
-        validate_identifier(partition_scheme_name, "partition scheme")
-        validate_identifier(partition_column, "column")
-        qualified = _qualify(schema_name, schema.name)
-
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ?",
-                (schema.name, schema_name),
-            )
-            if cur.fetchone() is not None:
-                audit_log(
-                    phase="create_partitioned_table", status="exists",
-                    details={"table": qualified},
-                )
-                return
-
-            if schema_name != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (schema_name,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(schema_name)}")
-                    audit_log(
-                        phase="create_schema", status="created",
-                        details={"schema": schema_name},
-                    )
-
-            col_defs = []
-            for col in schema.columns:
-                if col.is_computed:
-                    col_defs.append(f"{col.name} AS ({col.computed_definition})")
-                    continue
-                col_type = col.source_type or col.target_type or "nvarchar"
-                col_type = _mssql_column_type(col_type, col.size, col.precision, col.scale)
-                identity_part = ""
-                if col.is_identity and col.identity_seed is not None and col.identity_increment is not None:
-                    identity_part = f" IDENTITY({col.identity_seed},{col.identity_increment})"
-                null_str = "NULL" if col.nullable else "NOT NULL"
-                col_defs.append(f"{col.name} {col_type}{identity_part} {null_str}")
-
-            if schema.primary_key:
-                pk_cols = ", ".join(schema.primary_key)
-                col_defs.append(f"PRIMARY KEY ({pk_cols})")
-
-            ddl = (
-                f"CREATE TABLE {qualified} ({', '.join(col_defs)}) "
-                f"ON {partition_scheme_name}({partition_column})"
-            )
-            try:
-                cur.execute(ddl)
-                self._conn.commit()
-                audit_log(
-                    phase="create_partitioned_table", status="created",
-                    details={"table": qualified},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_partitioned_table", status="failed",
-                    details={"table": qualified, "reason": str(exc)},
-                )
-                raise
+        """Create a table with partitioning applied. Delegates to ``table.create_partitioned_table``."""
+        _mssql_table.create_partitioned_table(
+            self._conn, schema, partition_scheme_name, partition_column
+        )
 
     # ------------------------------------------------------------------
     # Step 14 — Security: Roles, Users & Role Memberships (target creation)
