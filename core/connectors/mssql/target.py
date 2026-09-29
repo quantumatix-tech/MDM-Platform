@@ -4,10 +4,10 @@ Extracted from ``core/connectors/mssql.py`` — all DDL creation, constraint
 application, and write logic for the target database.
 
 Table-specific operations (creation, upsert, export, delete, row count)
-are delegated to ``core.connectors.mssql.objects.table`` and
-partition-specific operations to
-``core.connectors.mssql.objects.partition`` so that ``target.py`` acts as the
-connector-facing router.
+are delegated to ``core.connectors.mssql.objects.table``, partition-specific
+operations to ``core.connectors.mssql.objects.partition`` and
+security-specific operations to ``core.connectors.mssql.objects.security``
+so that ``target.py`` acts as the connector-facing router.
 """
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ from core.connectors.mssql.objects import synonym as _mssql_synonym
 from core.connectors.mssql.objects import type as _mssql_type
 from core.connectors.mssql.objects import comment as _mssql_comment
 from core.connectors.mssql.objects import partition as _mssql_partition
+from core.connectors.mssql.objects import security as _mssql_security
 
 
 class MSSQLTargetConnector(TargetConnector):
@@ -321,167 +322,35 @@ class MSSQLTargetConnector(TargetConnector):
     def create_role_if_not_exists(self, role_name: str) -> None:
         """Create a database role on the target if it does not already exist.
 
-        Idempotent: if any database principal with that name already
-        exists (role or user), creation is skipped.
+        Delegates to
+        ``core.connectors.mssql.objects.security.create_role_if_not_exists``.
         """
-        validate_identifier(role_name, "role")
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM sys.database_principals WHERE name = ?",
-                (role_name,),
-            )
-            if cur.fetchone() is not None:
-                audit_log(
-                    phase="create_role", status="exists",
-                    details={"role": role_name},
-                )
-                return
-            try:
-                cur.execute(f"CREATE ROLE [{role_name}]")
-                self._conn.commit()
-                audit_log(
-                    phase="create_role", status="created",
-                    details={"role": role_name},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_role", status="failed",
-                    details={"role": role_name, "reason": str(exc)},
-                )
-                raise
+        _mssql_security.create_role_if_not_exists(self._conn, role_name)
 
     def create_user_if_not_exists(self, user_name: str) -> None:
         """Create a database user on the target if it does not already exist.
 
-        Does NOT create server-level logins or migrate passwords.
-        If a login with the same name exists on the server, the user is
-        mapped to it; otherwise a contained user is created.
+        Delegates to
+        ``core.connectors.mssql.objects.security.create_user_if_not_exists``.
         """
-        validate_identifier(user_name, "user")
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM sys.database_principals WHERE name = ?",
-                (user_name,),
-            )
-            if cur.fetchone() is not None:
-                audit_log(
-                    phase="create_user", status="exists",
-                    details={"user": user_name},
-                )
-                return
-            cur.execute(
-                "SELECT 1 FROM sys.server_principals WHERE name = ?",
-                (user_name,),
-            )
-            login_exists = cur.fetchone() is not None
-            try:
-                if login_exists:
-                    cur.execute(f"CREATE USER [{user_name}] FOR LOGIN [{user_name}]")
-                else:
-                    cur.execute(f"CREATE USER [{user_name}] WITHOUT LOGIN")
-                self._conn.commit()
-                audit_log(
-                    phase="create_user", status="created",
-                    details={"user": user_name},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_user", status="failed",
-                    details={"user": user_name, "reason": str(exc)},
-                )
-                raise
+        _mssql_security.create_user_if_not_exists(self._conn, user_name)
 
     def create_role_membership(self, member_name: str, role_name: str) -> None:
-        """Add a database principal to a database role (idempotent)."""
-        validate_identifier(member_name, "member")
-        validate_identifier(role_name, "role")
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM sys.database_role_members drm "
-                "JOIN sys.database_principals m "
-                "  ON drm.member_principal_id = m.principal_id "
-                "JOIN sys.database_principals r "
-                "  ON drm.role_principal_id = r.principal_id "
-                "WHERE m.name = ? AND r.name = ?",
-                (member_name, role_name),
-            )
-            if cur.fetchone() is not None:
-                audit_log(
-                    phase="create_role_membership", status="exists",
-                    details={"member": member_name, "role": role_name},
-                )
-                return
-            try:
-                cur.execute(
-                    f"ALTER ROLE [{role_name}] ADD MEMBER [{member_name}]"
-                )
-                self._conn.commit()
-                audit_log(
-                    phase="create_role_membership", status="created",
-                    details={"member": member_name, "role": role_name},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_role_membership", status="failed",
-                    details={"member": member_name, "role": role_name, "reason": str(exc)},
-                )
-                raise
+        """Add a database principal to a database role (idempotent).
+
+        Delegates to
+        ``core.connectors.mssql.objects.security.create_role_membership``.
+        """
+        _mssql_security.create_role_membership(
+            self._conn, member_name, role_name
+        )
 
     def apply_grant(self, grant: "GrantDef") -> None:
         """Apply a GRANT statement using MSSQL-native syntax.
 
-        Translates the cross-engine GrantDef into the appropriate
-        MSSQL GRANT form based on object_type:
-          - DATABASE: GRANT <privs> ON DATABASE::[db] TO [grantee]
-          - SCHEMA:   GRANT <privs> ON SCHEMA::[schema] TO [grantee]
-          - TABLE:    GRANT <privs> ON [schema].[table] TO [grantee]
-          - COLUMN:   GRANT <privs> (<column>) ON [schema].[table] TO [grantee]
+        Delegates to ``core.connectors.mssql.objects.security.apply_grant``.
         """
-        grantee_q = f"[{grant.grantee}]"
-        privileges = grant.privileges
-        schema_q = f"[{grant.schema_name or 'dbo'}]"
-        with self._conn.cursor() as cur:
-            try:
-                if grant.object_type == "DATABASE":
-                    db_name = grant.object_name or self._config.get("database", "master")
-                    cur.execute(
-                        f"GRANT {privileges} ON DATABASE::[{db_name}] TO {grantee_q}"
-                    )
-                elif grant.object_type == "SCHEMA":
-                    cur.execute(
-                        f"GRANT {privileges} ON SCHEMA::{schema_q} TO {grantee_q}"
-                    )
-                elif grant.object_type == "COLUMN":
-                    parts = grant.object_name.split(".")
-                    table_q = f"[{parts[0]}]"
-                    column_q = f"[{parts[1]}]"
-                    cur.execute(
-                        f"GRANT {privileges} ({column_q}) "
-                        f"ON {schema_q}.{table_q} TO {grantee_q}"
-                    )
-                else:
-                    object_q = f"[{grant.object_name}]"
-                    cur.execute(
-                        f"GRANT {privileges} ON {schema_q}.{object_q} TO {grantee_q}"
-                    )
-                self._conn.commit()
-                audit_log(
-                    phase="apply_grant", status="applied",
-                    details={"object": grant.object_name,
-                             "grantee": grant.grantee,
-                             "privileges": privileges},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="apply_grant", status="failed",
-                    details={"object": grant.object_name,
-                             "grantee": grant.grantee, "reason": str(exc)},
-                )
-                raise
+        _mssql_security.apply_grant(self._conn, self._config, grant)
 
     # ------------------------------------------------------------------
     # Step 15 — Comments / Extended Properties

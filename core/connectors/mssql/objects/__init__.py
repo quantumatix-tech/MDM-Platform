@@ -17,9 +17,7 @@ Currently implemented:
   - type    : Type (alias) discovery, DDL creation
   - comment : Comment/extended property discovery, application
   - partition: Partition function/scheme discovery + creation, partitioned table creation
-
-Future object modules (NOT yet created):
-  - security (roles, users, grants)
+  - security: Grant/user/role/membership discovery, role/user/membership/grant creation
 """
 from core.connectors.mssql.objects import table
 from core.connectors.mssql.objects import view
@@ -30,5 +28,6 @@ from core.connectors.mssql.objects import synonym
 from core.connectors.mssql.objects import type
 from core.connectors.mssql.objects import comment
 from core.connectors.mssql.objects import partition
+from core.connectors.mssql.objects import security
 
-__all__ = ["table", "view", "trigger", "function", "sequence", "synonym", "type", "comment", "partition"]
+__all__ = ["table", "view", "trigger", "function", "sequence", "synonym", "type", "comment", "partition", "security"]

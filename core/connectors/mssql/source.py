@@ -4,9 +4,10 @@ Extracted from ``core/connectors/mssql.py`` — all discovery and export
 logic for the source database.
 
 Table-specific discovery and export logic is delegated to
-``core.connectors.mssql.objects.table`` and partition-specific discovery to
-``core.connectors.mssql.objects.partition`` so that ``source.py`` acts as the
-connector-facing router.
+``core.connectors.mssql.objects.table``, partition-specific discovery to
+``core.connectors.mssql.objects.partition`` and security-specific discovery
+to ``core.connectors.mssql.objects.security`` so that ``source.py`` acts as
+the connector-facing router.
 """
 from __future__ import annotations
 
@@ -42,7 +43,6 @@ from core.connectors.mssql._models import (
     _build_mssql_index_ddl,
     _mssql_column_type,
     _qualify,
-    _resolve_mssql_schemas,
 )
 from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
@@ -53,6 +53,7 @@ from core.connectors.mssql.objects import synonym as _mssql_synonym
 from core.connectors.mssql.objects import type as _mssql_type
 from core.connectors.mssql.objects import comment as _mssql_comment
 from core.connectors.mssql.objects import partition as _mssql_partition
+from core.connectors.mssql.objects import security as _mssql_security
 
 
 class MSSQLSourceConnector(SourceConnector):
@@ -383,148 +384,9 @@ class MSSQLSourceConnector(SourceConnector):
     def list_grants(self) -> list[GrantDef]:
         """Discover database permissions (schema, table, column, database level).
 
-        Queries sys.database_permissions, filtering to grants on objects
-        within the configured schemas (or all non-system schemas), excluding
-        system principals (public, dbo, fixed database roles).
+        Delegates to ``core.connectors.mssql.objects.security.list_grants``.
         """
-        from core.connectors.mssql._models import _MSSQL_FIXED_DB_ROLES
-
-        schemas = _resolve_mssql_schemas(self._config)
-        results: list[GrantDef] = []
-
-        _fixed_roles_sql = ", ".join(f"'{r}'" for r in _MSSQL_FIXED_DB_ROLES)
-
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    f"SELECT dp.permission_name, dp.class_desc, "
-                    f"dp.major_id, dp.minor_id, "
-                    f"grantee.name AS grantee_name, "
-                    f"obj.name AS object_name, "
-                    f"col.name AS column_name, "
-                    f"sch.name AS schema_name, "
-                    f"db.name AS database_name "
-                    f"FROM sys.database_permissions dp "
-                    f"JOIN sys.database_principals grantee "
-                    f"  ON dp.grantee_principal_id = grantee.principal_id "
-                    f"LEFT JOIN sys.objects obj "
-                    f"  ON dp.major_id = obj.object_id "
-                    f"  AND dp.class_desc = 'OBJECT_OR_COLUMN' "
-                    f"LEFT JOIN sys.columns col "
-                    f"  ON dp.major_id = col.object_id "
-                    f"  AND dp.minor_id = col.column_id "
-                    f"  AND dp.class_desc = 'OBJECT_OR_COLUMN' "
-                    f"LEFT JOIN sys.schemas sch "
-                    f"  ON (dp.class_desc = 'OBJECT_OR_COLUMN' "
-                    f"      AND obj.schema_id = sch.schema_id) "
-                    f"  OR (dp.class_desc = 'SCHEMA' "
-                    f"      AND dp.major_id = sch.schema_id) "
-                    f"LEFT JOIN sys.databases db "
-                    f"  ON dp.major_id = db.database_id "
-                    f"  AND dp.class_desc = 'DATABASE' "
-                    f"WHERE dp.state = 'G' "
-                    f"  AND grantee.name NOT IN ({_fixed_roles_sql}) "
-                    f"  AND (dp.class_desc = 'DATABASE' "
-                    f"       OR sch.name IN ({placeholders})) "
-                    f"ORDER BY dp.class_desc, grantee.name, "
-                    f"ISNULL(sch.name, db.name), "
-                    f"ISNULL(obj.name, sch.name), col.name",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    f"SELECT dp.permission_name, dp.class_desc, "
-                    f"dp.major_id, dp.minor_id, "
-                    f"grantee.name AS grantee_name, "
-                    f"obj.name AS object_name, "
-                    f"col.name AS column_name, "
-                    f"sch.name AS schema_name, "
-                    f"db.name AS database_name "
-                    f"FROM sys.database_permissions dp "
-                    f"JOIN sys.database_principals grantee "
-                    f"  ON dp.grantee_principal_id = grantee.principal_id "
-                    f"LEFT JOIN sys.objects obj "
-                    f"  ON dp.major_id = obj.object_id "
-                    f"  AND dp.class_desc = 'OBJECT_OR_COLUMN' "
-                    f"LEFT JOIN sys.columns col "
-                    f"  ON dp.major_id = col.object_id "
-                    f"  AND dp.minor_id = col.column_id "
-                    f"  AND dp.class_desc = 'OBJECT_OR_COLUMN' "
-                    f"LEFT JOIN sys.schemas sch "
-                    f"  ON (dp.class_desc = 'OBJECT_OR_COLUMN' "
-                    f"      AND obj.schema_id = sch.schema_id) "
-                    f"  OR (dp.class_desc = 'SCHEMA' "
-                    f"      AND dp.major_id = sch.schema_id) "
-                    f"LEFT JOIN sys.databases db "
-                    f"  ON dp.major_id = db.database_id "
-                    f"  AND dp.class_desc = 'DATABASE' "
-                    f"WHERE dp.state = 'G' "
-                    f"  AND grantee.name NOT IN ({_fixed_roles_sql}) "
-                    f"  AND (dp.class_desc = 'DATABASE' "
-                    f"       OR sch.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest')) "
-                    f"ORDER BY dp.class_desc, grantee.name, "
-                    f"ISNULL(sch.name, db.name), "
-                    f"ISNULL(obj.name, sch.name), col.name"
-                )
-            rows = cur.fetchall()
-
-        groups: dict = {}
-        for row in rows:
-            (
-                permission_name,
-                class_desc,
-                major_id,
-                minor_id,
-                grantee_name,
-                object_name,
-                column_name,
-                schema_name,
-                database_name,
-            ) = row
-
-            if class_desc == "DATABASE":
-                obj_type = "DATABASE"
-                obj_name = database_name or ""
-                sch = ""
-            elif class_desc == "SCHEMA":
-                obj_type = "SCHEMA"
-                obj_name = schema_name or ""
-                sch = schema_name or ""
-            elif class_desc == "OBJECT_OR_COLUMN":
-                if minor_id and minor_id > 0:
-                    obj_type = "COLUMN"
-                    obj_name = f"{object_name}.{column_name}"
-                    sch = schema_name or ""
-                else:
-                    obj_type = "TABLE"
-                    obj_name = object_name or ""
-                    sch = schema_name or ""
-            else:
-                continue
-
-            key = (grantee_name, obj_type, obj_name, sch)
-            if key not in groups:
-                groups[key] = {
-                    "privileges": [],
-                    "object_type": obj_type,
-                    "object_name": obj_name,
-                    "schema_name": sch,
-                    "grantee": grantee_name,
-                }
-            groups[key]["privileges"].append(permission_name)
-
-        for info in groups.values():
-            results.append(
-                GrantDef(
-                    privileges=", ".join(sorted(set(info["privileges"]))),
-                    object_type=info["object_type"],
-                    object_name=info["object_name"],
-                    grantee=info["grantee"],
-                    schema_name=info["schema_name"],
-                )
-            )
-        return results
+        return _mssql_security.list_grants(self._conn, self._config)
 
     # ------------------------------------------------------------------
     # Step 14 — Security: Users, Roles & Role Memberships (source discovery)
@@ -533,70 +395,24 @@ class MSSQLSourceConnector(SourceConnector):
     def list_users(self) -> list[UserDef]:
         """Discover database users (excluding system principals).
 
-        Returns user-defined database users with type 'S' (SQL user) or
-        'U' (Windows user), excluding system principals (dbo, guest,
-        INFORMATION_SCHEMA, sys).
+        Delegates to ``core.connectors.mssql.objects.security.list_users``.
         """
-        results: list[UserDef] = []
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT name, type FROM sys.database_principals "
-                "WHERE type IN ('S', 'U') "
-                "AND name NOT IN ('dbo', 'guest', 'INFORMATION_SCHEMA', 'sys') "
-                "ORDER BY name"
-            )
-            for row in cur.fetchall():
-                results.append(UserDef(name=row[0], type=row[1]))
-        return results
+        return _mssql_security.list_users(self._conn)
 
     def list_roles(self) -> list[RoleDef]:
         """Discover database roles (excluding fixed/system roles).
 
-        Returns user-defined database roles with type 'R' (database role)
-        or 'C' (application role), excluding fixed system roles.
+        Delegates to ``core.connectors.mssql.objects.security.list_roles``.
         """
-        from core.connectors.mssql._models import _MSSQL_FIXED_DB_ROLES
-
-        _fixed_roles_sql = ", ".join(f"'{r}'" for r in _MSSQL_FIXED_DB_ROLES)
-        results: list[RoleDef] = []
-        with self._conn.cursor() as cur:
-            cur.execute(
-                f"SELECT name, type FROM sys.database_principals "
-                f"WHERE type IN ('R', 'C') "
-                f"AND name NOT IN ({_fixed_roles_sql}) "
-                f"ORDER BY name"
-            )
-            for row in cur.fetchall():
-                results.append(RoleDef(name=row[0], type=row[1]))
-        return results
+        return _mssql_security.list_roles(self._conn)
 
     def list_role_memberships(self) -> list[RoleMembershipDef]:
         """Discover database role memberships (excluding system principals).
 
-        Returns mappings of member_principal -> role_principal, excluding
-        memberships involving fixed/system principals (public, dbo, db_*).
+        Delegates to
+        ``core.connectors.mssql.objects.security.list_role_memberships``.
         """
-        from core.connectors.mssql._models import _MSSQL_FIXED_DB_ROLES
-
-        _fixed_roles_sql = ", ".join(f"'{r}'" for r in _MSSQL_FIXED_DB_ROLES)
-        results: list[RoleMembershipDef] = []
-        with self._conn.cursor() as cur:
-            cur.execute(
-                f"SELECT m.name AS member_name, r.name AS role_name "
-                f"FROM sys.database_role_members drm "
-                f"JOIN sys.database_principals m "
-                f"  ON drm.member_principal_id = m.principal_id "
-                f"JOIN sys.database_principals r "
-                f"  ON drm.role_principal_id = r.principal_id "
-                f"WHERE m.name NOT IN ({_fixed_roles_sql}) "
-                f"  AND r.name NOT IN ({_fixed_roles_sql}) "
-                f"ORDER BY r.name, m.name"
-            )
-            for row in cur.fetchall():
-                results.append(RoleMembershipDef(
-                    member_name=row[0], role_name=row[1]
-                ))
-        return results
+        return _mssql_security.list_role_memberships(self._conn)
 
     # ------------------------------------------------------------------
     # Step 12 — Partition discovery
