@@ -39,6 +39,7 @@ from core.connectors.mssql._models import (
 from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
 from core.connectors.mssql.objects import trigger as _mssql_trigger
+from core.connectors.mssql.objects import function as _mssql_function
 
 
 class MSSQLTargetConnector(TargetConnector):
@@ -351,39 +352,11 @@ class MSSQLTargetConnector(TargetConnector):
         _mssql_view.create_view(self._conn, view)
 
     def create_function(self, func: "FunctionDef") -> None:
-        validate_identifier(func.name, "function")
-        schema_name = func.schema_name or "dbo"
-        validate_identifier(schema_name, "schema")
-        with self._conn.cursor() as cur:
-            # Ensure the target schema exists (dbo always exists in SQL Server).
-            if schema_name != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (schema_name,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(schema_name)}")
-                    audit_log(
-                        phase="create_schema", status="created",
-                        details={"schema": schema_name},
-                    )
-            try:
-                # The DDL from sys.sql_modules.definition already includes
-                # "CREATE FUNCTION" or "CREATE PROCEDURE"; replace with CREATE OR ALTER
-                # for idempotency across re-runs.
-                ddl = func.ddl
-                if ddl.upper().startswith("CREATE "):
-                    ddl = "CREATE OR ALTER " + ddl[len("CREATE "):]
-                cur.execute(ddl)
-                self._conn.commit()
-                audit_log(
-                    phase="create_function", status="created",
-                    details={"function": func.name, "schema": schema_name},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_function", status="failed",
-                    details={"function": func.name, "schema": schema_name, "reason": str(exc)},
-                )
-                raise
+        """Create or alter a function on the target database.
+
+        Delegates to ``core.connectors.mssql.objects.function.create_function``.
+        """
+        _mssql_function.create_function(self._conn, func)
 
     def create_trigger(self, trigger: "TriggerDef") -> None:
         """Create or alter a trigger on the target database.

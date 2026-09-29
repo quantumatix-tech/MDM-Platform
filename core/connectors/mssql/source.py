@@ -46,6 +46,7 @@ from core.connectors.mssql._models import (
 from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
 from core.connectors.mssql.objects import trigger as _mssql_trigger
+from core.connectors.mssql.objects import function as _mssql_function
 
 
 class MSSQLSourceConnector(SourceConnector):
@@ -418,45 +419,9 @@ class MSSQLSourceConnector(SourceConnector):
     def list_functions(self) -> list[FunctionDef]:
         """Return user functions and stored procedures in the configured schemas.
 
-        SQL Server stores the full CREATE definition in sys.sql_modules.definition
-        (types: 'FN' scalar, 'TF' table-valued, 'IF' inline table-valued, 'P' procedure).
+        Delegates to ``core.connectors.mssql.objects.function.discover_functions``.
         """
-        schemas = _resolve_mssql_schemas(self._config)
-        results: list[FunctionDef] = []
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    "SELECT s.name, o.name, m.definition "
-                    "FROM sys.objects o "
-                    "JOIN sys.schemas s ON o.schema_id = s.schema_id "
-                    "JOIN sys.sql_modules m ON o.object_id = m.object_id "
-                    f"WHERE s.name IN ({placeholders}) "
-                    "AND o.type IN ('FN', 'TF', 'IF', 'P') "
-                    "ORDER BY s.name, o.name",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    "SELECT s.name, o.name, m.definition "
-                    "FROM sys.objects o "
-                    "JOIN sys.schemas s ON o.schema_id = s.schema_id "
-                    "JOIN sys.sql_modules m ON o.object_id = m.object_id "
-                    "WHERE s.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') "
-                    "AND o.type IN ('FN', 'TF', 'IF', 'P') "
-                    "ORDER BY s.name, o.name"
-                )
-            for schema_name, obj_name, definition in cur.fetchall():
-                validate_identifier(obj_name, "function")
-                validate_identifier(schema_name, "schema")
-                results.append(
-                    FunctionDef(
-                        name=obj_name,
-                        schema_name=schema_name,
-                        ddl=definition,
-                    )
-                )
-        return results
+        return _mssql_function.discover_functions(self._conn, self._config)
 
     def list_synonyms(self) -> list[SynonymDef]:
         """Return user synonyms in the configured schemas."""

@@ -11,9 +11,9 @@ Currently implemented:
   - table   : Table discovery, DDL, creation, data export/upsert/delete
   - view    : View discovery, DDL creation
   - trigger : Trigger discovery, DDL creation
+  - function: Function/procedure discovery, DDL creation
 
 Future object modules (NOT yet created):
-  - function / procedure
   - sequence
   - partition
   - security (roles, users, grants)
@@ -21,5 +21,6 @@ Future object modules (NOT yet created):
 from core.connectors.mssql.objects import table
 from core.connectors.mssql.objects import view
 from core.connectors.mssql.objects import trigger
+from core.connectors.mssql.objects import function
 
-__all__ = ["table", "view", "trigger"]
+__all__ = ["table", "view", "trigger", "function"]
