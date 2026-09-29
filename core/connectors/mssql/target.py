@@ -4,14 +4,15 @@ Extracted from ``core/connectors/mssql.py`` — all DDL creation, constraint
 application, and write logic for the target database.
 
 Table-specific operations (creation, upsert, export, delete, row count)
-are delegated to ``core.connectors.mssql.objects.table`` so that
-``target.py`` acts as the connector-facing router.
+are delegated to ``core.connectors.mssql.objects.table`` and
+partition-specific operations to
+``core.connectors.mssql.objects.partition`` so that ``target.py`` acts as the
+connector-facing router.
 """
 from __future__ import annotations
 
 import re
 from collections.abc import Iterator
-from datetime import date, datetime
 from typing import Any
 
 from core.connectors.base import (
@@ -44,6 +45,7 @@ from core.connectors.mssql.objects import sequence as _mssql_sequence
 from core.connectors.mssql.objects import synonym as _mssql_synonym
 from core.connectors.mssql.objects import type as _mssql_type
 from core.connectors.mssql.objects import comment as _mssql_comment
+from core.connectors.mssql.objects import partition as _mssql_partition
 
 
 class MSSQLTargetConnector(TargetConnector):
@@ -285,105 +287,18 @@ class MSSQLTargetConnector(TargetConnector):
     # ------------------------------------------------------------------
 
     def create_partition_function(self, pf: "PartitionFunctionDef") -> None:
-        """Create a partition function from metadata."""
-        validate_identifier(pf.name, "partition function")
-        validate_identifier(pf.schema_name, "schema")
-        pf_schema = pf.schema_name or "dbo"
+        """Create a partition function from metadata.
 
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM sys.partition_functions WHERE name = ?",
-                (pf.name,),
-            )
-            if cur.fetchone() is not None:
-                audit_log(
-                    phase="create_partition_function", status="exists",
-                    details={"function": f"{pf_schema}.{pf.name}"},
-                )
-                return
-
-            if pf_schema != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (pf_schema,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(pf_schema)}")
-                    audit_log(
-                        phase="create_schema", status="created",
-                        details={"schema": pf_schema},
-                    )
-
-            boundaries = ", ".join(
-                f"'{b.strftime('%Y-%m-%d')}'" if isinstance(b, (datetime, date))
-                else f"'{b}'" if isinstance(b, str)
-                else str(b)
-                for b in pf.boundaries
-            )
-            ddl = (
-                f"CREATE PARTITION FUNCTION {quote_identifier(pf.name)} "
-                f"({pf.data_type}) "
-                f"AS {pf.range_desc} FOR VALUES ({boundaries})"
-            )
-            try:
-                cur.execute(ddl)
-                self._conn.commit()
-                audit_log(
-                    phase="create_partition_function", status="created",
-                    details={"function": f"{pf_schema}.{pf.name}"},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_partition_function", status="failed",
-                    details={"function": f"{pf_schema}.{pf.name}", "reason": str(exc)},
-                )
-                raise
+        Delegates to ``objects.partition.create_partition_function``.
+        """
+        _mssql_partition.create_partition_function(self._conn, pf)
 
     def create_partition_scheme(self, ps: "PartitionSchemeDef") -> None:
-        """Create a partition scheme from metadata."""
-        validate_identifier(ps.name, "partition scheme")
-        validate_identifier(ps.schema_name, "schema")
-        ps_schema = ps.schema_name or "dbo"
+        """Create a partition scheme from metadata.
 
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM sys.partition_schemes WHERE name = ?",
-                (ps.name,),
-            )
-            if cur.fetchone() is not None:
-                audit_log(
-                    phase="create_partition_scheme", status="exists",
-                    details={"scheme": f"{ps_schema}.{ps.name}"},
-                )
-                return
-
-            if ps_schema != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (ps_schema,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(ps_schema)}")
-                    audit_log(
-                        phase="create_schema", status="created",
-                        details={"schema": ps_schema},
-                    )
-
-            filegroups = ", ".join(f"[{fg}]" for fg in ps.filegroups)
-            ddl = (
-                f"CREATE PARTITION SCHEME {quote_identifier(ps.name)} "
-                f"AS PARTITION {quote_identifier(ps.partition_function_name)} "
-                f"TO ({filegroups})"
-            )
-            try:
-                cur.execute(ddl)
-                self._conn.commit()
-                audit_log(
-                    phase="create_partition_scheme", status="created",
-                    details={"scheme": f"{ps_schema}.{ps.name}"},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_partition_scheme", status="failed",
-                    details={"scheme": f"{ps_schema}.{ps.name}", "reason": str(exc)},
-                )
-                raise
+        Delegates to ``objects.partition.create_partition_scheme``.
+        """
+        _mssql_partition.create_partition_scheme(self._conn, ps)
 
     def create_partitioned_table(
         self,
@@ -391,8 +306,11 @@ class MSSQLTargetConnector(TargetConnector):
         partition_scheme_name: str,
         partition_column: str,
     ) -> None:
-        """Create a table with partitioning applied. Delegates to ``table.create_partitioned_table``."""
-        _mssql_table.create_partitioned_table(
+        """Create a table with partitioning applied.
+
+        Delegates to ``objects.partition.create_partitioned_table``.
+        """
+        _mssql_partition.create_partitioned_table(
             self._conn, schema, partition_scheme_name, partition_column
         )
 

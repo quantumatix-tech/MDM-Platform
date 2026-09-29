@@ -16,9 +16,9 @@ Currently implemented:
   - synonym : Synonym discovery, DDL creation
   - type    : Type (alias) discovery, DDL creation
   - comment : Comment/extended property discovery, application
+  - partition: Partition function/scheme discovery + creation, partitioned table creation
 
 Future object modules (NOT yet created):
-  - partition
   - security (roles, users, grants)
 """
 from core.connectors.mssql.objects import table
@@ -29,5 +29,6 @@ from core.connectors.mssql.objects import sequence
 from core.connectors.mssql.objects import synonym
 from core.connectors.mssql.objects import type
 from core.connectors.mssql.objects import comment
+from core.connectors.mssql.objects import partition
 
-__all__ = ["table", "view", "trigger", "function", "sequence", "synonym", "type", "comment"]
+__all__ = ["table", "view", "trigger", "function", "sequence", "synonym", "type", "comment", "partition"]

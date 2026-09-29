@@ -20,7 +20,7 @@ avoids circular dependencies.
 #     ┌─────────────┐
 #     │  _target    │─────────  create_object_if_missing()
 #     │             │                ───────────────────────► table.create_table()
-#     │             │─────────  create_partitioned_table()  ─► table.create_partitioned_table()
+#     │             │─────────  create_partitioned_table()  ─► partition.create_partitioned_table()
 #     │             │─────────  upsert_batch()              ─► table.upsert_table_data()
 #     │             │─────────  get_object_count()          ─► table.get_table_row_count()
 #     │             │─────────  export_full()               ─► table.export_table_data()
@@ -166,8 +166,8 @@ def export_table_data(
 # ---------------------------------------------------------------------------
 # 3. INTERNAL TABLE HELPERS
 #    Shared utilities used by the target-side table creation functions
-#    below (and potentially by future object modules for indexes, triggers,
-#    etc.). These are not connector-facing; they operate on a raw *conn*.
+#    below, and by ``objects/partition.py`` for partitioned-table DDL
+#    generation. These are not connector-facing; they operate on a raw *conn*.
 # ---------------------------------------------------------------------------
 
 def table_exists(
@@ -175,8 +175,7 @@ def table_exists(
 ) -> bool:
     """Return ``True`` if *object_name* exists as a base table in *schema_name*.
 
-    Used by ``create_table`` and ``create_partitioned_table`` to implement
-    idempotent creation.
+    Used by ``create_table`` to implement idempotent creation.
     """
     sn = schema_name or "dbo"
     with conn.cursor() as cur:
@@ -191,9 +190,7 @@ def table_exists(
 def _ensure_schema_exists(conn: Any, schema_name: str) -> None:
     """Ensure a schema exists on the target (``dbo`` always exists).
 
-    Shared by ``create_table`` and ``create_partitioned_table`` to avoid
-    duplicate schema-creation logic. Future object modules (indexes, triggers,
-    etc.) can also import and reuse this helper.
+    Shared by ``create_table`` and ``partition.create_partitioned_table``.
     """
     if schema_name == "dbo":
         return
@@ -219,7 +216,7 @@ def _column_ddl(col: Any, col_type: str) -> str:
     Computed columns are emitted as ``AS (definition)`` and bypass type
     resolution entirely.
 
-    Shared by ``create_table`` and ``create_partitioned_table``.
+    Shared by ``create_table`` and ``partition.create_partitioned_table``.
     """
     if col.is_computed:
         return f"{col.name} AS ({col.computed_definition})"
@@ -234,8 +231,8 @@ def _column_ddl(col: Any, col_type: str) -> str:
 # ---------------------------------------------------------------------------
 # 4. TARGET-SIDE TABLE OPERATIONS
 #    Called/delegated by MSSQLTargetConnector methods.
-#    Table creation, partitioned table creation, data upsert, and row
-#    deletion for writing to a target database.
+#    Table creation, data upsert, and row deletion for writing to a target
+#    database. Partitioned-table creation lives in ``objects/partition.py``.
 # ---------------------------------------------------------------------------
 
 def create_table(conn: Any, schema: Schema, config: dict[str, Any]) -> None:
@@ -299,81 +296,6 @@ def create_table(conn: Any, schema: Schema, config: dict[str, Any]) -> None:
             status="created",
             details={"table": qualified},
         )
-
-
-def create_partitioned_table(
-    conn: Any,
-    schema: Schema,
-    partition_scheme_name: str,
-    partition_column: str,
-) -> None:
-    """Create a table with partition-scheme binding.
-
-    Replaces ``MSSQLTargetConnector.create_partitioned_table``.
-    Delegates the complete partitioned-table creation logic: existence
-    check, schema creation, column DDL generation, primary-key constraint,
-    and CREATE TABLE ... ON partition_scheme(column) execution.
-    """
-    validate_identifier(schema.name, "table")
-    schema_name = schema.schema_name or "dbo"
-    validate_identifier(schema_name, "schema")
-    validate_identifier(partition_scheme_name, "partition scheme")
-    validate_identifier(partition_column, "column")
-    qualified = _qualify(schema_name, schema.name)
-
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-            "WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ?",
-            (schema.name, schema_name),
-        )
-        if cur.fetchone() is not None:
-            audit_log(
-                phase="create_partitioned_table",
-                status="exists",
-                details={"table": qualified},
-            )
-            return
-
-        if schema_name != "dbo":
-            cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (schema_name,))
-            if cur.fetchone() is None:
-                cur.execute(f"CREATE SCHEMA {quote_identifier(schema_name)}")
-                audit_log(
-                    phase="create_schema",
-                    status="created",
-                    details={"schema": schema_name},
-                )
-
-        col_defs: list[str] = []
-        for col in schema.columns:
-            col_type = col.source_type or col.target_type or "nvarchar"
-            col_defs.append(_column_ddl(col, col_type))
-
-        if schema.primary_key:
-            pk_cols = ", ".join(schema.primary_key)
-            col_defs.append(f"PRIMARY KEY ({pk_cols})")
-
-        ddl = (
-            f"CREATE TABLE {qualified} ({', '.join(col_defs)}) "
-            f"ON {partition_scheme_name}({partition_column})"
-        )
-        try:
-            cur.execute(ddl)
-            conn.commit()
-            audit_log(
-                phase="create_partitioned_table",
-                status="created",
-                details={"table": qualified},
-            )
-        except Exception as exc:
-            conn.rollback()
-            audit_log(
-                phase="create_partitioned_table",
-                status="failed",
-                details={"table": qualified, "reason": str(exc)},
-            )
-            raise
 
 
 def upsert_table_data(

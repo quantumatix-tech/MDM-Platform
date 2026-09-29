@@ -4,7 +4,8 @@ Extracted from ``core/connectors/mssql.py`` — all discovery and export
 logic for the source database.
 
 Table-specific discovery and export logic is delegated to
-``core.connectors.mssql.objects.table`` so that ``source.py`` acts as the
+``core.connectors.mssql.objects.table`` and partition-specific discovery to
+``core.connectors.mssql.objects.partition`` so that ``source.py`` acts as the
 connector-facing router.
 """
 from __future__ import annotations
@@ -51,6 +52,7 @@ from core.connectors.mssql.objects import sequence as _mssql_sequence
 from core.connectors.mssql.objects import synonym as _mssql_synonym
 from core.connectors.mssql.objects import type as _mssql_type
 from core.connectors.mssql.objects import comment as _mssql_comment
+from core.connectors.mssql.objects import partition as _mssql_partition
 
 
 class MSSQLSourceConnector(SourceConnector):
@@ -601,133 +603,25 @@ class MSSQLSourceConnector(SourceConnector):
     # ------------------------------------------------------------------
 
     def list_partition_functions(self) -> list[PartitionFunctionDef]:
-        """Return user partition functions with their boundaries."""
-        results: list[PartitionFunctionDef] = []
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT pf.name, pf.type_desc, pf.boundary_value_on_right, "
-                "prv.value, prv.boundary_id "
-                "FROM sys.partition_functions pf "
-                "LEFT JOIN sys.partition_range_values prv "
-                "  ON prv.function_id = pf.function_id "
-                "ORDER BY pf.name, prv.boundary_id",
-            )
-            pf_map: dict = {}
-            for row in cur.fetchall():
-                pf_name, type_desc, bvr, value, boundary_id = row
-                if pf_name not in pf_map:
-                    range_desc = "RANGE RIGHT" if bvr else "RANGE LEFT"
-                    pf_map[pf_name] = PartitionFunctionDef(
-                        name=pf_name,
-                        schema_name="dbo",
-                        data_type="datetime2",
-                        boundaries=[],
-                        range_desc=range_desc,
-                    )
-                if value is not None:
-                    pf_map[pf_name].boundaries.append(value)
-            results = list(pf_map.values())
-        return results
+        """Return user partition functions with their boundaries.
+
+        Delegates to ``objects.partition.list_partition_functions``.
+        """
+        return _mssql_partition.list_partition_functions(self._conn)
 
     def list_partition_schemes(self) -> list[PartitionSchemeDef]:
-        """Return user partition schemes with their filegroup mappings."""
-        results: list[PartitionSchemeDef] = []
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT ps.name, pf.name AS pf_name "
-                "FROM sys.partition_schemes ps "
-                "JOIN sys.partition_functions pf ON ps.function_id = pf.function_id "
-                "ORDER BY ps.name",
-            )
-            scheme_names = [row[0] for row in cur.fetchall()]
+        """Return user partition schemes with their filegroup mappings.
 
-            for ps_name in scheme_names:
-                cur.execute(
-                    "SELECT ps.name, pf.name AS pf_name, "
-                    "fg.name AS fg_name "
-                    "FROM sys.partition_schemes ps "
-                    "JOIN sys.partition_functions pf ON ps.function_id = pf.function_id "
-                    "JOIN sys.destination_data_spaces dds "
-                    "  ON dds.partition_scheme_id = ps.data_space_id "
-                    "JOIN sys.filegroups fg ON fg.data_space_id = dds.data_space_id "
-                    "WHERE ps.name = ? "
-                    "ORDER BY dds.destination_id",
-                    (ps_name,),
-                )
-                fg_list = []
-                pf_name_val = ""
-                for row in cur.fetchall():
-                    _, pf_name, fg_name = row
-                    pf_name_val = pf_name
-                    fg_list.append(fg_name)
-                results.append(PartitionSchemeDef(
-                    name=ps_name,
-                    schema_name="dbo",
-                    partition_function_name=pf_name_val,
-                    filegroups=fg_list,
-                ))
-        return results
+        Delegates to ``objects.partition.list_partition_schemes``.
+        """
+        return _mssql_partition.list_partition_schemes(self._conn)
 
     def get_partitioned_tables(self) -> list[PartitionedTableDef]:
-        """Return partitioned table/index metadata."""
-        schemas = _resolve_mssql_schemas(self._config)
-        results: list[PartitionedTableDef] = []
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    "SELECT t.name, s.name AS schema_name, "
-                    "i.name AS index_name, "
-                    "pf.name AS pf_name, "
-                    "ps.name AS ps_name, "
-                    "c.name AS partition_column "
-                    "FROM sys.tables t "
-                    "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                    "JOIN sys.indexes i ON t.object_id = i.object_id "
-                    "JOIN sys.partition_schemes ps ON i.data_space_id = ps.data_space_id "
-                    "JOIN sys.partition_functions pf ON pf.function_id = ps.function_id "
-                    "LEFT JOIN sys.index_columns ic "
-                    "  ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
-                    "  AND ic.is_included_column = 0 "
-                    "LEFT JOIN sys.columns c ON c.object_id = t.object_id "
-                    "  AND c.column_id = ic.column_id "
-                    f"WHERE s.name IN ({placeholders}) "
-                    "AND i.data_space_id IS NOT NULL "
-                    "ORDER BY t.name, i.name",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    "SELECT t.name, s.name AS schema_name, "
-                    "i.name AS index_name, "
-                    "pf.name AS pf_name, "
-                    "ps.name AS ps_name, "
-                    "c.name AS partition_column "
-                    "FROM sys.tables t "
-                    "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                    "JOIN sys.indexes i ON t.object_id = i.object_id "
-                    "JOIN sys.partition_schemes ps ON i.data_space_id = ps.data_space_id "
-                    "JOIN sys.partition_functions pf ON pf.function_id = ps.function_id "
-                    "LEFT JOIN sys.index_columns ic "
-                    "  ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
-                    "  AND ic.is_included_column = 0 "
-                    "LEFT JOIN sys.columns c ON c.object_id = t.object_id "
-                    "  AND c.column_id = ic.column_id "
-                    "WHERE s.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') "
-                    "AND i.data_space_id IS NOT NULL "
-                    "ORDER BY t.name, i.name"
-                )
-            for row in cur.fetchall():
-                table_name, schema_name, index_name, pf_name, ps_name, partition_column = row
-                results.append(PartitionedTableDef(
-                    table_name=table_name,
-                    schema_name=schema_name,
-                    index_name=index_name,
-                    partition_function_name=pf_name,
-                    partition_scheme_name=ps_name,
-                    partition_column=partition_column,
-                ))
-        return results
+        """Return partitioned table/index metadata.
+
+        Delegates to ``objects.partition.get_partitioned_tables``.
+        """
+        return _mssql_partition.get_partitioned_tables(self._conn, self._config)
 
     # ------------------------------------------------------------------
     # Step 15 — Comments / Extended Properties
