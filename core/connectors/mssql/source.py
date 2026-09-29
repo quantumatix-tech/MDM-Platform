@@ -47,6 +47,7 @@ from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
 from core.connectors.mssql.objects import trigger as _mssql_trigger
 from core.connectors.mssql.objects import function as _mssql_function
+from core.connectors.mssql.objects import sequence as _mssql_sequence
 
 
 class MSSQLSourceConnector(SourceConnector):
@@ -337,84 +338,11 @@ class MSSQLSourceConnector(SourceConnector):
         return _mssql_view.discover_views(self._conn, self._config)
 
     def list_all_sequences(self) -> list:
-        """Return user sequences in the configured schemas with SQL Server metadata."""
-        from core.connectors.base import SequenceDef
+        """Return user sequences in the configured schemas with SQL Server metadata.
 
-        schemas = _resolve_mssql_schemas(self._config)
-        results: list[SequenceDef] = []
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    "SELECT s.name, sch.name, "
-                    "CAST(TYPE_NAME(s.user_type_id) AS NVARCHAR(128)) AS sequence_type, "
-                    "CAST(s.start_value AS BIGINT) AS start_value, "
-                    "CAST(s.increment AS BIGINT) AS increment, "
-                    "CAST(s.minimum_value AS BIGINT) AS minimum_value, "
-                    "CAST(s.maximum_value AS BIGINT) AS maximum_value, "
-                    "s.is_cycling, "
-                    "CAST(s.cache_size AS BIGINT) AS cache_size, "
-                    "CAST(s.current_value AS BIGINT) AS current_value, "
-                    "s.is_cached "
-                    "FROM sys.sequences AS s "
-                    "JOIN sys.schemas AS sch ON sch.schema_id = s.schema_id "
-                    f"WHERE sch.name IN ({placeholders}) "
-                    "ORDER BY sch.name, s.name",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    "SELECT s.name, sch.name, "
-                    "CAST(TYPE_NAME(s.user_type_id) AS NVARCHAR(128)) AS sequence_type, "
-                    "CAST(s.start_value AS BIGINT) AS start_value, "
-                    "CAST(s.increment AS BIGINT) AS increment, "
-                    "CAST(s.minimum_value AS BIGINT) AS minimum_value, "
-                    "CAST(s.maximum_value AS BIGINT) AS maximum_value, "
-                    "s.is_cycling, "
-                    "CAST(s.cache_size AS BIGINT) AS cache_size, "
-                    "CAST(s.current_value AS BIGINT) AS current_value, "
-                    "s.is_cached "
-                    "FROM sys.sequences AS s "
-                    "JOIN sys.schemas AS sch ON sch.schema_id = s.schema_id "
-                    "WHERE sch.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') "
-                    "ORDER BY sch.name, s.name"
-                )
-
-            for row in cur.fetchall():
-                (
-                    seq_name,
-                    seq_schema,
-                    seq_type,
-                    start_value,
-                    increment,
-                    minimum_value,
-                    maximum_value,
-                    is_cycling,
-                    cache_size,
-                    current_value,
-                    is_cached,
-                ) = row
-                validate_identifier(seq_name, "sequence")
-                validate_identifier(seq_schema, "schema")
-                results.append(
-                    SequenceDef(
-                        name=seq_name,
-                        schema=seq_schema,
-                        start_value=int(start_value),
-                        increment=int(increment),
-                        min_value=int(minimum_value),
-                        max_value=int(maximum_value),
-                        cycle=bool(is_cycling),
-                        last_value=(
-                            int(current_value) if current_value is not None else None
-                        ),
-                        owned_by=None,
-                        data_type=seq_type,
-                        cache_size=int(cache_size) if cache_size is not None else 1,
-                        is_cached=bool(is_cached),
-                    )
-                )
-        return results
+        Delegates to ``core.connectors.mssql.objects.sequence.discover_sequences``.
+        """
+        return _mssql_sequence.discover_sequences(self._conn, self._config)
 
     def list_functions(self) -> list[FunctionDef]:
         """Return user functions and stored procedures in the configured schemas.

@@ -12,9 +12,9 @@ Currently implemented:
   - view    : View discovery, DDL creation
   - trigger : Trigger discovery, DDL creation
   - function: Function/procedure discovery, DDL creation
+  - sequence: Sequence discovery, DDL creation
 
 Future object modules (NOT yet created):
-  - sequence
   - partition
   - security (roles, users, grants)
 """
@@ -22,5 +22,6 @@ from core.connectors.mssql.objects import table
 from core.connectors.mssql.objects import view
 from core.connectors.mssql.objects import trigger
 from core.connectors.mssql.objects import function
+from core.connectors.mssql.objects import sequence
 
-__all__ = ["table", "view", "trigger", "function"]
+__all__ = ["table", "view", "trigger", "function", "sequence"]

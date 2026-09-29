@@ -40,6 +40,7 @@ from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
 from core.connectors.mssql.objects import trigger as _mssql_trigger
 from core.connectors.mssql.objects import function as _mssql_function
+from core.connectors.mssql.objects import sequence as _mssql_sequence
 
 
 class MSSQLTargetConnector(TargetConnector):
@@ -75,64 +76,11 @@ class MSSQLTargetConnector(TargetConnector):
                 audit_log(phase="ensure_database", status="created", details={"database": db_name})
 
     def create_sequence(self, seq: "SequenceDef") -> None:
-        """Create a schema-qualified SQL Server sequence with source metadata."""
-        from core.connectors.base import SequenceDef  # noqa: F401
+        """Create a schema-qualified SQL Server sequence with source metadata.
 
-        seq_schema = seq.schema or "dbo"
-        validate_identifier(seq.name, "sequence")
-        validate_identifier(seq_schema, "schema")
-        seq_qname = _qualify(seq_schema, seq.name)
-
-        with self._conn.cursor() as cur:
-            if seq_schema != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (seq_schema,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(seq_schema)}")
-                    audit_log(
-                        phase="create_schema",
-                        status="created",
-                        details={"schema": seq_schema},
-                    )
-
-            cur.execute(
-                "SELECT 1 FROM sys.sequences "
-                "WHERE name = ? AND schema_id = SCHEMA_ID(?)",
-                (seq.name, seq_schema),
-            )
-            if cur.fetchone() is not None:
-                return
-
-            cycle_clause = "CYCLE" if seq.cycle else "NO CYCLE"
-            cache_clause = (
-                "NO CACHE"
-                if not seq.is_cached
-                else f"CACHE {int(seq.cache_size)}"
-            )
-            ddl = (
-                f"CREATE SEQUENCE {seq_qname} "
-                f"AS {(seq.data_type or 'bigint').upper()} "
-                f"START WITH {int(seq.start_value)} "
-                f"INCREMENT BY {int(seq.increment)} "
-                f"MINVALUE {int(seq.min_value)} "
-                f"MAXVALUE {int(seq.max_value)} "
-                f"{cycle_clause} "
-                f"{cache_clause}"
-            )
-            try:
-                cur.execute(ddl)
-                self._conn.commit()
-                audit_log(
-                    phase="create_sequence",
-                    status="created",
-                    details={"sequence": seq_qname, "owned_by": seq.owned_by},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_sequence", status="failed",
-                    details={"sequence": seq_qname, "reason": str(exc)},
-                )
-                raise
+        Delegates to ``core.connectors.mssql.objects.sequence.create_sequence``.
+        """
+        _mssql_sequence.create_sequence(self._conn, seq)
 
     def create_type(self, type_def: "TypeDef") -> None:
         """Create a user-defined (alias) data type on the target.
