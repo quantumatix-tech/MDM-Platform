@@ -48,6 +48,9 @@ from core.connectors.mssql.objects import view as _mssql_view
 from core.connectors.mssql.objects import trigger as _mssql_trigger
 from core.connectors.mssql.objects import function as _mssql_function
 from core.connectors.mssql.objects import sequence as _mssql_sequence
+from core.connectors.mssql.objects import synonym as _mssql_synonym
+from core.connectors.mssql.objects import type as _mssql_type
+from core.connectors.mssql.objects import comment as _mssql_comment
 
 
 class MSSQLSourceConnector(SourceConnector):
@@ -352,39 +355,11 @@ class MSSQLSourceConnector(SourceConnector):
         return _mssql_function.discover_functions(self._conn, self._config)
 
     def list_synonyms(self) -> list[SynonymDef]:
-        """Return user synonyms in the configured schemas."""
-        schemas = _resolve_mssql_schemas(self._config)
-        results: list[SynonymDef] = []
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    "SELECT syn.name, sch.name, syn.base_object_name "
-                    "FROM sys.synonyms syn "
-                    "JOIN sys.schemas sch ON syn.schema_id = sch.schema_id "
-                    f"WHERE sch.name IN ({placeholders}) "
-                    "ORDER BY sch.name, syn.name",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    "SELECT syn.name, sch.name, syn.base_object_name "
-                    "FROM sys.synonyms syn "
-                    "JOIN sys.schemas sch ON syn.schema_id = sch.schema_id "
-                    "WHERE sch.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') "
-                    "ORDER BY sch.name, syn.name"
-                )
-            for syn_name, syn_schema, base_object in cur.fetchall():
-                validate_identifier(syn_name, "synonym")
-                validate_identifier(syn_schema, "schema")
-                results.append(
-                    SynonymDef(
-                        name=syn_name,
-                        schema_name=syn_schema,
-                        base_object=base_object,
-                    )
-                )
-        return results
+        """Return user synonyms in the configured schemas.
+
+        Delegates to ``core.connectors.mssql.objects.synonym.discover_synonyms``.
+        """
+        return _mssql_synonym.discover_synonyms(self._conn, self._config)
 
     def list_types(self) -> list[TypeDef]:
         """Return user-defined (alias) data types (TVPs are not migrated as types).
@@ -394,53 +369,10 @@ class MSSQLSourceConnector(SourceConnector):
         DATA_TYPE for columns that use such a type, so these are discovered here
         (and re-applied to columns in get_schema) to preserve schema-qualified
         UDT references on the target.
-        """
-        from core.connectors.mssql._models import _mssql_column_type
 
-        schemas = _resolve_mssql_schemas(self._config)
-        results: list[TypeDef] = []
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    "SELECT s.name, t.name, t.is_nullable, t.max_length, "
-                    "TRY_CAST(t.precision AS INT), TRY_CAST(t.scale AS INT), "
-                    "TYPE_NAME(t.system_type_id) AS base_name "
-                    "FROM sys.types t "
-                    "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                    f"WHERE s.name IN ({placeholders}) AND t.is_user_defined = 1 "
-                    "ORDER BY s.name, t.name",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    "SELECT s.name, t.name, t.is_nullable, t.max_length, "
-                    "TRY_CAST(t.precision AS INT), TRY_CAST(t.scale AS INT), "
-                    "TYPE_NAME(t.system_type_id) AS base_name "
-                    "FROM sys.types t "
-                    "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                    "WHERE s.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') "
-                    "AND t.is_user_defined = 1 "
-                    "ORDER BY s.name, t.name"
-                )
-            for row in cur.fetchall():
-                type_schema, type_name, is_nullable, max_len, precision, scale, base_name = row
-                validate_identifier(type_name, "type")
-                validate_identifier(type_schema, "schema")
-                base_type = _mssql_column_type(base_name, max_len, precision, scale)
-                null_str = "NULL" if is_nullable else "NOT NULL"
-                ddl = (
-                    f"CREATE TYPE [{type_schema}].[{type_name}] "
-                    f"FROM {base_type} {null_str}"
-                )
-                results.append(
-                    TypeDef(
-                        name=f"{type_schema}.{type_name}",
-                        kind="alias",
-                        ddl=ddl,
-                    )
-                )
-        return results
+        Delegates to ``core.connectors.mssql.objects.type.discover_types``.
+        """
+        return _mssql_type.discover_types(self._conn, self._config)
 
     # ------------------------------------------------------------------
     # Step 14 — Security: Grants (Phase 16)
@@ -801,96 +733,15 @@ class MSSQLSourceConnector(SourceConnector):
     # Step 15 — Comments / Extended Properties
     # ------------------------------------------------------------------
 
-    def list_comments(self) -> list:
+    def list_comments(self) -> list[CommentDef]:
         """Return extended properties (comments) for tables, columns, views, functions, schemas.
 
         Queries sys.extended_properties where name = 'MS_Description'.
         Supports: TABLE, VIEW, FUNCTION, PROCEDURE, SCHEMA, COLUMN.
+
+        Delegates to ``core.connectors.mssql.objects.comment.discover_comments``.
         """
-        from core.connectors.base import CommentDef
-
-        schemas = _resolve_mssql_schemas(self._config)
-        comments: list[CommentDef] = []
-
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                schema_filter = f"AND s.name IN ({placeholders})"
-                params = list(schemas)
-            else:
-                schema_filter = "AND s.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest')"
-                params = []
-
-            # Table, View, Function, Procedure comments (class=1, minor_id=0)
-            cur.execute(
-                f"SELECT ep.value, s.name AS schema_name, o.name AS object_name, "
-                f"o.type_desc, "
-                f"CASE o.type "
-                f"  WHEN 'U' THEN 'TABLE' "
-                f"  WHEN 'V' THEN 'VIEW' "
-                f"  WHEN 'FN' THEN 'FUNCTION' "
-                f"  WHEN 'TF' THEN 'FUNCTION' "
-                f"  WHEN 'IF' THEN 'FUNCTION' "
-                f"  WHEN 'P' THEN 'PROCEDURE' "
-                f"  ELSE 'OBJECT' END AS obj_type "
-                f"FROM sys.extended_properties ep "
-                f"JOIN sys.objects o ON ep.major_id = o.object_id "
-                f"JOIN sys.schemas s ON o.schema_id = s.schema_id "
-                f"WHERE ep.class = 1 AND ep.minor_id = 0 AND ep.name = 'MS_Description' "
-                f"{schema_filter} "
-                f"ORDER BY s.name, o.name",
-                params,
-            )
-            for row in cur.fetchall():
-                value, schema_name, object_name, type_desc, obj_type = row
-                comments.append(CommentDef(
-                    object_type=obj_type,
-                    object_name=object_name,
-                    comment=value,
-                    schema_name=schema_name,
-                ))
-
-            # Column comments (class=1, minor_id=column_id)
-            cur.execute(
-                f"SELECT ep.value, s.name AS schema_name, o.name AS table_name, c.name AS column_name "
-                f"FROM sys.extended_properties ep "
-                f"JOIN sys.objects o ON ep.major_id = o.object_id "
-                f"JOIN sys.schemas s ON o.schema_id = s.schema_id "
-                f"JOIN sys.columns c ON c.object_id = o.object_id AND c.column_id = ep.minor_id "
-                f"WHERE ep.class = 1 AND ep.minor_id > 0 AND ep.name = 'MS_Description' "
-                f"{schema_filter} "
-                f"ORDER BY s.name, o.name, c.column_id",
-                params,
-            )
-            for row in cur.fetchall():
-                value, schema_name, table_name, column_name = row
-                comments.append(CommentDef(
-                    object_type="COLUMN",
-                    object_name=f"{table_name}.{column_name}",
-                    comment=value,
-                    schema_name=schema_name,
-                ))
-
-            # Schema comments (class=3, major_id=schema_id, minor_id=0)
-            cur.execute(
-                f"SELECT ep.value, s.name AS schema_name "
-                f"FROM sys.extended_properties ep "
-                f"JOIN sys.schemas s ON ep.major_id = s.schema_id "
-                f"WHERE ep.class = 3 AND ep.minor_id = 0 AND ep.name = 'MS_Description' "
-                f"{schema_filter} "
-                f"ORDER BY s.name",
-                params,
-            )
-            for row in cur.fetchall():
-                value, schema_name = row
-                comments.append(CommentDef(
-                    object_type="SCHEMA",
-                    object_name=schema_name,
-                    comment=value,
-                    schema_name=schema_name,
-                ))
-
-        return comments
+        return _mssql_comment.discover_comments(self._conn, self._config)
 
     # ------------------------------------------------------------------
     # Step 9 — Triggers (Phase 15 source discovery)

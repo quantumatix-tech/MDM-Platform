@@ -41,6 +41,9 @@ from core.connectors.mssql.objects import view as _mssql_view
 from core.connectors.mssql.objects import trigger as _mssql_trigger
 from core.connectors.mssql.objects import function as _mssql_function
 from core.connectors.mssql.objects import sequence as _mssql_sequence
+from core.connectors.mssql.objects import synonym as _mssql_synonym
+from core.connectors.mssql.objects import type as _mssql_type
+from core.connectors.mssql.objects import comment as _mssql_comment
 
 
 class MSSQLTargetConnector(TargetConnector):
@@ -88,53 +91,10 @@ class MSSQLTargetConnector(TargetConnector):
         SQL Server has no ``CREATE OR ALTER TYPE``; re-runs are made idempotent
         by checking sys.types first. CREATE TYPE must be the sole statement in
         its batch, so it is executed on its own cursor.execute().
+
+        Delegates to ``core.connectors.mssql.objects.type.create_type``.
         """
-        # TypeDef.name is schema-qualified ("schema.type") for MSSQL UDTs.
-        name = type_def.name
-        if "." in name:
-            type_schema, type_name = name.split(".", 1)
-        else:
-            type_schema, type_name = "dbo", name
-        validate_identifier(type_name, "type")
-        validate_identifier(type_schema, "schema")
-
-        with self._conn.cursor() as cur:
-            # Ensure the target schema exists (dbo always exists).
-            if type_schema != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (type_schema,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(type_schema)}")
-                    audit_log(
-                        phase="create_schema", status="created", details={"schema": type_schema}
-                    )
-
-            cur.execute(
-                "SELECT 1 FROM sys.types "
-                "WHERE is_user_defined = 1 "
-                "AND name = ? AND schema_id = SCHEMA_ID(?)",
-                (type_name, type_schema),
-            )
-            if cur.fetchone() is not None:
-                audit_log(
-                    phase="create_type", status="exists",
-                    details={"type": f"{type_schema}.{type_name}"},
-                )
-                return
-
-            try:
-                cur.execute(type_def.ddl)
-                self._conn.commit()
-                audit_log(
-                    phase="create_type", status="created",
-                    details={"type": f"{type_schema}.{type_name}", "kind": type_def.kind},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_type", status="failed",
-                    details={"type": f"{type_schema}.{type_name}", "reason": str(exc)},
-                )
-                raise
+        _mssql_type.create_type(self._conn, type_def)
 
     def create_object_if_missing(self, schema: "Schema") -> None:
         """Create a table if it doesn't exist. Delegates to ``table.create_table``."""
@@ -314,50 +274,11 @@ class MSSQLTargetConnector(TargetConnector):
         _mssql_trigger.create_trigger(self._conn, trigger)
 
     def create_synonym(self, synonym: "SynonymDef") -> None:
-        """Create a synonym on the target database."""
-        validate_identifier(synonym.name, "synonym")
-        schema_name = synonym.schema_name or "dbo"
-        validate_identifier(schema_name, "schema")
-        # base_object should already be qualified like [schema].[object]
-        base_object = synonym.base_object
-        with self._conn.cursor() as cur:
-            # Ensure the target schema exists (dbo always exists in SQL Server).
-            if schema_name != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (schema_name,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(schema_name)}")
-                    audit_log(
-                        phase="create_schema", status="created",
-                        details={"schema": schema_name},
-                    )
-            try:
-                # Check if synonym already exists
-                cur.execute(
-                    "SELECT 1 FROM sys.synonyms WHERE name = ? AND schema_id = SCHEMA_ID(?)",
-                    (synonym.name, schema_name),
-                )
-                if cur.fetchone() is not None:
-                    audit_log(
-                        phase="create_synonym", status="exists",
-                        details={"synonym": f"{schema_name}.{synonym.name}"},
-                    )
-                    return
-                # Create the synonym
-                syn_qname = f"[{schema_name}].[{synonym.name}]"
-                ddl = f"CREATE SYNONYM {syn_qname} FOR {base_object}"
-                cur.execute(ddl)
-                self._conn.commit()
-                audit_log(
-                    phase="create_synonym", status="created",
-                    details={"synonym": f"{schema_name}.{synonym.name}", "base_object": base_object},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_synonym", status="failed",
-                    details={"synonym": f"{schema_name}.{synonym.name}", "reason": str(exc)},
-                )
-                raise
+        """Create a synonym on the target database.
+
+        Delegates to ``core.connectors.mssql.objects.synonym.create_synonym``.
+        """
+        _mssql_synonym.create_synonym(self._conn, synonym)
 
     # ------------------------------------------------------------------
     # Step 12 — Partition creation
@@ -652,132 +573,7 @@ class MSSQLTargetConnector(TargetConnector):
         """Apply an extended property (comment) using sp_addextendedproperty / sp_updateextendedproperty.
 
         Idempotent: adds if missing, updates if already present.
+
+        Delegates to ``core.connectors.mssql.objects.comment.apply_comment``.
         """
-        from core.connectors.base import CommentDef
-
-        if not comment.comment:
-            audit_log(
-                phase="apply_comment", status="skipped",
-                details={"object": comment.object_name, "schema": comment.schema_name or "dbo",
-                         "reason": "null or empty comment"},
-            )
-            return
-
-        escaped = comment.comment.replace("'", "''")
-        schema_name = comment.schema_name or "dbo"
-
-        with self._conn.cursor() as cur:
-            try:
-                # Check if extended property already exists
-                if comment.object_type == "SCHEMA":
-                    cur.execute(
-                        "SELECT 1 FROM sys.extended_properties ep "
-                        "JOIN sys.schemas s ON ep.major_id = s.schema_id "
-                        "WHERE ep.class = 3 AND ep.minor_id = 0 AND ep.name = 'MS_Description' "
-                        "AND s.name = ?",
-                        (schema_name,),
-                    )
-                    exists = cur.fetchone() is not None
-                    level0_type, level0_name = "SCHEMA", schema_name
-                    level1_type = level1_name = level2_type = level2_name = None
-
-                elif comment.object_type == "COLUMN":
-                    parts = comment.object_name.split(".")
-                    table_name, column_name = parts[0], parts[1]
-                    cur.execute(
-                        "SELECT 1 FROM sys.extended_properties ep "
-                        "JOIN sys.objects o ON ep.major_id = o.object_id "
-                        "JOIN sys.schemas s ON o.schema_id = s.schema_id "
-                        "JOIN sys.columns c ON c.object_id = o.object_id AND c.column_id = ep.minor_id "
-                        "WHERE ep.class = 1 AND ep.minor_id > 0 AND ep.name = 'MS_Description' "
-                        "AND s.name = ? AND o.name = ? AND c.name = ?",
-                        (schema_name, table_name, column_name),
-                    )
-                    exists = cur.fetchone() is not None
-                    level0_type, level0_name = "SCHEMA", schema_name
-                    level1_type, level1_name = "TABLE", table_name
-                    level2_type, level2_name = "COLUMN", column_name
-
-                else:
-                    # TABLE, VIEW, FUNCTION, PROCEDURE
-                    object_name = comment.object_name
-                    cur.execute(
-                        "SELECT 1 FROM sys.extended_properties ep "
-                        "JOIN sys.objects o ON ep.major_id = o.object_id "
-                        "JOIN sys.schemas s ON o.schema_id = s.schema_id "
-                        "WHERE ep.class = 1 AND ep.minor_id = 0 AND ep.name = 'MS_Description' "
-                        "AND s.name = ? AND o.name = ?",
-                        (schema_name, object_name),
-                    )
-                    exists = cur.fetchone() is not None
-                    level0_type, level0_name = "SCHEMA", schema_name
-                    level1_type, level1_name = comment.object_type.upper(), object_name
-                    level2_type = level2_name = None
-
-                if exists:
-                    # UPDATE existing extended property
-                    if comment.object_type == "SCHEMA":
-                        cur.execute(
-                            "EXEC sys.sp_updateextendedproperty "
-                            "@name = 'MS_Description', @value = ?, "
-                            "@level0type = ?, @level0name = ?",
-                            (escaped, level0_type, level0_name),
-                        )
-                    elif comment.object_type == "COLUMN":
-                        cur.execute(
-                            "EXEC sys.sp_updateextendedproperty "
-                            "@name = 'MS_Description', @value = ?, "
-                            "@level0type = ?, @level0name = ?, "
-                            "@level1type = ?, @level1name = ?, "
-                            "@level2type = ?, @level2name = ?",
-                            (escaped, level0_type, level0_name, level1_type, level1_name, level2_type, level2_name),
-                        )
-                    else:
-                        cur.execute(
-                            "EXEC sys.sp_updateextendedproperty "
-                            "@name = 'MS_Description', @value = ?, "
-                            "@level0type = ?, @level0name = ?, "
-                            "@level1type = ?, @level1name = ?",
-                            (escaped, level0_type, level0_name, level1_type, level1_name),
-                        )
-                    action = "updated"
-                else:
-                    # ADD new extended property
-                    if comment.object_type == "SCHEMA":
-                        cur.execute(
-                            "EXEC sys.sp_addextendedproperty "
-                            "@name = 'MS_Description', @value = ?, "
-                            "@level0type = ?, @level0name = ?",
-                            (escaped, level0_type, level0_name),
-                        )
-                    elif comment.object_type == "COLUMN":
-                        cur.execute(
-                            "EXEC sys.sp_addextendedproperty "
-                            "@name = 'MS_Description', @value = ?, "
-                            "@level0type = ?, @level0name = ?, "
-                            "@level1type = ?, @level1name = ?, "
-                            "@level2type = ?, @level2name = ?",
-                            (escaped, level0_type, level0_name, level1_type, level1_name, level2_type, level2_name),
-                        )
-                    else:
-                        cur.execute(
-                            "EXEC sys.sp_addextendedproperty "
-                            "@name = 'MS_Description', @value = ?, "
-                            "@level0type = ?, @level0name = ?, "
-                            "@level1type = ?, @level1name = ?",
-                            (escaped, level0_type, level0_name, level1_type, level1_name),
-                        )
-                    action = "added"
-
-                self._conn.commit()
-                audit_log(
-                    phase="apply_comment", status="applied",
-                    details={"object": comment.object_name, "schema": schema_name, "action": action},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="apply_comment", status="failed",
-                    details={"object": comment.object_name, "schema": schema_name, "reason": str(exc)},
-                )
-                raise
+        _mssql_comment.apply_comment(self._conn, comment)

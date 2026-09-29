@@ -13,6 +13,9 @@ Currently implemented:
   - trigger : Trigger discovery, DDL creation
   - function: Function/procedure discovery, DDL creation
   - sequence: Sequence discovery, DDL creation
+  - synonym : Synonym discovery, DDL creation
+  - type    : Type (alias) discovery, DDL creation
+  - comment : Comment/extended property discovery, application
 
 Future object modules (NOT yet created):
   - partition
@@ -23,5 +26,8 @@ from core.connectors.mssql.objects import view
 from core.connectors.mssql.objects import trigger
 from core.connectors.mssql.objects import function
 from core.connectors.mssql.objects import sequence
+from core.connectors.mssql.objects import synonym
+from core.connectors.mssql.objects import type
+from core.connectors.mssql.objects import comment
 
-__all__ = ["table", "view", "trigger", "function", "sequence"]
+__all__ = ["table", "view", "trigger", "function", "sequence", "synonym", "type", "comment"]
