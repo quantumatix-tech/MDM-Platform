@@ -20,36 +20,32 @@ Limitations are categorized as:
 
 ---
 
-## Users, roles, and grants
+## Users and direct permissions
 
-> **Task 13 update:** allowlisted users, roles, role edges, and scoped
-> database/column/table/routine grants now have a migration path. The allowlist
-> is mandatory for server principals; absent configuration is safely out of
-> scope. MySQL 26.7 lacks `mysql.user.is_role`, so configured type is used.
-> Passwords/hashes and global privileges are never migrated. Local → Azure is
-> verified; Local → Local remains unexecuted. DELETE/ALTER/DROP/GRANT behavior
-> and role-inheritance-only behavior remain unverified.
+MySQL migration supports user accounts and direct permissions. Locked accounts
+are excluded from user discovery. Authentication credentials and password
+definitions are not migrated. Global permissions are considered only for
+explicitly selected users and a supported privilege subset.
 
-### MySQL users and roles are not migrated
+### User account limitations
 
 - **Category:** Implementation limitation
-- **Impact:** The current MySQL connector does not discover or create MySQL
-  users, roles, role assignments, authentication credentials, or password
-  definitions on the target.
-- **Workaround:** Create required users and roles on the target separately
+- **Impact:** The current MySQL connector does not migrate authentication
+  credentials or password definitions on the target.
+- **Workaround:** Configure target authentication separately
   before or after migration.
-- **Tracking:** Users, roles, and role assignments are outside the currently
-  supported migration scope.
+- **Tracking:** Authentication setup remains outside the migration scope.
 
-### Global and database-level privileges are not migrated
+### Global and database-level privileges have limited support
 
 - **Category:** Implementation limitation
-- **Impact:** Global privileges (`ON *.*`) and database-level privileges
-  (`ON database.*`) are not discovered and reproduced by the current MySQL
-  migration implementation.
-- **Workaround:** Apply required global or database-level privileges manually
-  on the target.
-- **Tracking:** Only supported object-level grant types are processed.
+- **Impact:** Global privileges are filtered to an explicit user allowlist and
+  supported privilege subset. Database-level privileges are mapped to the
+  target database.
+- **Workaround:** Review unsupported privileges and apply them manually when
+  required.
+- **Tracking:** Direct database/table/column/routine grants are handled through
+  the common grant migration path.
 
 ### Table grants are conditionally supported
 

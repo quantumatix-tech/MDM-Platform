@@ -251,7 +251,7 @@ def test_security_creation_failure_isolated():
     assert "security" in result["phases"]
     assert "skipped: role creation failed" in result["phases"]["security"]["role:role_bad"]
     assert result["phases"]["security"]["role:role_good"] == "created"
-    assert "skipped: user creation failed" in result["phases"]["security"]["user:user_bad"]
+    assert "failed: user creation failed" in result["phases"]["security"]["user:user_bad"]
     assert "skipped: membership creation failed" in result["phases"]["security"]["membership:user_bad->role_bad"]
 
 

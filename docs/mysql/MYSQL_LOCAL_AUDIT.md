@@ -1,10 +1,7 @@
 # MySQL Local Audit — Final Report
 
-> **Task 13 update:** Earlier statements that users/roles are unsupported
-> predate the allowlisted security-principal implementation. Canonical Local →
-> Azure evidence is in `MYSQL_LOCAL_TO_AZURE_AUDIT.md`, run
-> `39c9933250be4f2daadacaf44ccdc45f`. Local → Local security-principal
-> verification remains not yet executed.
+> MySQL security migration covers user accounts and direct permissions only.
+> See `MYSQL_LOCAL_TO_AZURE_AUDIT.md` for scope and limitations.
 
 **Project:** Migration Platform  
 **Branch:** `feature/unified-dms-platform`  
@@ -238,9 +235,9 @@ objects. Such objects are outside the migration set.
 | Representative datatypes | **Verified** | 31-column fixture passed |
 | Table grants | **Conditionally supported** | Connector/reporting paths tested; live cross-account visibility limited |
 | Routine EXECUTE grants | **Conditionally supported** | Depends on routine privilege catalog visibility |
-| Users / roles | **Not supported** | No user/role migration path |
-| Global privileges | **Not supported** | No global privilege migration path |
-| Database-level privileges | **Not supported** | No database-level privilege migration path |
+| User accounts | **Supported / Conditional** | Unlocked account identities; credentials are not copied |
+| Direct global permissions | **Filtered / Conditional** | Explicitly selected users and supported privileges only |
+| Database-level permissions | **Supported / Conditional** | Mapped to configured target database |
 
 ---
 
@@ -1038,9 +1035,8 @@ as current limitations.
 
 | Limitation | Category |
 |---|---|
-| Users, roles, role assignments, authentication/password definitions are not migrated | Implementation |
-| Global privileges are not migrated | Implementation |
-| Database-level privileges are not migrated | Implementation |
+| Authentication/password definitions are not migrated | Implementation |
+| Unsupported global privileges are not migrated | Implementation |
 | Table grants require visible grant metadata and an existing target grantee | Implementation / Environment |
 | Routine `EXECUTE` grant discovery depends on `ROUTINE_PRIVILEGES` visibility | Environment / Audit scope |
 | FULL migration does not delete unrelated target-only objects | Implementation |

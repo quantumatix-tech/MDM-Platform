@@ -24,8 +24,7 @@ from core.connectors.base import (
     EventDef,
     CommentDef,
     GrantDef,
-    SecurityPrincipalDef,
-    RoleMembershipDef,
+    UserDef,
     UpsertResult,
     ApplyResult,
     ChangeEvent,
@@ -97,10 +96,35 @@ _MYSQL_DEFINER_RE = re.compile(
 )
 
 
-def _rewrite_mysql_definer(ddl: str, target_definer: str) -> str:
-    """Replace only a MySQL CREATE statement's existing DEFINER clause."""
+def _mysql_definer_identity(ddl: str) -> tuple[str, str] | None:
+    """Extract a stored object's exact MySQL DEFINER account identity."""
     match = _MYSQL_DEFINER_RE.match(ddl)
     if match is None:
+        return None
+
+    def unquote(part: str) -> str:
+        return part[1:-1].replace("``", "`") if part.startswith("`") else part
+
+    return unquote(match["user"]), unquote(match["host"])
+
+
+def _rewrite_mysql_definer(
+    ddl: str,
+    target_definer: str | None,
+    *,
+    preserve_source_definer: bool = False,
+    available_accounts: set[tuple[str, str]] | None = None,
+    can_set_any_definer: bool = False,
+) -> str:
+    """Preserve only available source accounts the target may set as DEFINER."""
+    match = _MYSQL_DEFINER_RE.match(ddl)
+    if match is None:
+        return ddl
+
+    source_account = _mysql_definer_identity(ddl)
+    if source_account is None:
+        return ddl
+    if target_definer is None:
         return ddl
 
     account = re.fullmatch(
@@ -113,9 +137,16 @@ def _rewrite_mysql_definer(ddl: str, target_definer: str) -> str:
     def unquote(part: str) -> str:
         return part[1:-1].replace("``", "`") if part.startswith("`") else part
 
-    source_user, source_host = unquote(match["user"]), unquote(match["host"])
     target_user, target_host = unquote(account["user"]), unquote(account["host"])
-    if (source_user, source_host) == (target_user, target_host):
+    target_identity = (target_user, target_host)
+    if (
+        preserve_source_definer
+        and available_accounts is not None
+        and source_account in available_accounts
+        and (can_set_any_definer or source_account == target_identity)
+    ):
+        return ddl
+    if source_account == (target_user, target_host):
         return ddl
 
     replacement = f"DEFINER={_q(target_user)}@{_q(target_host)}"
@@ -529,146 +560,168 @@ class MySQLSourceConnector(SourceConnector):
             result.extend(CommentDef("COLUMN", f"{t}.{n}", c, db) for t, n, c in cur.fetchall())
         return result
 
-    def _security_allowlist(self) -> dict[str, set[tuple[str, str]]] | None:
-        """Return configured user/role identities, or None for the safe default."""
-        configured = self._config.get("security_principals")
+    def _security_user_allowlist(self) -> set[tuple[str, str]] | None:
+        """Return configured user identities, or None for automatic discovery."""
+        configured = self._config.get("security_users")
         if not configured:
             return None
+        result: set[tuple[str, str]] = set()
+        for item in configured:
+            if isinstance(item, str):
+                result.add((item, "%"))
+            elif isinstance(item, dict) and item.get("user"):
+                result.add((str(item["user"]), str(item.get("host", "%"))))
+            else:
+                raise ValueError("migration.security_users entries require user and optional host")
+        return result
 
-        def identities(kind: str) -> set[tuple[str, str]]:
-            result: set[tuple[str, str]] = set()
-            for item in configured.get(kind, []):
-                if isinstance(item, str):
-                    result.add((item, "%"))
-                elif isinstance(item, dict) and item.get("user"):
-                    result.add((str(item["user"]), str(item.get("host", "%"))))
+    def list_users(self) -> list[UserDef]:
+        """Return unlocked MySQL accounts selected by the user allowlist policy.
+
+        Locked accounts are excluded. Authentication plugins and password
+        material are deliberately omitted.
+        """
+        requested = self._security_user_allowlist()
+        if requested is not None and not requested:
+            return []
+        try:
+            with self._conn.cursor() as cur:
+                if requested is None:
+                    cur.execute(
+                        "SELECT User,Host FROM mysql.user "
+                        "WHERE User NOT IN ('root','mysql.sys','mysql.session','mysql.infoschema','mysqlxsys') "
+                        "AND User<>'' AND account_locked='N' ORDER BY User,Host"
+                    )
                 else:
-                    raise ValueError(f"migration.security_principals.{kind} entries require user and optional host")
-            return result
+                    predicates = " OR ".join("(User=%s AND Host=%s)" for _ in requested)
+                    params = tuple(value for identity in sorted(requested) for value in identity)
+                    cur.execute(
+                        f"SELECT User,Host FROM mysql.user WHERE ({predicates}) AND account_locked='N' ORDER BY User,Host",
+                        params,
+                    )
+                rows = cur.fetchall()
+        except Exception as exc:
+            raise MySQLSecurityMetadataNotVisible(
+                "MySQL account metadata is not visible to the migration account"
+            ) from exc
 
-        return {"USER": identities("users"), "ROLE": identities("roles")}
+        found = {(row[0], row[1]) for row in rows}
+        if requested is not None:
+            missing = requested - found
+            if missing:
+                labels = ", ".join(f"{user}@{host}" for user, host in sorted(missing))
+                raise RuntimeError(f"Configured MySQL user is missing or not visible: {labels}")
 
-    def _allowed_principal_keys(self) -> set[tuple[str, str]]:
-        allowlist = self._security_allowlist()
-        return set() if allowlist is None else allowlist["USER"] | allowlist["ROLE"]
+        return [
+            UserDef(name=user, host=host)
+            for user, host in rows
+            if not _is_system_account((user, host))
+        ]
 
-    def security_scope_status(self) -> str | None:
-        if self._security_allowlist() is None:
-            return "AUTOMATIC_DISCOVERY"
-        return "ALLOWLIST_ENFORCED: principals and grants outside migration.security_principals are SKIPPED/OUT_OF_SCOPE"
-
-    def _filter_security_grants(self, grants: list[GrantDef]) -> list[GrantDef]:
-        allowlist = self._security_allowlist()
-        if allowlist is None:
-            return [grant for grant in grants if not _is_system_account(_grantee_key(grant.grantee))]
-        allowed = self._allowed_principal_keys()
-        return [grant for grant in grants if _grantee_key(grant.grantee) in allowed]
+    def _filter_direct_user_grants(self, grants: list[GrantDef]) -> list[GrantDef]:
+        allowed_users = self._security_user_allowlist()
+        user_identities = {
+            (user.name, user.host or "%") for user in self.list_users()
+        }
+        # Global privileges span every database and are migrated only for
+        # accounts explicitly selected by the operator.
+        supported_global = {"SELECT", "INSERT", "UPDATE", "DELETE"}
+        return [
+            grant for grant in grants
+            if not _is_system_account((grant.grantee, grant.grantee_host or "%"))
+            and grant.privileges.upper() not in {"USAGE", "ROLE_ADMIN", "PROXY"}
+            and (grant.grantee, grant.grantee_host or "%") in user_identities
+            and (
+                grant.object_type != "GLOBAL"
+                or (
+                    allowed_users is not None
+                    and (grant.grantee, grant.grantee_host or "%") in allowed_users
+                    and grant.privileges.upper() in supported_global
+                )
+            )
+        ]
 
     def list_grants(self) -> list[GrantDef]:
-        db = self._config["database"]; result: list[GrantDef] = []
-        with self._conn.cursor() as cur:
-            cur.execute("SELECT GRANTEE,TABLE_SCHEMA,TABLE_NAME,PRIVILEGE_TYPE,IS_GRANTABLE FROM INFORMATION_SCHEMA.TABLE_PRIVILEGES WHERE TABLE_SCHEMA=%s", (db,))
-            result.extend(GrantDef(privileges=row[3], object_type="TABLE", object_name=row[2], grantee=row[0], schema_name=row[1], grant_option=len(row) > 4 and str(row[4]).upper() == "YES") for row in cur.fetchall())
-            try:
-                cur.execute("SELECT GRANTEE,ROUTINE_NAME,ROUTINE_TYPE,PRIVILEGE_TYPE,IS_GRANTABLE FROM INFORMATION_SCHEMA.ROUTINE_PRIVILEGES WHERE ROUTINE_SCHEMA=%s", (db,))
-                result.extend(GrantDef(privileges=row[3], object_type=row[2], object_name=row[1], grantee=row[0], schema_name=db, grant_option=len(row) > 4 and str(row[4]).upper() == "YES") for row in cur.fetchall())
-            except Exception:
-                # Some compatible servers do not expose ROUTINE_PRIVILEGES.
-                # Preserve table grants and leave routine grants unreported.
-                self._conn.rollback()
-        return self._filter_security_grants(result)
+        database = self._config["database"]
+        grants: list[GrantDef] = []
 
-    def list_security_principals(self) -> list[SecurityPrincipalDef]:
-        """Read accounts without selecting password authentication material."""
-        allowlist = self._security_allowlist()
-        if allowlist is None:
-            try:
-                with self._conn.cursor() as cur:
-                    cur.execute("SELECT FROM_USER,FROM_HOST,TO_USER,TO_HOST,WITH_ADMIN_OPTION FROM mysql.role_edges")
-                    edges = cur.fetchall()
-                    role_keys = {(row[0], row[1]) for row in edges if not _is_system_account((row[0], row[1]))}
-                    cur.execute("SELECT User,Host,plugin,account_locked,password_expired FROM mysql.user WHERE User NOT IN ('root','mysql.sys','mysql.session','mysql.infoschema','mysqlxsys') AND User<>'' ORDER BY User,Host")
-                    rows = cur.fetchall()
-            except Exception as exc:
-                raise MySQLSecurityMetadataNotVisible("BLOCKED: MySQL account/role metadata is not visible to the migration account") from exc
-            return [SecurityPrincipalDef(user, host, "ROLE" if (user, host) in role_keys else "USER", plugin, str(locked).upper() == "Y", str(expired).upper() == "Y") for user, host, plugin, locked, expired in rows if not _is_system_account((user, host))]
-        requested = self._allowed_principal_keys()
-        if not requested:
-            return []
-        predicates = " OR ".join("(User=%s AND Host=%s)" for _ in requested)
-        params = tuple(value for identity in sorted(requested) for value in identity)
+        def append_grant(
+            privileges: str,
+            object_type: str,
+            object_name: str,
+            schema_name: str,
+            grantee_text: str,
+            grant_option: bool = False,
+        ) -> None:
+            account = _grantee_key(grantee_text)
+            if account is None:
+                return
+            user, host = account
+            grants.append(GrantDef(
+                privileges=privileges,
+                object_type=object_type,
+                object_name=object_name,
+                grantee=user,
+                schema_name=schema_name,
+                grant_option=grant_option,
+                grantee_host=host,
+            ))
+
         try:
             with self._conn.cursor() as cur:
-                # MySQL 26.7 no longer exposes mysql.user.is_role.  The
-                # explicitly configured allowlist is the authority for the
-                # requested principal type, so no version-specific role flag
-                # or unsafe full catalog scan is needed.
                 cur.execute(
-                    "SELECT User,Host,plugin,account_locked,password_expired "
-                    f"FROM mysql.user WHERE {predicates} ORDER BY User,Host",
-                    params,
+                    "SELECT GRANTEE,TABLE_SCHEMA,TABLE_NAME,PRIVILEGE_TYPE,IS_GRANTABLE "
+                    "FROM INFORMATION_SCHEMA.TABLE_PRIVILEGES WHERE TABLE_SCHEMA=%s",
+                    (database,),
                 )
-                rows = cur.fetchall()
-        except Exception as exc:
-            raise MySQLSecurityMetadataNotVisible(
-                "BLOCKED: MySQL account/role metadata is not visible to the migration account"
-            ) from exc
-        found = {(row[0], row[1]) for row in rows}
-        missing = requested - found
-        if missing:
-            labels = ", ".join(f"{user}@{host}" for user, host in sorted(missing))
-            raise RuntimeError(f"BLOCKED: requested security principal is missing or not visible: {labels}")
-        principals = [SecurityPrincipalDef(
-            user=user, host=host,
-            principal_type="ROLE" if (user, host) in allowlist["ROLE"] else "USER",
-            authentication_plugin=plugin, account_locked=str(locked).upper() == "Y",
-            password_expired=str(expired).upper() == "Y",
-        ) for user, host, plugin, locked, expired in rows]
-        wrong_type = [p for p in principals if (p.user, p.host) not in allowlist[p.principal_type]]
-        if wrong_type:
-            labels = ", ".join(f"{p.user}@{p.host}" for p in wrong_type)
-            raise RuntimeError(f"BLOCKED: requested principal has a different user/role type: {labels}")
-        return principals
+                for row in cur.fetchall():
+                    append_grant(row[3], "TABLE", row[2], row[1], row[0], str(row[4]).upper() == "YES")
 
-    def list_role_memberships(self) -> list[RoleMembershipDef]:
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute("SELECT FROM_USER,FROM_HOST,TO_USER,TO_HOST,WITH_ADMIN_OPTION FROM mysql.role_edges ORDER BY FROM_USER,FROM_HOST,TO_USER,TO_HOST")
-                rows = cur.fetchall()
-        except Exception as exc:
-            raise MySQLSecurityMetadataNotVisible(
-                "BLOCKED: MySQL role-edge metadata is not visible or unsupported by this server"
-            ) from exc
-        allowed = self._allowed_principal_keys()
-        configured = self._security_allowlist() is not None
-        return [RoleMembershipDef(*row[:4], with_admin_option=str(row[4]).upper() == "Y") for row in rows if (
-            ((row[0], row[1]) in allowed and (row[2], row[3]) in allowed)
-            if configured else
-            (not _is_system_account((row[0], row[1])) and not _is_system_account((row[2], row[3])))
-        )]
-
-    def list_security_grants(self) -> list[GrantDef]:
-        """Discover global, database, and column grants with grant option."""
-        db = self._config["database"]
-        queries = (
-            ("SELECT GRANTEE,TABLE_SCHEMA,PRIVILEGE_TYPE,IS_GRANTABLE FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES WHERE TABLE_SCHEMA=%s", "DATABASE"),
-            ("SELECT GRANTEE,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,PRIVILEGE_TYPE,IS_GRANTABLE FROM INFORMATION_SCHEMA.COLUMN_PRIVILEGES WHERE TABLE_SCHEMA=%s", "COLUMN"),
-        )
-        result: list[GrantDef] = []
-        try:
-            with self._conn.cursor() as cur:
-                for sql, scope in queries:
-                    cur.execute(sql, (db,) if "%s" in sql else ())
+                try:
+                    cur.execute(
+                        "SELECT GRANTEE,ROUTINE_NAME,ROUTINE_TYPE,PRIVILEGE_TYPE,IS_GRANTABLE "
+                        "FROM INFORMATION_SCHEMA.ROUTINE_PRIVILEGES WHERE ROUTINE_SCHEMA=%s",
+                        (database,),
+                    )
                     for row in cur.fetchall():
-                        if scope == "DATABASE":
-                            grantee, schema, privilege, grantable = row
-                            result.append(GrantDef(privilege, "DATABASE", schema, grantee, schema, str(grantable).upper() == "YES"))
-                        else:
-                            grantee, schema, table, column, privilege, grantable = row
-                            result.append(GrantDef(privilege, "COLUMN", f"{table}.{column}", grantee, schema, str(grantable).upper() == "YES"))
+                        append_grant(row[3], row[2], row[1], database, row[0], str(row[4]).upper() == "YES")
+                except Exception:
+                    # Compatible servers may not expose routine privilege metadata.
+                    self._conn.rollback()
+
+                cur.execute(
+                    "SELECT GRANTEE,TABLE_SCHEMA,PRIVILEGE_TYPE,IS_GRANTABLE "
+                    "FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES WHERE TABLE_SCHEMA=%s",
+                    (database,),
+                )
+                for row in cur.fetchall():
+                    append_grant(row[2], "DATABASE", row[1], row[1], row[0], str(row[3]).upper() == "YES")
+
+                cur.execute(
+                    "SELECT GRANTEE,TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,PRIVILEGE_TYPE,IS_GRANTABLE "
+                    "FROM INFORMATION_SCHEMA.COLUMN_PRIVILEGES WHERE TABLE_SCHEMA=%s",
+                    (database,),
+                )
+                for row in cur.fetchall():
+                    append_grant(row[4], "COLUMN", f"{row[2]}.{row[3]}", row[1], row[0], str(row[5]).upper() == "YES")
+
+                try:
+                    cur.execute(
+                        "SELECT GRANTEE,TABLE_CATALOG,PRIVILEGE_TYPE,IS_GRANTABLE "
+                        "FROM INFORMATION_SCHEMA.USER_PRIVILEGES"
+                    )
+                    for row in cur.fetchall():
+                        append_grant(row[2], "GLOBAL", "*", "*", row[0], str(row[3]).upper() == "YES")
+                except Exception:
+                    # USER_PRIVILEGES is standard MySQL metadata but may be hidden
+                    # or absent on compatible services; retain narrower grants.
+                    self._conn.rollback()
         except Exception as exc:
-            raise MySQLSecurityMetadataNotVisible("BLOCKED: MySQL privilege metadata is not visible to the migration account") from exc
-        return self._filter_security_grants(result)
+            raise MySQLSecurityMetadataNotVisible(
+                "MySQL direct privilege metadata is not visible to the migration account"
+            ) from exc
+
+        return self._filter_direct_user_grants(grants)
 
     def get_capabilities(self) -> dict[str, dict[str, Any]]:
         direct = ("tables", "columns", "defaults", "primary_keys", "auto_increment", "indexes", "unique_constraints", "check_constraints", "foreign_keys", "generated_columns", "partitions", "views", "functions", "procedures", "triggers", "events", "comments", "grants", "security_principals")
@@ -682,6 +735,19 @@ class MySQLTargetConnector(TargetConnector):
         self._conn: Any = None
         self._reconciliation_backups: list[str] = []
         self._routine_definer: str | None = config.get("routine_definer")
+        self._preserve_source_definer: bool = bool(config.get("preserve_source_definer", False))
+        self._available_definer_accounts: set[tuple[str, str]] = set()
+        self._current_account: tuple[str, str] | None = None
+        self._can_set_any_definer = False
+
+    def _rewrite_definer(self, ddl: str) -> str:
+        return _rewrite_mysql_definer(
+            ddl,
+            self._routine_definer,
+            preserve_source_definer=self._preserve_source_definer,
+            available_accounts=self._available_definer_accounts,
+            can_set_any_definer=self._can_set_any_definer,
+        )
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     def connect(self) -> None:
@@ -699,10 +765,42 @@ class MySQLTargetConnector(TargetConnector):
         conn_kwargs.update(_connection_options(self._config))
 
         self._conn = mysql.connector.connect(**conn_kwargs)
-        if self._routine_definer is None:
-            with self._conn.cursor() as cur:
-                cur.execute("SELECT CURRENT_USER()")
-                self._routine_definer = cur.fetchone()[0]
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT CURRENT_USER()")
+            current_user = cur.fetchone()[0]
+            current_match = re.fullmatch(
+                rf"\s*(?P<user>{_MYSQL_ACCOUNT_PART})\s*@\s*(?P<host>{_MYSQL_ACCOUNT_PART})\s*",
+                current_user,
+            )
+            if current_match is None:
+                raise RuntimeError("MySQL CURRENT_USER() did not return a user@host identity")
+
+            def unquote(part: str) -> str:
+                return part[1:-1].replace("``", "`") if part.startswith("`") else part
+
+            self._current_account = (
+                unquote(current_match["user"]),
+                unquote(current_match["host"]),
+            )
+            self._available_definer_accounts.add(self._current_account)
+            try:
+                cur.execute("SHOW GRANTS FOR CURRENT_USER()")
+                grant_text = "\n".join(str(row[0]).upper() for row in cur.fetchall())
+                self._can_set_any_definer = bool(
+                    re.search(r"\b(?:SET_ANY_DEFINER|SET_USER_ID|SUPER)\b", grant_text)
+                )
+            except Exception:
+                # Unknown authority must not be treated as permission to retain
+                # a different source DEFINER. The current account remains the
+                # safe target-side identity fallback.
+                self._can_set_any_definer = False
+                self._conn.rollback()
+
+            if self._routine_definer is None or (
+                not self._can_set_any_definer
+                and self._routine_definer != current_user
+            ):
+                self._routine_definer = current_user
         audit_log(phase="connect", status="success", details={"engine": "mysql", "role": "target"})
 
     def close(self) -> None:
@@ -942,7 +1040,7 @@ class MySQLTargetConnector(TargetConnector):
         try:
             with self._conn.cursor() as cur:
                 cur.execute(f"DROP {func.kind.upper()} IF EXISTS {_q(func.name)}")
-                cur.execute(_rewrite_mysql_definer(func.ddl, self._routine_definer or ""))
+                cur.execute(self._rewrite_definer(func.ddl))
                 self._conn.commit()
         except Exception as exc:
             self._conn.rollback()
@@ -955,7 +1053,7 @@ class MySQLTargetConnector(TargetConnector):
         try:
             with self._conn.cursor() as cur:
                 cur.execute(f"DROP TRIGGER IF EXISTS {_q(trigger.name)}")
-                cur.execute(_rewrite_mysql_definer(trigger.ddl, self._routine_definer or ""))
+                cur.execute(self._rewrite_definer(trigger.ddl))
                 self._conn.commit()
         except Exception as exc:
             self._conn.rollback()
@@ -1045,7 +1143,7 @@ class MySQLTargetConnector(TargetConnector):
                             "safety window at target creation. It was not replaced."
                         )
                 cur.execute(f"DROP EVENT IF EXISTS {_q(event.name)}")
-                cur.execute(_rewrite_mysql_definer(event.ddl, self._routine_definer or ""))
+                cur.execute(self._rewrite_definer(event.ddl))
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -1150,6 +1248,11 @@ class MySQLTargetConnector(TargetConnector):
         # whether this direct MySQL statement can be applied.
         target_database = validate_identifier(self._config["database"], "database")
         object_name = grant.object_name.rsplit(".", 1)[-1]
+        grantee = (
+            _qaccount(grant.grantee, grant.grantee_host)
+            if grant.grantee_host is not None
+            else grant.grantee
+        )
         with self._conn.cursor() as cur:
             if grant.object_type == "GLOBAL":
                 object_type, target = "", "*.*"
@@ -1167,58 +1270,52 @@ class MySQLTargetConnector(TargetConnector):
             try:
                 grant_option = " WITH GRANT OPTION" if grant.grant_option else ""
                 scope = f"{object_type} " if object_type else ""
-                cur.execute(f"GRANT {grant.privileges} ON {scope}{target} TO {grant.grantee}{grant_option}")
+                cur.execute(f"GRANT {grant.privileges} ON {scope}{target} TO {grantee}{grant_option}")
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
 
-    def create_security_principal(self, principal: SecurityPrincipalDef) -> None:
-        """Create an account/role without copying a password or password hash.
-
-        Accounts use the target server's default authentication policy; callers
-        must provision a credential separately before behavioral login testing.
-        """
-        account = _qaccount(principal.user, principal.host)
-        statement = f"CREATE ROLE IF NOT EXISTS {account}" if principal.principal_type == "ROLE" else f"CREATE USER IF NOT EXISTS {account}"
+    def create_user_if_not_exists(self, user_name: str, host: str | None = None) -> None:
+        """Create a host-scoped account without copying source credentials."""
+        identity = (user_name, host or "%")
+        if identity in self._available_definer_accounts:
+            return
+        if identity == self._current_account:
+            self._available_definer_accounts.add(identity)
+            return
+        account = _qaccount(*identity)
         with self._conn.cursor() as cur:
             try:
-                cur.execute(statement)
+                cur.execute(f"CREATE USER IF NOT EXISTS {account}")
                 self._conn.commit()
-            except Exception as exc:
-                self._conn.rollback()
-                if principal.principal_type == "USER":
-                    raise RuntimeError(
-                        f"Cannot create {account}; target authentication/account policy differs. "
-                        "No source password or authentication hash is migrated."
-                    ) from exc
-                raise
-
-    def apply_role_membership(self, membership: RoleMembershipDef) -> None:
-        role = _qaccount(membership.role_user, membership.role_host)
-        grantee = _qaccount(membership.grantee_user, membership.grantee_host)
-        admin = " WITH ADMIN OPTION" if membership.with_admin_option else ""
-        with self._conn.cursor() as cur:
-            try:
-                cur.execute(f"GRANT {role} TO {grantee}{admin}")
-                self._conn.commit()
+                self._available_definer_accounts.add(identity)
             except Exception:
                 self._conn.rollback()
                 raise
 
-    def security_migration_authorization(self) -> tuple[bool, str]:
-        """Preflight effective target grants so known-denied writes are skipped."""
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute("SHOW GRANTS FOR CURRENT_USER()")
-                grants = "\n".join(str(row[0]).upper() for row in cur.fetchall())
-        except Exception:
-            return False, "Target authorization could not be verified; grant CREATE USER, CREATE ROLE, and GRANT OPTION, then rerun the full migration."
-        full_admin = "ALL PRIVILEGES ON *.*" in grants and "GRANT OPTION" in grants
-        required = ("CREATE USER", "CREATE ROLE", "GRANT OPTION")
-        if full_admin or all(item in grants for item in required):
-            return True, ""
-        return False, "Target migration account lacks authorization to create users/roles or apply permissions. Grant CREATE USER, CREATE ROLE, and GRANT OPTION, then rerun the full migration."
+    @staticmethod
+    def is_authorization_error(error: Exception) -> bool:
+        """Classify common MySQL privilege-denial errors for per-grant reporting."""
+        codes = {1044, 1045, 1142, 1143, 1227, 1370, 1410, 1698}
+        args = getattr(error, "args", ())
+        if args:
+            try:
+                if int(args[0]) in codes:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        message = str(error).casefold()
+        return any(token in message for token in (
+            "access denied",
+            "not authorized",
+            "not authorised",
+            "permission denied",
+            "grant command denied",
+            "you are not allowed",
+            "insufficient privilege",
+            "need (at least one of) the",
+        ))
 
     def upsert_batch(self, object_name: str, rows: Iterator[dict[str, Any]], schema: Schema | None = None) -> UpsertResult:
         validate_identifier(object_name, "table")

@@ -51,25 +51,15 @@ migration:
     default: 300
     minimum: 0
     description: Block enabled MySQL one-time Events that are due or scheduled within this window at source snapshot or target creation. This prevents silently changing their execution semantics.
-  security_principals:
-    type: object
+  security_users:
+    type: array
     optional: true
-    description: Optional persisted MySQL server-principal allowlist. Prefer runtime --security-user/--security-role selection; omit to skip MySQL users, roles, role edges, and security-scope grants safely.
-    properties:
-      users:
-        type: array
-        items:
-          type: object
-          properties:
-            user: { type: string }
-            host: { type: string, default: "%" }
-      roles:
-        type: array
-        items:
-          type: object
-          properties:
-            user: { type: string }
-            host: { type: string, default: "%" }
+    description: Optional MySQL user account allowlist; global direct permissions are discovered only for explicitly selected users.
+    items:
+      type: object
+      properties:
+        user: { type: string }
+        host: { type: string, default: "%" }
   dry_run:
     type: boolean
     default: false

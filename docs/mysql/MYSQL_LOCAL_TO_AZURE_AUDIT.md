@@ -123,27 +123,14 @@ its target-database side effect, recording the result/date in this audit.
 
 ## Evidence, limits, and reproduction
 
-## Task 13 — allowlisted users, roles, and grants
+## Users and direct permissions
 
-Task 13 uses an explicit allowlist: `security_test_user@%`,
-`reporting_role@%`, and `read_role@%`. Passwords, hashes, and authentication
-secrets are neither queried nor migrated. MySQL 26.7 has no
-`mysql.user.is_role`; the connector uses the allowlist to classify scoped
-principals and never scans every server account.
-
-| Evidence | Observed result |
-|---|---|
-| Local MySQL 26.7 → Azure `39c9933250be4f2daadacaf44ccdc45f` | **SUCCESS**; 28.2 seconds; 23 tables, 115 rows, 0 failed, 0 errors. |
-| Target principals | `read_role@%`, `reporting_role@%`, `security_test_user@%` exist. |
-| Target edges | `read_role@% → reporting_role@%`; `reporting_role@% → security_test_user@%`; both `WITH_ADMIN_OPTION=N`. |
-| Target grants | `read_role@%`: SELECT on target database; `reporting_role@%`: read role; user: direct SELECT plus reporting role. Each showed USAGE. |
-| Behavior as the user | SELECT succeeded (16); CREATE, INSERT, UPDATE returned ERROR 1142 (denied). |
-
-DELETE, ALTER, DROP, and GRANT behavior is **NOT YET EXECUTED**. The direct
-user SELECT grant means SELECT does not independently prove inheritance-only
-access. An earlier temporary INSERT grant was revoked and is not final
-evidence. Local → Local Task 13 security-principal end-to-end verification is
-**NOT YET EXECUTED**.
+Current MySQL security migration scope contains user accounts and direct
+permissions. Passwords, hashes, authentication secrets, role-derived grants,
+and proxy permissions are not migrated. Global permissions require explicit
+user selection and a supported privilege subset. Validate the result against
+the exact report and connector version used for a run; older Task 13 evidence
+below this heading has been superseded by this implementation.
 
 ```sql
 SELECT EVENT_NAME, EVENT_TYPE, STATUS, EXECUTE_AT, INTERVAL_VALUE,

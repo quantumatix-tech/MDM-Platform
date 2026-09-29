@@ -671,31 +671,40 @@ and values.
 
 ---
 
-# Step 8 — Task 13: Users / Roles / Grants Testing
+# Step 8 — Users and Direct Permissions
 
-> **Task 13 update:** users, roles, role edges, and scoped grants are now
-> supported only through `migration.security_principals`. Omit this allowlist
-> to skip server-principal migration safely. MySQL 26.7 classification comes
-> from the configured user/role lists rather than `mysql.user.is_role`; no
-> passwords, hashes, or global privileges are read or migrated. Local → Azure
-> run `39c9933250be4f2daadacaf44ccdc45f` verified users/roles/edges/grants,
-> SELECT allowed, and CREATE/INSERT/UPDATE denied. DELETE/ALTER/DROP/GRANT and
-> Local → Local Task 13 behavior remain not executed.
+MySQL security migration uses the common user and grant APIs. Configure user
+accounts with `migration.security_users` or select them at runtime. Authentication
+secrets are not migrated. Global permissions require explicit user selection
+and are limited to supported direct privileges.
 
 For normal interactive PowerShell runs, select security principals at runtime
 rather than storing identities in YAML. Repeat each option as needed:
 
 ```powershell
 python -m migration_platform --config config/mysql_local_test.yaml --mode full `
-  --security-user security_test_user@% `
-  --security-role reporting_role@% `
-  --security-role read_role@%
+  --security-user security_test_user@%
 ```
 
-No `--security-user` or `--security-role` option means security-principal
-migration is safely skipped. The browser dashboard currently displays migration
-progress/results after the run begins; runtime selection is made through the
-existing CLI/PowerShell launch flow.
+Without `--security-user`, the connector discovers unlocked, non-system
+accounts. The browser dashboard displays Users and Direct Permissions progress
+and results.
+
+### Stored object DEFINER policy
+
+Before creating MySQL routines, triggers, or Events, the migration snapshots
+the source accounts named by their `DEFINER` clauses and creates only those
+accounts required by these objects. It does not recreate the target connection
+account when that exact account is already in use. Other selected users remain
+in the normal Security phase.
+
+The exact source `DEFINER` is retained only when its account is available on
+the target and the migration identity has `SET_ANY_DEFINER` or a server's
+legacy equivalent. An object owned by the target connection identity needs no
+additional definer privilege. If another source identity cannot safely be
+preserved, DDL uses the target connection's `CURRENT_USER()` identity. The
+migration never grants `SUPER` or `SET_ANY_DEFINER`; in this fallback case the
+source `DEFINER` was not preserved.
 
 Current MySQL DMS grant scope is:
 
@@ -705,11 +714,8 @@ Current MySQL DMS grant scope is:
 
 The DMS does not currently migrate:
 
-- users;
-- roles;
-- role assignments;
 - authentication/password state;
-- global privileges;
+- unsupported global privileges;
 - database/schema privileges;
 - column grants;
 - view grants;
@@ -726,8 +732,9 @@ The DMS does not currently migrate:
 | Successful grant application | SUPPORTED / TESTED | Applied grant is recorded as applied/migrated |
 | Failed grant application | SUPPORTED / TESTED | Failure is rolled back and recorded as failed/skipped |
 | Routine `EXECUTE` | CONDITIONALLY SUPPORTED / TESTED | Requires visible `ROUTINE_PRIVILEGES` and existing grantee |
-| Users / roles / assignments | OUT OF SCOPE / NOT SUPPORTED | No account creation/assignment |
-| Global/database/schema/column/view/trigger/event grants | OUT OF SCOPE / NOT SUPPORTED | No current extraction/application path |
+| User accounts | SUPPORTED / CONDITIONAL | Unlocked user identities; no authentication secrets |
+| Selected global direct permissions | SUPPORTED / FILTERED | Allowlisted users and supported privilege subset only |
+| Database/schema/column/view/trigger/event grants | SUPPORTED / CONDITIONAL | Depends on metadata visibility and target support |
 
 ## Metadata visibility boundary
 

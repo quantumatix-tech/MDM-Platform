@@ -176,7 +176,7 @@ class ReportBuilder:
     # JSON
     # ------------------------------------------------------------------
     def build_json(self) -> dict[str, Any]:
-        return {
+        report = {
             "report_version": "2.0",
             "run_id": self._result.get("run_id"),
             "mode": self._result.get("mode"),
@@ -190,6 +190,12 @@ class ReportBuilder:
             "partition_testing": self._result.get("partition_testing") or self._result.get("phases", {}).get("partition_testing"),
             "error": self._result.get("error") or self._result.get("cdc_error"),
         }
+        source_engine = self._result.get("source_engine")
+        target_engine = self._result.get("target_engine")
+        if source_engine == "mysql" or target_engine == "mysql":
+            report["source_engine"] = source_engine
+            report["target_engine"] = target_engine
+        return report
 
     # ------------------------------------------------------------------
     # HTML
@@ -225,18 +231,38 @@ class ReportBuilder:
         object_html = ('<section class="section"><h2 class="section-title">🧩 Object Migration Results</h2><div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Category</th><th style="text-align:right">Source</th><th style="text-align:right">Migrated</th><th style="text-align:right">Blocked</th><th style="text-align:right">Unsupported</th><th style="text-align:right">Failed</th><th>Status</th></tr></thead><tbody>' + object_rows + '</tbody></table></div></section>') if object_rows else ''
         security = phases.get("security_principals", {})
         security_html = ""
+        mysql_security = data.get("source_engine") == "mysql" or data.get("target_engine") == "mysql"
         if isinstance(security, dict):
             entries = [(key, value) for key, value in security.items() if not key.startswith("_")]
             failed = lambda values: sum(str(value).lower().startswith(("failed:", "error:")) for value in values)
+            migrated = lambda values: sum(str(value).lower() in ("created", "applied") for value in values)
+            skipped_values = lambda values: sum(str(value).lower().startswith("skipped:") for value in values)
             user_values = [value for key, value in entries if key.startswith("USER ")]
-            role_values = [value for key, value in entries if key.startswith("ROLE ")]
-            membership_values = [value for key, value in entries if " TO " in key and not key.startswith(("DATABASE ", "COLUMN ", "TABLE ", "PROCEDURE ", "FUNCTION "))]
-            grant_values = [value for key, value in entries if key.startswith(("DATABASE ", "COLUMN ", "TABLE ", "PROCEDURE ", "FUNCTION "))]
-            failure_count = failed(user_values) + failed(role_values) + failed(membership_values) + failed(grant_values)
-            skipped = security.get("_status") == "SKIPPED_NOT_AUTHORIZED"
-            status = "Skipped — target authorization required" if skipped else ("Successfully migrated" if failure_count == 0 else "Completed with issues")
-            explanation = "Security migration was not attempted because target authorization is required." if skipped else "User accounts, roles, role relationships, and permissions were migrated to the target."
-            security_html = f'''<section class="section"><h2 class="section-title">👤 Security &amp; Access</h2><p class="section-sub">{explanation}</p><table class="data-table"><thead><tr><th>Type</th><th>Migrated</th><th>Failed</th></tr></thead><tbody><tr><td>Accounts</td><td>{len(user_values)}</td><td>{failed(user_values)}</td></tr><tr><td>Roles</td><td>{len(role_values)}</td><td>{failed(role_values)}</td></tr><tr><td>Role relationships</td><td>{len(membership_values)}</td><td>{failed(membership_values)}</td></tr><tr><td>Permissions</td><td>{len(grant_values)}</td><td>{failed(grant_values)}</td></tr><tr><td><strong>Status</strong></td><td colspan="2"><strong>{status}</strong></td></tr></tbody></table></section>'''
+            role_values = [] if mysql_security else [value for key, value in entries if key.startswith("ROLE ")]
+            membership_values = [] if mysql_security else [value for key, value in entries if " TO " in key and not key.startswith(("DATABASE ", "COLUMN ", "TABLE ", "PROCEDURE ", "FUNCTION "))]
+            grant_phase = phases.get("grants", [])
+            grant_values = [
+                str(value) for value in grant_phase
+                if isinstance(value, str) and value.startswith("GRANT ")
+            ] if isinstance(grant_phase, list) else []
+            grant_applied = [value for value in grant_values if value.lower().endswith(": applied")]
+            grant_failed = [value for value in grant_values if ": failed" in value.lower()]
+            grant_skipped = [value for value in grant_values if ": skipped:" in value.lower()]
+            issue_count = (
+                failed(user_values) + failed(role_values) + failed(membership_values)
+                + len(grant_failed) + len(grant_skipped)
+            )
+            security_status = "Successfully migrated" if issue_count == 0 else "Completed with issues"
+            explanation = "Accounts and direct permissions were processed individually; failures and authorization skips are reported per item."
+            if mysql_security:
+                security_html = f'''<section class="section"><h2 class="section-title">👤 Security &amp; Access</h2><p class="section-sub">Users and direct permissions were processed individually; failures and authorization skips are reported per item.</p><table class="data-table"><thead><tr><th>Type</th><th>Migrated</th><th>Failed</th><th>Skipped</th></tr></thead><tbody><tr><td>Users</td><td>{migrated(user_values)}</td><td>{failed(user_values)}</td><td>{skipped_values(user_values)}</td></tr><tr><td>Direct Permissions</td><td>{len(grant_applied)}</td><td>{len(grant_failed)}</td><td>{len(grant_skipped)}</td></tr><tr><td><strong>Status</strong></td><td colspan="3"><strong>{security_status}</strong></td></tr></tbody></table></section>'''
+            else:
+                old_grant_values = [value for key, value in entries if key.startswith(("DATABASE ", "COLUMN ", "TABLE ", "PROCEDURE ", "FUNCTION "))]
+                failure_count = failed(user_values) + failed(role_values) + failed(membership_values) + failed(old_grant_values)
+                skipped = security.get("_status") == "SKIPPED_NOT_AUTHORIZED"
+                old_status = "Skipped — target authorization required" if skipped else ("Successfully migrated" if failure_count == 0 else "Completed with issues")
+                old_explanation = "Security migration was not attempted because target authorization is required." if skipped else "User accounts, roles, role relationships, and permissions were migrated to the target."
+                security_html = f'''<section class="section"><h2 class="section-title">👤 Security &amp; Access</h2><p class="section-sub">{old_explanation}</p><table class="data-table"><thead><tr><th>Type</th><th>Migrated</th><th>Failed</th></tr></thead><tbody><tr><td>Accounts</td><td>{len(user_values)}</td><td>{failed(user_values)}</td></tr><tr><td>Roles</td><td>{len(role_values)}</td><td>{failed(role_values)}</td></tr><tr><td>Role relationships</td><td>{len(membership_values)}</td><td>{failed(membership_values)}</td></tr><tr><td>Permissions</td><td>{len(old_grant_values)}</td><td>{failed(old_grant_values)}</td></tr><tr><td><strong>Status</strong></td><td colspan="2"><strong>{old_status}</strong></td></tr></tbody></table></section>'''
 
         # ---- Status badge ----
         if status in ("success", "completed"):
@@ -249,6 +275,8 @@ class ReportBuilder:
         # ---- Phase timeline rows ----
         timeline_rows = ""
         for key, label, icon in _PHASE_META:
+            if mysql_security and key == "grants":
+                label = "Direct Permissions"
             phase_val = phases.get(key)
             if phase_val is None:
                 row_status, row_class = "skipped", "phase-skip"

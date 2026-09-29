@@ -15,6 +15,7 @@ from core.connectors.base import (
     Schema,
     Column,
     UpsertResult,
+    EventDef,
     ViewDefinition,
     FunctionDef,
     SynonymDef,
@@ -62,9 +63,7 @@ def _orchestrator_for_order_test():
     source.list_synonyms.return_value = []
     source.get_all_triggers.return_value = []
     source.list_comments.return_value = []
-    source.list_roles.return_value = []
     source.list_users.return_value = []
-    source.list_role_memberships.return_value = []
     source.list_grants.return_value = []
 
     target.get_object_count.return_value = 1
@@ -105,9 +104,7 @@ def _orchestrator_with_partitioned_table():
     source.list_synonyms.return_value = []
     source.get_all_triggers.return_value = []
     source.list_comments.return_value = []
-    source.list_roles.return_value = []
     source.list_users.return_value = []
-    source.list_role_memberships.return_value = []
     source.list_grants.return_value = []
 
     # Partitioned table metadata - returned by get_partitioned_tables()
@@ -345,6 +342,63 @@ def test_full_phase_sequence_matches_dependency_graph():
             idx = phase_order.index(phase)
             assert idx > last_idx, f"Phase {phase} appears out of order (idx {idx} <= {last_idx})"
             last_idx = idx
+
+
+def test_mysql_definer_accounts_are_created_before_dependent_objects_only():
+    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator._config = {
+        "source": {"engine": "mysql"},
+        "target": {"engine": "mysql"},
+        "migration": {"stop_on_error": False},
+    }
+    source.list_users.return_value = [UserDef(name="mysql_test", host="%"), UserDef(name="ordinary", host="%")]
+    source.list_functions.return_value = [
+        FunctionDef(
+            name="routine",
+            kind="function",
+            ddl="CREATE DEFINER=`mysql_test`@`%` FUNCTION routine() RETURNS INT RETURN 1",
+        ),
+        FunctionDef(
+            name="procedure",
+            kind="procedure",
+            ddl="CREATE DEFINER=`mysql_test`@`%` PROCEDURE procedure() SELECT 1",
+        ),
+    ]
+    source.get_all_triggers.return_value = [
+        TriggerDef(
+            name="trigger",
+            table="table1",
+            ddl="CREATE DEFINER=`mysql_test`@`%` TRIGGER trigger BEFORE INSERT ON table1 FOR EACH ROW SET NEW.id=1",
+        ),
+    ]
+    source.list_events.return_value = [
+        EventDef(
+            name="event",
+            ddl="CREATE DEFINER=`mysql_test`@`%` EVENT event ON SCHEDULE EVERY 1 DAY DO SELECT 1",
+        ),
+    ]
+    target.create_function = MagicMock()
+    target.create_trigger = MagicMock()
+    target.create_event = MagicMock()
+
+    orchestrator.run_full()
+
+    calls = target.mock_calls
+    created_mysql_account = next(
+        index for index, item in enumerate(calls)
+        if item[0] == "create_user_if_not_exists" and item.args == ("mysql_test", "%")
+    )
+    object_calls = {
+        name: next(index for index, item in enumerate(calls) if item[0] == name)
+        for name in ("create_function", "create_trigger", "create_event")
+    }
+    created_ordinary_account = next(
+        index for index, item in enumerate(calls)
+        if item[0] == "create_user_if_not_exists" and item.args == ("ordinary", "%")
+    )
+
+    assert all(created_mysql_account < index for index in object_calls.values())
+    assert created_ordinary_account > max(object_calls.values())
 
 
 if __name__ == "__main__":

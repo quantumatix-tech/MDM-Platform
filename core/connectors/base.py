@@ -263,6 +263,7 @@ class GrantDef:
     grantee: str
     schema_name: str = "public"
     grant_option: bool = False
+    grantee_host: str | None = None
 
 
 @dataclass
@@ -296,11 +297,12 @@ class UserDef:
     """A database user principal."""
     name: str
     type: str = "S"     # 'S' = SQL user, 'U' = Windows user
+    host: str | None = None  # MySQL account host; None for engines without host-scoped users
 
 
 @dataclass(init=False)
 class RoleMembershipDef:
-    """A role edge for either MySQL accounts or database principals."""
+    """A role edge between database principals."""
     member_name: str | None = None
     role_name: str | None = None
     role_user: str | None = None
@@ -486,25 +488,8 @@ class SourceConnector(abc.ABC):
     def list_grants(self) -> list[GrantDef]:
         return []
 
-    def list_security_principals(self) -> list[SecurityPrincipalDef]:
-        return []
-
     def list_users(self) -> list[UserDef]:
         return []
-
-    def list_roles(self) -> list[RoleDef]:
-        return []
-
-    def list_role_memberships(self) -> list[RoleMembershipDef]:
-        return []
-
-    def list_security_grants(self) -> list[GrantDef]:
-        """Privileges outside the connector's historical object-grant scope."""
-        return []
-
-    def security_scope_status(self) -> str | None:
-        """Optional connector-owned explanation of its security migration scope."""
-        return None
 
     def list_synonyms(self) -> list[SynonymDef]:
         return []
@@ -614,28 +599,12 @@ class TargetConnector(abc.ABC):
     def apply_grant(self, grant: GrantDef) -> None:
         pass
 
-    def create_security_principal(self, principal: SecurityPrincipalDef) -> None:
-        raise NotImplementedError("Target does not support security principal migration")
-
-    def apply_role_membership(self, membership: RoleMembershipDef) -> None:
-        raise NotImplementedError("Target does not support role membership migration")
-
-    def security_migration_authorization(self) -> tuple[bool, str]:
-        """Return whether target security writes may be attempted."""
-        return True, ""
-
     def create_synonym(self, synonym: SynonymDef) -> None:
         pass
 
-
-    def create_role_if_not_exists(self, role_name: str) -> None:
+    def create_user_if_not_exists(self, user_name: str, host: str | None = None) -> None:
         pass
 
-    def create_user_if_not_exists(self, user_name: str) -> None:
-        pass
-
-    def create_role_membership(self, member_name: str, role_name: str) -> None:
-        pass
 
 
 class CDCEngine(abc.ABC):

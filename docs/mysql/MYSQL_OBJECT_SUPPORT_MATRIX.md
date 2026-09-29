@@ -203,10 +203,9 @@ not imply that the DMS supports the object.
 
 ## Grants
 
-> **Task 13 update:** allowlisted user/role creation, role edges, and scoped
-> grants are supported. Local → Azure run `39c9933250be4f2daadacaf44ccdc45f`
-> verified the three configured principals, two role edges, and target grants.
-> No global privileges/passwords are migrated; Local → Local is not executed.
+> MySQL security scope contains users and direct permissions only. Account
+> authentication secrets are not migrated. Global permissions require explicit
+> user selection and are limited to supported direct privileges.
 
 | Object | Support | E2E Validation | Evidence / Notes |
 |---|---|---|---|
@@ -216,11 +215,9 @@ not imply that the DMS supports the object.
 | Other supported table privileges | **Partial** | Unit tested | Applied according to discovered source table privilege metadata |
 | Routine `EXECUTE` grant | **Partial** | Unit tested / environment dependent | Extracted from `ROUTINE_PRIVILEGES` when accessible |
 | Target grantee existence | **Required prerequisite** | Tested | DMS does not create the target account for these grant paths |
-| User creation | **Out of Scope** | N/A | Account creation is not part of current DMS support |
-| Role creation | **Out of Scope** | N/A | MySQL roles are not migrated |
-| Role assignment | **Out of Scope** | N/A | Role membership/assignment is not migrated |
-| Global privileges | **Out of Scope** | N/A | No global privilege extraction/application |
-| Database-level privileges | **Out of Scope** | N/A | No database-level privilege extraction/application |
+| User creation | **Supported / Conditional** | Unit tested | Unlocked user identity is created without copying credentials |
+| Supported direct global permissions | **Filtered / Conditional** | Unit tested | Requires explicit user selection and an allowed privilege |
+| Database-level privileges | **Supported / Conditional** | Unit tested | Mapped to the configured target database |
 | Password/authentication attributes | **Out of Scope** | N/A | User authentication configuration is not migrated |
 | Cross-account grant metadata visibility | **Environment Blocked** | Local least-privilege environment | `mysql_test` cannot see another account's grants under the tested privilege set |
 

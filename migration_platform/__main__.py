@@ -116,14 +116,11 @@ def _parse_security_accounts(values: list[str], flag: str) -> list[dict[str, str
     return accounts
 
 
-def _runtime_security_principals(users: list[str], roles: list[str]) -> dict[str, list[dict[str, str]]] | None:
-    """Return an opt-in runtime scope; no selection deliberately means none."""
-    if not users and not roles:
+def _runtime_security_users(users: list[str]) -> list[dict[str, str]] | None:
+    """Return the optional list of selected MySQL user accounts."""
+    if not users:
         return None
-    return {
-        "users": _parse_security_accounts(users, "--security-user"),
-        "roles": _parse_security_accounts(roles, "--security-role"),
-    }
+    return _parse_security_accounts(users, "--security-user")
 
 
 def main():
@@ -154,10 +151,6 @@ def main():
         "--security-user", action="append", default=[], metavar="USER@HOST",
         help="MySQL user account to migrate; repeat for each selected account",
     )
-    parser.add_argument(
-        "--security-role", action="append", default=[], metavar="ROLE@HOST",
-        help="MySQL role to migrate; repeat for each selected role",
-    )
     args = parser.parse_args()
 
     if args.port != 8080:
@@ -166,9 +159,9 @@ def main():
     with open(args.config, encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    runtime_security_principals = _runtime_security_principals(args.security_user, args.security_role)
-    if runtime_security_principals is not None:
-        config.setdefault("migration", {})["security_principals"] = runtime_security_principals
+    runtime_security_users = _runtime_security_users(args.security_user)
+    if runtime_security_users is not None:
+        config.setdefault("migration", {})["security_users"] = runtime_security_users
 
     source_cfg = config.get("source", {})
     target_cfg = config.get("target", {})
@@ -184,12 +177,13 @@ def main():
         raise SystemExit(f"Unknown target engine: {target_type!r}. Available: {list(TARGET_CONNECTORS)}")
 
     source_connection = dict(source_cfg.get("connection", {}))
-    # Connectors own the interpretation of this optional, engine-neutral
-    # migration scope.  MySQL uses it to avoid broad server-principal reads.
-    source_connection["security_principals"] = config.get("migration", {}).get("security_principals")
+    # MySQL uses this optional account allowlist to scope user and direct grant
+    # discovery without reading every server account's global privileges.
+    source_connection["security_users"] = config.get("migration", {}).get("security_users")
     source = instantiate_connector(SOURCE_CONNECTORS[source_type], source_connection)
     target_connection = dict(target_cfg.get("connection", {}))
     target_connection["source_engine"] = source_type
+    target_connection["preserve_source_definer"] = source_type == "mysql" and target_type == "mysql"
     target = instantiate_connector(TARGET_CONNECTORS[target_type], target_connection)
 
     # ---- Audit log to file (suppress stdout noise when rich is active) ----

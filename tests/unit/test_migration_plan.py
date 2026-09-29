@@ -18,7 +18,7 @@ from core.migration_plan import (
 )
 from core.orchestrator import MigrationOrchestrator
 from core.reporting.report_builder import ReportBuilder
-from migration_platform.__main__ import _runtime_security_principals
+from migration_platform.__main__ import _runtime_security_users
 
 
 def test_report_exposes_security_principal_phase_and_counts():
@@ -42,26 +42,53 @@ def test_report_exposes_security_principal_phase_and_counts():
     assert "ALLOWLIST_ENFORCED" not in main_report
 
 
-def test_report_explains_skipped_security_authorization_without_raw_mysql_error():
-    report = ReportBuilder({"run_id": "skip", "mode": "full", "status": "success", "phases": {"security_principals": {
-        "_status": "SKIPPED_NOT_AUTHORIZED", "_detail": "raw error 1410",
-    }}}, 0, 1).build_html()
+def test_report_shows_authorization_denial_per_grant():
+    report = ReportBuilder({
+        "run_id": "skip", "mode": "full", "status": "partial_success",
+        "source_engine": "mysql", "target_engine": "mysql",
+        "phases": {
+            "security_principals": {"USER app_user@%": "created"},
+            "grants": [
+                "GRANT SELECT ON customers TO app_user@%: skipped: NOT AUTHORIZED (Access denied)",
+                "GRANT UPDATE ON customers TO app_user@%: applied",
+            ],
+        },
+    }, 0, 1).build_html()
     main_report, _technical = report.split("<!-- Phase Details", 1)
-    assert "Skipped — target authorization required" in main_report
-    assert "raw error 1410" not in main_report
+    assert "Security &amp; Access" in main_report
+    assert "Completed with issues" in main_report
+    assert "Skipped</th>" in main_report
 
 
-def test_runtime_security_selection_builds_scoped_principals():
-    assert _runtime_security_principals(
-        ["security_test_user@%"], ["reporting_role@%", "read_role@%"]
-    ) == {
-        "users": [{"user": "security_test_user", "host": "%"}],
-        "roles": [{"user": "reporting_role", "host": "%"}, {"user": "read_role", "host": "%"}],
-    }
+def test_mysql_security_report_shows_only_users_and_direct_permissions():
+    report = ReportBuilder({
+        "run_id": "mysql-security", "mode": "full", "status": "success",
+        "source_engine": "mysql", "target_engine": "mysql",
+        "phases": {
+            "security_principals": {
+                "USER app_user@%": "created",
+                "ROLE should_not_appear@%": "created",
+                "membership:member->group": "created",
+            },
+            "grants": ["GRANT SELECT ON customers TO app_user@%: applied"],
+        },
+    }, 0, 1).build_html()
+    main_report, _technical = report.split("<!-- Phase Details", 1)
+    assert "Users" in main_report
+    assert "Direct Permissions" in main_report
+    assert "Roles" not in main_report
+    assert "Role relationships" not in main_report
+    assert "should_not_appear" not in main_report
+
+
+def test_runtime_security_selection_builds_user_allowlist():
+    assert _runtime_security_users(["security_test_user@%"]) == [
+        {"user": "security_test_user", "host": "%"}
+    ]
 
 
 def test_no_runtime_security_selection_keeps_security_migration_opt_in():
-    assert _runtime_security_principals([], []) is None
+    assert _runtime_security_users([]) is None
 
 
 def _config() -> dict:

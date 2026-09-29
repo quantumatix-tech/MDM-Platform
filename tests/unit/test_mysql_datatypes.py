@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from core.connectors.base import (
-    Column, CommentDef, GrantDef, Index, RoleMembershipDef, Schema,
-    SecurityPrincipalDef,
+    Column, CommentDef, EventDef, FunctionDef, GrantDef, Index, Schema, TriggerDef,
+    UserDef,
 )
 from core.connectors.mysql import (
     MySQLSourceConnector,
@@ -239,19 +239,23 @@ def test_mysql_source_table_grant_preserves_grantee_and_source_schema_metadata()
     cursor.__enter__.return_value = cursor
     cursor.__exit__.return_value = False
     cursor.fetchall.side_effect = [
-        [("'migration_grant_test'@'localhost'", "mysql_migration_source", "customers", "SELECT")],
-        [],
+        [("'migration_grant_test'@'localhost'", "mysql_migration_source", "customers", "SELECT", "YES")],
+        [], [], [], [], [("migration_grant_test", "localhost")],
     ]
     connection = MagicMock()
     connection.cursor.return_value = cursor
-    source = MySQLSourceConnector({"database": "mysql_migration_source"})
+    source = MySQLSourceConnector({
+        "database": "mysql_migration_source",
+        "security_users": [{"user": "migration_grant_test", "host": "localhost"}],
+    })
     source._conn = connection
 
     grants = source.list_grants()
 
     assert grants == [GrantDef(
         privileges="SELECT", object_type="TABLE", object_name="customers",
-        grantee="'migration_grant_test'@'localhost'", schema_name="mysql_migration_source",
+        grantee="migration_grant_test", schema_name="mysql_migration_source", grant_option=True,
+        grantee_host="localhost",
     )]
     assert "TABLE_SCHEMA" in cursor.execute.call_args_list[0].args[0]
 
@@ -262,16 +266,21 @@ def test_mysql_source_routine_execute_grant_is_discovered_when_catalog_is_visibl
     cursor.__exit__.return_value = False
     cursor.fetchall.side_effect = [
         [],
-        [("'migration_grant_test'@'localhost'", "refresh_customers", "PROCEDURE", "EXECUTE")],
+        [("'migration_grant_test'@'localhost'", "refresh_customers", "PROCEDURE", "EXECUTE", "NO")],
+        [], [], [], [("migration_grant_test", "localhost")],
     ]
     connection = MagicMock()
     connection.cursor.return_value = cursor
-    source = MySQLSourceConnector({"database": "mysql_migration_source"})
+    source = MySQLSourceConnector({
+        "database": "mysql_migration_source",
+        "security_users": [{"user": "migration_grant_test", "host": "localhost"}],
+    })
     source._conn = connection
 
     assert source.list_grants() == [GrantDef(
         privileges="EXECUTE", object_type="PROCEDURE", object_name="refresh_customers",
-        grantee="'migration_grant_test'@'localhost'", schema_name="mysql_migration_source",
+        grantee="migration_grant_test", schema_name="mysql_migration_source",
+        grantee_host="localhost",
     )]
     assert "ROUTINE_PRIVILEGES" in cursor.execute.call_args_list[1].args[0]
 
@@ -281,7 +290,7 @@ def test_mysql_grant_discovery_does_not_bypass_metadata_visibility_with_mysql_sy
     cursor = MagicMock()
     cursor.__enter__.return_value = cursor
     cursor.__exit__.return_value = False
-    cursor.fetchall.side_effect = [[], []]
+    cursor.fetchall.return_value = []
     connection = MagicMock()
     connection.cursor.return_value = cursor
     source = MySQLSourceConnector({"database": "mysql_migration_source"})
@@ -299,18 +308,26 @@ def test_mysql_routine_grant_catalog_failure_preserves_table_grants():
     cursor = MagicMock()
     cursor.__enter__.return_value = cursor
     cursor.__exit__.return_value = False
-    cursor.fetchall.return_value = [
-        ("'migration_grant_test'@'localhost'", "mysql_migration_source", "customers", "SELECT"),
+    cursor.fetchall.side_effect = [
+        [("'migration_grant_test'@'localhost'", "mysql_migration_source", "customers", "SELECT", "YES")],
+        [], [], [], [("migration_grant_test", "localhost")],
     ]
-    cursor.execute.side_effect = [None, RuntimeError("ROUTINE_PRIVILEGES unavailable")]
+    cursor.execute.side_effect = lambda sql, *_args: (
+        (_ for _ in ()).throw(RuntimeError("ROUTINE_PRIVILEGES unavailable"))
+        if "ROUTINE_PRIVILEGES" in sql else None
+    )
     connection = MagicMock()
     connection.cursor.return_value = cursor
-    source = MySQLSourceConnector({"database": "mysql_migration_source"})
+    source = MySQLSourceConnector({
+        "database": "mysql_migration_source",
+        "security_users": [{"user": "migration_grant_test", "host": "localhost"}],
+    })
     source._conn = connection
 
     assert source.list_grants() == [GrantDef(
         privileges="SELECT", object_type="TABLE", object_name="customers",
-        grantee="'migration_grant_test'@'localhost'", schema_name="mysql_migration_source",
+        grantee="migration_grant_test", schema_name="mysql_migration_source", grant_option=True,
+        grantee_host="localhost",
     )]
     connection.rollback.assert_called_once()
 
@@ -361,97 +378,176 @@ def test_mysql_table_grant_rolls_back_and_raises_on_target_failure():
     connection.commit.assert_not_called()
 
 
-def test_mysql_security_principals_preserve_user_host_without_password_material():
+def test_mysql_list_users_preserves_host_and_allowlist_selects_only_users():
     cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
-    cursor.fetchall.return_value = [
-        ("app_user", "%", "caching_sha2_password", "N", "N"),
-        ("reporting_role", "%", "", "N", "N"),
-    ]
+    cursor.fetchall.return_value = [("security_test_user", "%")]
     connection = MagicMock(); connection.cursor.return_value = cursor
     source = MySQLSourceConnector({
         "database": "source",
-        "security_principals": {
-            "users": [{"user": "app_user", "host": "%"}],
-            "roles": [{"user": "reporting_role", "host": "%"}],
-        },
+        "security_users": [{"user": "security_test_user", "host": "%"}],
     }); source._conn = connection
 
-    assert source.list_security_principals() == [
-        SecurityPrincipalDef("app_user", "%", "USER", "caching_sha2_password", False, False),
-        SecurityPrincipalDef("reporting_role", "%", "ROLE", "", False, False),
-    ]
-    assert "authentication_string" not in cursor.execute.call_args.args[0]
-    assert "is_role" not in cursor.execute.call_args.args[0]
-
-
-def test_mysql_26_security_principal_query_uses_allowlist_types_without_is_role():
-    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
-    cursor.fetchall.return_value = [
-        ("read_role", "%", "", "N", "N"),
-        ("security_test_user", "%", "caching_sha2_password", "N", "N"),
-    ]
-    connection = MagicMock(); connection.cursor.return_value = cursor
-    source = MySQLSourceConnector({
-        "database": "source",
-        "security_principals": {
-            "users": [{"user": "security_test_user", "host": "%"}],
-            "roles": [{"user": "read_role", "host": "%"}],
-        },
-    }); source._conn = connection
-
-    principals = source.list_security_principals()
-    assert [(p.user, p.principal_type) for p in principals] == [
-        ("read_role", "ROLE"), ("security_test_user", "USER"),
-    ]
+    assert source.list_users() == [UserDef(name="security_test_user", host="%")]
     sql = cursor.execute.call_args.args[0]
-    assert "is_role" not in sql and "authentication_string" not in sql
+    assert "SELECT User,Host" in sql
+    assert "authentication_string" not in sql
+    assert "plugin" not in sql
+    assert "read_role" not in repr(source.list_users())
 
 
-def test_mysql_security_without_allowlist_discovers_non_system_principals():
+def test_mysql_list_users_without_allowlist_filters_locked_accounts():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.return_value = [("app_user", "10.%")]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({"database": "source"}); source._conn = connection
+
+    assert source.list_users() == [UserDef(name="app_user", host="10.%")]
+    assert cursor.execute.call_count == 1
+    assert "account_locked='N'" in cursor.execute.call_args.args[0]
+    assert "mysql.role_edges" not in cursor.execute.call_args.args[0]
+
+
+def test_mysql_list_grants_consolidates_direct_user_scopes_and_excludes_role_permissions():
     cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
     cursor.fetchall.side_effect = [
-        [("reporting_role", "%", "security_test_user", "%", "N")],
-        [("mysql.sys", "localhost", "", "N", "N"), ("reporting_role", "%", "", "N", "N"), ("security_test_user", "%", "plugin", "N", "N")],
-        [("reporting_role", "%", "security_test_user", "%", "N")],
-        [], [],
+        [
+            ("'app_user'@'%'", "source", "customers", "SELECT", "YES"),
+            ("'reader_role'@'%'", "source", "customers", "SELECT", "NO"),
+        ],
+        [("'app_user'@'%'", "refresh_customers", "PROCEDURE", "EXECUTE", "NO")],
+        [("'app_user'@'%'", "source", "CREATE", "NO")],
+        [("'app_user'@'%'", "source", "customers", "id", "UPDATE", "YES")],
+        [
+            ("'app_user'@'%'", "def", "PROCESS", "NO"),
+            ("'app_user'@'%'", "def", "ROLE_ADMIN", "YES"),
+            ("'app_user'@'%'", "def", "PROXY", "YES"),
+            ("'app_user'@'%'", "def", "USAGE", "NO"),
+            ("'reader_role'@'%'", "def", "SELECT", "YES"),
+        ],
+        [("app_user", "%")],
+    ]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({
+        "database": "source",
+        "security_users": [{"user": "app_user", "host": "%"}],
+    }); source._conn = connection
+
+    grants = source.list_grants()
+
+    assert grants == [
+        GrantDef("SELECT", "TABLE", "customers", "app_user", "source", True, "%"),
+        GrantDef("EXECUTE", "PROCEDURE", "refresh_customers", "app_user", "source", False, "%"),
+        GrantDef("CREATE", "DATABASE", "source", "app_user", "source", False, "%"),
+        GrantDef("UPDATE", "COLUMN", "customers.id", "app_user", "source", True, "%"),
+    ]
+    executed = " ".join(call.args[0] for call in cursor.execute.call_args_list)
+    assert "INFORMATION_SCHEMA.USER_PRIVILEGES" in executed
+    assert "mysql.role_edges" not in executed
+    assert all(grant.grantee != "reader_role" for grant in grants)
+
+
+def test_mysql_global_grants_require_allowlisted_user_and_supported_privilege():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.side_effect = [
+        [], [], [], [],
+        [
+            ("'app_user'@'%'", "def", "SELECT", "NO"),
+            ("'app_user'@'%'", "def", "CREATE", "NO"),
+            ("'app_user'@'%'", "def", "SYSTEM_USER", "NO"),
+            ("'other_user'@'%'", "def", "SELECT", "NO"),
+            ("'app_user'@'%'", "def", "ROLE_ADMIN", "YES"),
+            ("'app_user'@'%'", "def", "PROXY", "YES"),
+        ],
+        [("app_user", "%")],
+    ]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({
+        "database": "source",
+        "security_users": [{"user": "app_user", "host": "%"}],
+    }); source._conn = connection
+
+    assert source.list_grants() == [GrantDef(
+        "SELECT", "GLOBAL", "*", "app_user", "*", False, "%",
+    )]
+
+
+def test_mysql_global_grants_are_not_discovered_without_explicit_user_selection():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.side_effect = [
+        [], [], [], [],
+        [("'app_user'@'%'", "def", "SELECT", "NO")],
+        [("app_user", "%")],
     ]
     connection = MagicMock(); connection.cursor.return_value = cursor
     source = MySQLSourceConnector({"database": "source"}); source._conn = connection
 
-    assert [(p.user, p.principal_type) for p in source.list_security_principals()] == [("reporting_role", "ROLE"), ("security_test_user", "USER")]
-    assert source.list_role_memberships() == [RoleMembershipDef("reporting_role", "%", "security_test_user", "%", False)]
-    assert source.list_security_grants() == []
-    assert "mysql.sys" in cursor.execute.call_args_list[1].args[0]
+    assert source.list_grants() == []
 
 
-def test_mysql_security_allowlist_filters_role_edges_and_grants():
+def test_mysql_user_allowlist_filters_existing_table_grants_without_regression():
     cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
-    cursor.fetchall.return_value = [
-        ("reporting_role", "%", "security_test_user", "%", "Y"),
-        ("unrelated_role", "%", "security_test_user", "%", "N"),
+    cursor.fetchall.side_effect = [
+        [("'security_test_user'@'%'", "source", "customers", "SELECT", "YES"),
+         ("'unrelated_user'@'%'", "source", "customers", "SELECT", "YES")],
+        [], [], [], [], [("security_test_user", "%")],
     ]
     connection = MagicMock(); connection.cursor.return_value = cursor
     source = MySQLSourceConnector({
         "database": "source",
-        "security_principals": {
-            "users": [{"user": "security_test_user", "host": "%"}],
-            "roles": [{"user": "reporting_role", "host": "%"}],
-        },
+        "security_users": [{"user": "security_test_user", "host": "%"}],
     }); source._conn = connection
 
-    assert source.list_role_memberships() == [
-        RoleMembershipDef("reporting_role", "%", "security_test_user", "%", True)
+    assert source.list_grants() == [GrantDef(
+        privileges="SELECT", object_type="TABLE", object_name="customers",
+        grantee="security_test_user", schema_name="source", grant_option=True,
+        grantee_host="%",
+    )]
+
+
+def test_mysql_create_user_preserves_host_without_copying_credentials():
+    target, cursor, connection = _target()
+    target.create_user_if_not_exists("app_user", "10.%")
+
+    assert cursor.execute.call_args.args[0] == "CREATE USER IF NOT EXISTS `app_user`@`10.%`"
+    assert "IDENTIFIED" not in cursor.execute.call_args.args[0]
+    connection.commit.assert_called_once()
+
+
+def test_mysql_target_grants_apply_user_host_for_database_column_and_global_scopes():
+    target, cursor, connection = _target()
+    grants = [
+        GrantDef("CREATE", "DATABASE", "source", "app_user", "source", False, "%"),
+        GrantDef("UPDATE", "COLUMN", "customers.id", "app_user", "source", True, "%"),
+        GrantDef("PROCESS", "GLOBAL", "*", "app_user", "*", False, "%"),
     ]
 
-    cursor.fetchall.side_effect = [
-        [("'security_test_user'@'%'", "source", "SELECT", "YES"),
-         ("'unrelated_user'@'%'", "source", "SELECT", "YES")],
-        [],
+    for grant in grants:
+        target.apply_grant(grant)
+
+    assert [call.args[0] for call in cursor.execute.call_args_list] == [
+        "GRANT CREATE ON `target`.* TO `app_user`@`%`",
+        "GRANT UPDATE ON `target`.`customers` (`id`) TO `app_user`@`%` WITH GRANT OPTION",
+        "GRANT PROCESS ON *.* TO `app_user`@`%`",
     ]
-    grants = source.list_security_grants()
-    assert len(grants) == 1 and grants[0].grantee == "'security_test_user'@'%'"
-    executed = " ".join(call.args[0] for call in cursor.execute.call_args_list)
-    assert "USER_PRIVILEGES" not in executed
+    assert connection.commit.call_count == 3
+
+
+def test_mysql_target_has_no_role_capabilities_and_classifies_denials():
+    target, _cursor, _connection = _target()
+    capabilities = target.get_capabilities()
+    assert "roles" not in capabilities
+    assert "role_memberships" not in capabilities
+    assert target.is_authorization_error(RuntimeError("Access denied for GRANT"))
+    assert not target.is_authorization_error(RuntimeError("unknown table"))
+    assert not hasattr(target, "create_security_principal")
+    from core.connectors.mysql import MySQLTargetConnector
+    assert "create_role_if_not_exists" not in MySQLTargetConnector.__dict__
+    assert "create_role_membership" not in MySQLTargetConnector.__dict__
+    assert not hasattr(target, "create_role_if_not_exists")
+    assert not hasattr(target, "create_role_membership")
+    source = MySQLSourceConnector({"database": "source"})
+    assert not hasattr(source, "list_roles")
+    assert not hasattr(source, "list_role_memberships")
 
 
 def test_mysql_allowlist_filters_existing_table_grants_without_regression():
@@ -459,36 +555,145 @@ def test_mysql_allowlist_filters_existing_table_grants_without_regression():
     cursor.fetchall.side_effect = [[
         ("'security_test_user'@'%'", "source", "customers", "SELECT", "YES"),
         ("'unrelated_user'@'%'", "source", "customers", "SELECT", "YES"),
-    ], []]
+    ], [], [], [], [], [("security_test_user", "%")]]
     connection = MagicMock(); connection.cursor.return_value = cursor
     source = MySQLSourceConnector({
         "database": "source",
-        "security_principals": {"users": [{"user": "security_test_user", "host": "%"}]},
+        "security_users": [{"user": "security_test_user", "host": "%"}],
     }); source._conn = connection
 
     assert source.list_grants() == [GrantDef(
         privileges="SELECT", object_type="TABLE", object_name="customers",
-        grantee="'security_test_user'@'%'", schema_name="source", grant_option=True,
+        grantee="security_test_user", schema_name="source", grant_option=True,
+        grantee_host="%",
     )]
 
 
-def test_mysql_target_security_creation_role_edge_and_grant_option():
-    target, cursor, connection = _target()
-    target.create_security_principal(SecurityPrincipalDef("reporting_role", "%", "ROLE"))
-    target.create_security_principal(SecurityPrincipalDef("report_user", "localhost", "USER"))
-    target.apply_role_membership(RoleMembershipDef("reporting_role", "%", "report_user", "localhost", True))
-    target.apply_grant(GrantDef("SELECT", "DATABASE", "source", "`reporting_role`@`%`", "source", True))
+def test_mysql_common_orchestrator_has_no_role_migration_path():
+    from core.connectors.base import UserDef
+    from core.orchestrator import MigrationOrchestrator
 
-    sql = [call.args[0] for call in cursor.execute.call_args_list]
-    assert "CREATE ROLE IF NOT EXISTS `reporting_role`@`%`" in sql
-    assert "CREATE USER IF NOT EXISTS `report_user`@`localhost`" in sql
-    assert "GRANT `reporting_role`@`%` TO `report_user`@`localhost` WITH ADMIN OPTION" in sql
-    assert "GRANT SELECT ON `target`.* TO `reporting_role`@`%` WITH GRANT OPTION" in sql
+    source = MagicMock()
+    target = MagicMock()
+    source.list_objects.return_value = []
+    source.list_extensions.return_value = []
+    source.list_schemas.return_value = []
+    source.list_types.return_value = []
+    source.list_all_sequences.return_value = []
+    source.list_partition_functions.return_value = []
+    source.list_partition_schemes.return_value = []
+    source.get_partitioned_tables.return_value = []
+    source.list_views.return_value = []
+    source.list_materialized_views.return_value = []
+    source.list_functions.return_value = []
+    source.list_synonyms.return_value = []
+    source.get_all_triggers.return_value = []
+    source.list_comments.return_value = []
+    source.list_partitions.side_effect = AttributeError("no list_partitions")
+    source.list_users.return_value = [UserDef("broken", host="%"), UserDef("working", host="localhost")]
+    source.list_grants.return_value = [
+        GrantDef("SELECT", "TABLE", "customers", "broken", "source", False, "%"),
+        GrantDef("SELECT", "TABLE", "customers", "working", "source", False, "localhost"),
+        GrantDef("UPDATE", "TABLE", "customers", "working", "source", False, "localhost"),
+    ]
+    target.get_capabilities.return_value = {
+        "security_principals": {"supported": True, "mode": "direct"},
+    }
+
+    def create_user(name, host=None):
+        if name == "broken":
+            raise RuntimeError("CREATE USER denied")
+
+    def apply_grant(grant):
+        if grant.privileges == "SELECT":
+            raise RuntimeError("Access denied for GRANT")
+
+    target.create_user_if_not_exists.side_effect = create_user
+    target.apply_grant.side_effect = apply_grant
+    target.is_authorization_error.side_effect = lambda error: "Access denied" in str(error)
+    orchestrator = MigrationOrchestrator(source, target, {
+        "source": {"engine": "mysql"}, "target": {"engine": "mysql"},
+        "migration": {"stop_on_error": False},
+    })
+
+    result = orchestrator.run_full()
+
+    assert result["status"] == "partial_success"
+    assert source.list_users.called
+    assert source.list_grants.called
+    source.list_roles.assert_not_called()
+    source.list_role_memberships.assert_not_called()
+    target.create_role_if_not_exists.assert_not_called()
+    target.create_role_membership.assert_not_called()
+    assert target.apply_grant.call_count == 2
+    assert "skipped: user creation failed" in result["phases"]["grants"][0]
+    assert "skipped: NOT AUTHORIZED" in result["phases"]["grants"][1]
+    assert result["phases"]["grants"][2].endswith(": applied")
 
 
-def test_mysql_target_security_authorization_preflight_skips_known_denial():
-    target, cursor, _connection = _target()
-    cursor.fetchall.return_value = [("GRANT SELECT ON `target`.* TO `mysql_admin`@`%`",)]
-    allowed, message = target.security_migration_authorization()
-    assert not allowed
-    assert "CREATE USER" in message
+def test_mysql_definer_users_are_created_before_all_definer_objects():
+    from core.orchestrator import MigrationOrchestrator
+
+    source = MagicMock()
+    target = MagicMock()
+    source.list_objects.return_value = []
+    source.list_extensions.return_value = []
+    source.list_schemas.return_value = []
+    source.list_types.return_value = []
+    source.list_all_sequences.return_value = []
+    source.list_partition_functions.return_value = []
+    source.list_partition_schemes.return_value = []
+    source.get_partitioned_tables.return_value = []
+    source.list_views.return_value = []
+    source.list_materialized_views.return_value = []
+    source.list_functions.return_value = [
+        FunctionDef("f", kind="function", ddl="CREATE DEFINER=`mysql_test`@`%` FUNCTION f() RETURNS INT RETURN 1"),
+        FunctionDef("p", kind="procedure", ddl="CREATE DEFINER=`mysql_test`@`%` PROCEDURE p() SELECT 1"),
+    ]
+    source.get_all_triggers.return_value = [
+        TriggerDef("tr", "tbl", "CREATE DEFINER=`mysql_test`@`%` TRIGGER tr BEFORE INSERT ON tbl FOR EACH ROW SET NEW.id=1")
+    ]
+    source.list_events.return_value = [
+        EventDef("evt", ddl="CREATE DEFINER=`mysql_test`@`%` EVENT evt ON SCHEDULE EVERY 1 DAY DO SELECT 1")
+    ]
+    source.list_synonyms.return_value = []
+    source.list_comments.return_value = []
+    source.list_partitions.side_effect = AttributeError("no list_partitions")
+    source.list_users.return_value = [UserDef("mysql_test", host="%")]
+    source.list_grants.return_value = []
+    order: list[str] = []
+    target.get_capabilities.return_value = {"security_principals": {"supported": True}}
+    account_created = False
+
+    def create_user(name, host=None):
+        nonlocal account_created
+        account_created = True
+        order.append(f"user:{name}@{host}")
+
+    def create_event(event):
+        if not account_created:
+            raise RuntimeError(
+                "4006 (HY000): Operation CREATE USER failed for 'mysql_test'@'%' "
+                "as it is referenced as a definer account in an event"
+            )
+        order.append(f"event:{event.name}")
+
+    target.create_user_if_not_exists.side_effect = create_user
+    target.create_function.side_effect = lambda routine: order.append(f"{routine.kind}:{routine.name}")
+    target.create_trigger.side_effect = lambda trigger: order.append(f"trigger:{trigger.name}")
+    target.create_event.side_effect = create_event
+    orchestrator = MigrationOrchestrator(source, target, {
+        "source": {"engine": "mysql"}, "target": {"engine": "mysql"},
+        "migration": {"stop_on_error": False},
+    })
+
+    result = orchestrator.run_full()
+
+    assert result["phases"]["security_users_pre_objects"]["USER mysql_test@%"] == "created"
+    assert order == ["user:mysql_test@%", "function:f", "procedure:p", "trigger:tr", "event:evt"]
+    assert result["phases"]["events"]["evt"] == "created"
+    target.create_user_if_not_exists.assert_called_once_with("mysql_test", "%")
+    source.list_roles.assert_not_called()
+    source.list_role_memberships.assert_not_called()
+    target.create_role_if_not_exists.assert_not_called()
+    target.create_role_membership.assert_not_called()

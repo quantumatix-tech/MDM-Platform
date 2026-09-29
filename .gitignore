@@ -37,3 +37,6 @@ test-results/
 Thumbs.db
 
 .pytest-local/
+
+# Runtime migration state
+state/

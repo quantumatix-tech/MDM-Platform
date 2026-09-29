@@ -21,6 +21,7 @@ from core.connectors.base import (
     UpsertResult,
     SynonymDef,
 )
+from core.connectors.mysql import _mysql_definer_identity
 from core.migration_plan import MigrationPlan, PostgresMigrationPlanner
 from core.schema_mapping.registry import TypeMappingRegistry
 from core.secrets import create_secret_provider
@@ -143,8 +144,16 @@ class MigrationOrchestrator:
             "mode": "full",
             "phases": {},
         }
+        source_engine = self._config.get("source", {}).get("engine")
+        target_engine = self._config.get("target", {}).get("engine")
+        if source_engine == "mysql" or target_engine == "mysql":
+            result["source_engine"] = source_engine
+            result["target_engine"] = target_engine
 
         all_errors: list[str] = []
+        mysql_users: list[Any] | None = None
+        mysql_user_results: dict[str, str] = {}
+        mysql_failed_users: dict[tuple[str, str | None], str] = {}
 
         def _run_phase(name: str, fn: Any, progress: int, critical: bool = False) -> Any:
             """Run a migration phase, log result, update progress."""
@@ -195,6 +204,51 @@ class MigrationOrchestrator:
                 }
                 for event in source_events
             }
+
+            # Snapshot the other MySQL DEFINER-bearing objects too. This
+            # allows account dependencies to be established before views,
+            # routines, triggers, and events without moving unrelated phases.
+            source_engine = self._config.get("source", {}).get("engine")
+            target_engine = self._config.get("target", {}).get("engine")
+            mysql_definer_dependency = source_engine == "mysql" and target_engine == "mysql"
+            source_routines: list[Any] | None = None
+            source_triggers: list[Any] | None = None
+            if mysql_definer_dependency:
+                source_routines = list(self._source.list_functions())
+                source_triggers = list(self._source.get_all_triggers())
+
+            # MySQL stored objects may refer to source accounts in their
+            # DEFINER clause. Create those accounts before any dependent
+            # routines, triggers, or events can create orphan DEFINER refs.
+            if mysql_definer_dependency:
+                mysql_users = list(self._source.list_users())
+                definer_objects = [*source_routines, *source_triggers, *source_events]
+                required_definers = {
+                    identity
+                    for identity in (
+                        _mysql_definer_identity(getattr(obj, "ddl", ""))
+                        for obj in definer_objects
+                    )
+                    if identity is not None
+                }
+                for user in mysql_users:
+                    host = getattr(user, "host", None)
+                    identity = (user.name, host)
+                    if identity not in required_definers:
+                        continue
+                    label = f"{user.name}@{host}" if host is not None else user.name
+                    try:
+                        if host is None:
+                            self._target.create_user_if_not_exists(user.name)
+                        else:
+                            self._target.create_user_if_not_exists(user.name, host)
+                        mysql_user_results[f"USER {label}"] = "created"
+                    except Exception as exc:
+                        mysql_failed_users[identity] = str(exc)
+                        mysql_user_results[f"USER {label}"] = f"failed: {exc}"
+                        all_errors.append(f"CREATE USER {label}: {exc}")
+                result["phases"]["security_users_pre_objects"] = mysql_user_results
+                self._update_status("security_users_pre_objects", 4, all_errors)
 
             if plan is not None:
                 self._record_preflight(plan.to_dict())
@@ -415,7 +469,8 @@ class MigrationOrchestrator:
             # On rerun MySQL triggers already exist and would otherwise record
             # migration DML as application activity.  Connector-specific
             # suspension is deliberately limited to source trigger names.
-            source_triggers = self._source.get_all_triggers()
+            if source_triggers is None:
+                source_triggers = self._source.get_all_triggers()
             suspended_triggers = self._target.suspend_triggers_for_data_load(source_triggers)
             result["phases"]["trigger_data_load_handling"] = {
                 "suspended": [t.name for t in suspended_triggers],
@@ -627,7 +682,11 @@ class MigrationOrchestrator:
             # ---------- Phase 13: Functions & Stored Procedures ----------
             func_results: dict[str, str] = {}
             try:
-                routines = self._source.list_functions()
+                routines = (
+                    source_routines
+                    if source_routines is not None
+                    else self._source.list_functions()
+                )
                 result["object_inventory"] = {
                     "functions": sum(func.kind == "function" for func in routines),
                     "procedures": sum(func.kind == "procedure" for func in routines),
@@ -724,107 +783,160 @@ class MigrationOrchestrator:
             result["phases"]["comments"] = comment_results
             self._update_status("comments", 88, all_errors)
 
-            # ---------- Phase: Users, Roles & Role Memberships (Step 14) ----------
+            # ---------- Phase: Users and Direct Permissions ----------
             security_results: dict[str, str] = {}
+            user_access_results: dict[str, str] = {}
+            failed_users: dict[tuple[str, str | None], str] = {}
+            target_capabilities = self._target.get_capabilities()
+            source_engine = self._config.get("source", {}).get("engine")
+            target_engine = self._config.get("target", {}).get("engine")
+            mysql_security_scope = source_engine == "mysql" or target_engine == "mysql"
+            established_nonmysql_scope = source_engine in {"mssql", "postgresql"} or target_engine in {"mssql", "postgresql"}
+            roles_supported = not mysql_security_scope
+            memberships_supported = not mysql_security_scope
             try:
-                for role in self._source.list_roles():
-                    try:
-                        self._target.create_role_if_not_exists(role.name)
-                        security_results[f"role:{role.name}"] = "created"
-                    except Exception as exc:
-                        security_results[f"role:{role.name}"] = f"skipped: {exc}"
-                for user in self._source.list_users():
-                    try:
-                        self._target.create_user_if_not_exists(user.name)
-                        security_results[f"user:{user.name}"] = "created"
-                    except Exception as exc:
-                        security_results[f"user:{user.name}"] = f"skipped: {exc}"
-                for membership in self._source.list_role_memberships():
-                    try:
-                        self._target.create_role_membership(
-                            membership.member_name, membership.role_name
-                        )
-                        security_results[
-                            f"membership:{membership.member_name}->{membership.role_name}"
-                        ] = "created"
-                    except Exception as exc:
-                        security_results[
-                            f"membership:{membership.member_name}->{membership.role_name}"
-                        ] = f"skipped: {exc}"
+                if roles_supported:
+                    list_roles = getattr(self._source, "list_roles", None)
+                    for role in (list_roles() if callable(list_roles) else []):
+                        try:
+                            create_role = getattr(self._target, "create_role_if_not_exists", None)
+                            if not callable(create_role):
+                                continue
+                            create_role(role.name)
+                            security_results[f"role:{role.name}"] = "created"
+                        except Exception as exc:
+                            security_results[f"role:{role.name}"] = f"skipped: {exc}"
+                for user in (mysql_users if mysql_users is not None else self._source.list_users()):
+                    host = getattr(user, "host", None)
+                    identity = (user.name, host)
+                    user_label = f"{user.name}@{host}" if host is not None else user.name
+                    security_key = f"user:{user_label}"
+                    access_key = f"USER {user_label}"
+                    if mysql_users is not None:
+                        if access_key not in mysql_user_results:
+                            try:
+                                if host is None:
+                                    self._target.create_user_if_not_exists(user.name)
+                                else:
+                                    self._target.create_user_if_not_exists(user.name, host)
+                                mysql_user_results[access_key] = "created"
+                            except Exception as exc:
+                                failure = str(exc)
+                                mysql_failed_users[identity] = failure
+                                mysql_user_results[access_key] = f"failed: {failure}"
+                                all_errors.append(f"CREATE USER {user_label}: {failure}")
+                        failure = mysql_failed_users.get(identity)
+                        if failure is None:
+                            security_results[security_key] = "created"
+                            user_access_results[access_key] = "created"
+                        else:
+                            failed_users[identity] = failure
+                            security_results[security_key] = f"failed: {failure}"
+                            user_access_results[access_key] = f"failed: {failure}"
+                    else:
+                        try:
+                            if host is None:
+                                self._target.create_user_if_not_exists(user.name)
+                            else:
+                                self._target.create_user_if_not_exists(user.name, host)
+                            security_results[security_key] = "created"
+                            user_access_results[access_key] = "created"
+                        except Exception as exc:
+                            failure = str(exc)
+                            failed_users[identity] = failure
+                            if mysql_security_scope or not established_nonmysql_scope:
+                                security_results[security_key] = f"failed: {failure}"
+                                user_access_results[access_key] = f"failed: {failure}"
+                                all_errors.append(f"CREATE USER {user_label}: {failure}")
+                            else:
+                                # Keep the established MSSQL/PostgreSQL
+                                # per-principal isolation and status semantics.
+                                security_results[security_key] = f"skipped: {failure}"
+                if memberships_supported:
+                    list_memberships = getattr(self._source, "list_role_memberships", None)
+                    for membership in (list_memberships() if callable(list_memberships) else []):
+                        try:
+                            create_membership = getattr(self._target, "create_role_membership", None)
+                            if not callable(create_membership):
+                                continue
+                            create_membership(membership.member_name, membership.role_name)
+                            security_results[
+                                f"membership:{membership.member_name}->{membership.role_name}"
+                            ] = "created"
+                        except Exception as exc:
+                            security_results[
+                                f"membership:{membership.member_name}->{membership.role_name}"
+                            ] = f"skipped: {exc}"
             except Exception as exc:
                 security_results["_error"] = str(exc)
+                user_access_results["_error"] = str(exc)
+                if mysql_users is not None:
+                    user_access_results.update(mysql_user_results)
+                    failed_users.update(mysql_failed_users)
             result["phases"]["security"] = security_results
             self._update_status("security", 89, all_errors)
 
-            # ---------- Phase 16: Grants ----------
-            # Connector-owned security support is deliberately capability-gated:
-            # non-MySQL targets retain their existing migration behaviour.
-            security_results: dict[str, str] = {}
-            if self._target.get_capabilities().get("security_principals", {}).get("supported", False):
-                try:
-                    scope_status = self._source.security_scope_status()
-                    authorized, authorization_message = self._target.security_migration_authorization()
-                    if not authorized:
-                        security_results["_status"] = "SKIPPED_NOT_AUTHORIZED"
-                        security_results["_detail"] = authorization_message
-                    elif scope_status and scope_status.startswith("OUT_OF_SCOPE"):
-                        security_results["_status"] = scope_status
-                    else:
-                        if scope_status:
-                            security_results["_scope"] = scope_status
-                        principals = self._source.list_security_principals()
-                        for principal in principals:
-                            key = f"{principal.principal_type} {principal.user}@{principal.host}"
-                            try:
-                                self._target.create_security_principal(principal)
-                                security_results[key] = "created"
-                            except Exception as exc:
-                                security_results[key] = f"failed: {exc}"
-                        for membership in self._source.list_role_memberships():
-                            key = f"{membership.role_user}@{membership.role_host} TO {membership.grantee_user}@{membership.grantee_host}"
-                            try:
-                                self._target.apply_role_membership(membership)
-                                security_results[key] = "applied"
-                            except Exception as exc:
-                                security_results[key] = f"failed: {exc}"
-                        for grant in self._source.list_security_grants():
-                            key = f"{grant.object_type} {grant.object_name} TO {grant.grantee}"
-                            try:
-                                self._target.apply_grant(grant)
-                                security_results[key] = "applied"
-                            except Exception as exc:
-                                security_results[key] = f"failed: {exc}"
-                except Exception as exc:
-                    security_results["_error"] = str(exc)
+            # MySQL account results now use the common user path above. The
+            # connector's capability advertises this report category only for
+            # engines that expose account-level security migration.
+            if target_capabilities.get("security_principals", {}).get("supported", False):
+                result["phases"]["security_principals"] = user_access_results
             else:
-                security_results["_status"] = "out_of_scope"
-            result["phases"]["security_principals"] = security_results
+                result["phases"]["security_principals"] = {"_status": "out_of_scope"}
             self._update_status("security_principals", 90, all_errors)
             grant_results: list[str] = []
             try:
                 grants = list(self._source.list_grants())
-                # Ensure all grantee roles exist on target before applying grants
-                grantees = {g.grantee for g in grants}
-                for grantee in grantees:
-                    try:
-                        self._target.create_role_if_not_exists(grantee)
-                    except Exception as exc:
-                        grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
-                        all_errors.append(f"CREATE ROLE {grantee}: {exc}")
+                # Preserve the shared role setup for engines that support it.
+                if roles_supported:
+                    grantees = {g.grantee for g in grants}
+                    for grantee in grantees:
+                        try:
+                            create_role = getattr(self._target, "create_role_if_not_exists", None)
+                            if not callable(create_role):
+                                continue
+                            create_role(grantee)
+                        except Exception as exc:
+                            grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
+                            all_errors.append(f"CREATE ROLE {grantee}: {exc}")
                 for grant in grants:
-                    if grant.object_type == "SCHEMA":
+                    grantee_host = getattr(grant, "grantee_host", None)
+                    grantee_label = (
+                        f"{grant.grantee}@{grantee_host}"
+                        if grantee_host is not None else grant.grantee
+                    )
+                    if grant.object_type == "GLOBAL":
+                        grant_key = f"*.* TO {grantee_label}"
+                    elif grant.object_type == "DATABASE":
+                        grant_key = f"{grant.object_name}.* TO {grantee_label}"
+                    elif grant.object_type == "SCHEMA":
                         grant_key = f"{grant.object_name} TO {grant.grantee}"
                     else:
                         grant_key = (
-                            f"{grant.object_name} TO {grant.grantee}"
+                            f"{grant.object_name} TO {grantee_label}"
                             if grant.schema_name == "public"
-                            else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+                            else f"{grant.schema_name}.{grant.object_name} TO {grantee_label}"
                         )
+                    user_failure = (
+                        failed_users.get((grant.grantee, grantee_host))
+                        if mysql_security_scope else None
+                    )
+                    if user_failure is not None:
+                        grant_results.append(
+                            f"GRANT {grant.privileges} ON {grant_key}: skipped: user creation failed ({user_failure})"
+                        )
+                        continue
                     try:
                         self._target.apply_grant(grant)
                         grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: applied")
                     except Exception as exc:
-                        grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
+                        is_auth_error = getattr(self._target, "is_authorization_error", None)
+                        if grantee_host is not None and callable(is_auth_error) and is_auth_error(exc):
+                            grant_results.append(
+                                f"GRANT {grant.privileges} ON {grant_key}: skipped: NOT AUTHORIZED ({exc})"
+                            )
+                        else:
+                            grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
                         all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
                         failed_objects.add(grant_key)
             except Exception as exc:
@@ -989,6 +1101,10 @@ class MigrationOrchestrator:
         target_capabilities = self._target.get_capabilities()
         if not isinstance(target_capabilities, dict):
             target_capabilities = {}
+        mysql_security_scope = (
+            self._config.get("source", {}).get("engine") == "mysql"
+            or self._config.get("target", {}).get("engine") == "mysql"
+        )
         counts = {
             "tables": len(schemas), "columns": sum(len(s.columns) for s in schemas.values()),
             "primary_keys": sum(bool(s.primary_key) for s in schemas.values()),
@@ -1019,16 +1135,30 @@ class MigrationOrchestrator:
                 phase = {key: value for key, value in phase.items() if routine_kinds.get(key) == wanted}
             if isinstance(phase, dict):
                 entries = list(phase.items())
+            elif isinstance(phase, list) and mysql_security_scope and category == "grants":
+                entries = [(str(index), value) for index, value in enumerate(phase)]
             else:
                 entries = [("_phase", phase)]
             blocked_entries = [value for _, value in entries if "blocked" in str(value).lower()]
+            skipped_entries = (
+                [
+                    value for _, value in entries
+                    if any(marker in str(value).lower() for marker in (
+                        "skipped: not authorized",
+                        "skipped: user creation failed",
+                    ))
+                ]
+                if mysql_security_scope else []
+            )
             failed_entries = [
                 value for _, value in entries
                 if any(marker in str(value).lower() for marker in ("failed", "error:", "skipped:"))
                 and "blocked" not in str(value).lower()
+                and value not in skipped_entries
             ]
             blocked_count = len(blocked_entries)
             failed_count = len(failed_entries)
+            skipped_count = len(skipped_entries)
             unsupported_count = count if count and not capability.get("supported", False) else 0
             if unsupported_count:
                 status = "UNSUPPORTED"
@@ -1036,9 +1166,11 @@ class MigrationOrchestrator:
                 status = "BLOCKED"
             elif failed_count:
                 status = "FAILED"
+            elif skipped_count:
+                status = "SKIPPED"
             else:
                 status = "MIGRATED"
-            migrated_count = max(count - blocked_count - failed_count - unsupported_count, 0)
+            migrated_count = max(count - blocked_count - failed_count - skipped_count - unsupported_count, 0)
             failed += failed_count
             blocked += blocked_count
             categories[category] = {
@@ -1048,9 +1180,11 @@ class MigrationOrchestrator:
                 "unsupported": unsupported_count,
                 "failed": failed_count,
                 "status": status,
-                "details": blocked_entries + failed_entries,
+                "details": blocked_entries + failed_entries + skipped_entries,
                 "capability": capability,
             }
+            if mysql_security_scope:
+                categories[category]["skipped"] = skipped_count
         return {
             "categories": categories,
             "failed": failed,
