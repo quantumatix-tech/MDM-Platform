@@ -37,6 +37,7 @@ from core.connectors.mssql._models import (
     _qualify,
 )
 from core.connectors.mssql.objects import table as _mssql_table
+from core.connectors.mssql.objects import view as _mssql_view
 
 
 class MSSQLTargetConnector(TargetConnector):
@@ -345,46 +346,8 @@ class MSSQLTargetConnector(TargetConnector):
                     )
 
     def create_view(self, view: "ViewDefinition") -> None:
-        validate_identifier(view.name, "view")
-        schema_name = view.schema_name or "dbo"
-        validate_identifier(schema_name, "schema")
-        view_qname = f"[{schema_name or 'dbo'}].[{view.name}]"
-        with self._conn.cursor() as cur:
-            # Ensure the target schema exists (dbo always exists in SQL Server).
-            if schema_name != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (schema_name,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(schema_name)}")
-                    audit_log(
-                        phase="create_schema", status="created",
-                        details={"schema": schema_name},
-                    )
-                    self._conn.commit()
-        # CREATE VIEW must be the first statement in a batch.
-        # Execute in a separate cursor/batch after schema creation commit.
-        with self._conn.cursor() as cur:
-            try:
-                definition = view.definition
-                if definition.upper().startswith("CREATE VIEW"):
-                    definition = definition[len("CREATE VIEW"):].lstrip()
-                    as_idx = definition.upper().find(" AS ")
-                    if as_idx >= 0:
-                        definition = definition[as_idx + 4:].lstrip()
-                cur.execute(
-                    f"CREATE OR ALTER VIEW {view_qname} AS {definition}"
-                )
-                self._conn.commit()
-                audit_log(
-                    phase="create_view", status="created",
-                    details={"view": view.name},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_view", status="failed",
-                    details={"view": view.name, "reason": str(exc)},
-                )
-                raise
+        """Create or alter a view. Delegates to ``view.create_view``."""
+        _mssql_view.create_view(self._conn, view)
 
     def create_function(self, func: "FunctionDef") -> None:
         validate_identifier(func.name, "function")

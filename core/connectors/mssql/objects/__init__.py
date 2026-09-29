@@ -9,9 +9,9 @@ circular imports.
 
 Currently implemented:
   - table : Table discovery, DDL, creation, data export/upsert/delete
+  - view  : View discovery, DDL creation
 
 Future object modules (NOT yet created):
-  - view
   - trigger
   - function / procedure
   - sequence
@@ -19,5 +19,6 @@ Future object modules (NOT yet created):
   - security (roles, users, grants)
 """
 from core.connectors.mssql.objects import table
+from core.connectors.mssql.objects import view
 
-__all__ = ["table"]
+__all__ = ["table", "view"]

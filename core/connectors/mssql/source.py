@@ -44,6 +44,7 @@ from core.connectors.mssql._models import (
     _resolve_mssql_schemas,
 )
 from core.connectors.mssql.objects import table as _mssql_table
+from core.connectors.mssql.objects import view as _mssql_view
 
 
 class MSSQLSourceConnector(SourceConnector):
@@ -330,45 +331,8 @@ class MSSQLSourceConnector(SourceConnector):
         )
 
     def list_views(self) -> list[ViewDefinition]:
-        """Return user views in the configured schemas.
-
-        Reads INFORMATION_SCHEMA.VIEWS (excludes system schemas).  The
-        VIEW_DEFINITION column is NVARCHAR(MAX) and pyodbc can choke on it
-        when fetched together with other columns, so it is CAST explicitly.
-        """
-        schemas = _resolve_mssql_schemas(self._config)
-        results: list[ViewDefinition] = []
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    "SELECT TABLE_NAME, TABLE_SCHEMA, "
-                    "CAST(VIEW_DEFINITION AS NVARCHAR(MAX)) AS VIEW_DEFINITION "
-                    "FROM INFORMATION_SCHEMA.VIEWS "
-                    f"WHERE TABLE_SCHEMA IN ({placeholders}) "
-                    "ORDER BY TABLE_SCHEMA, TABLE_NAME",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    "SELECT TABLE_NAME, TABLE_SCHEMA, "
-                    "CAST(VIEW_DEFINITION AS NVARCHAR(MAX)) AS VIEW_DEFINITION "
-                    "FROM INFORMATION_SCHEMA.VIEWS "
-                    "WHERE TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') "
-                    "ORDER BY TABLE_SCHEMA, TABLE_NAME"
-                )
-            for row in cur.fetchall():
-                view_name, view_schema, view_def = row
-                validate_identifier(view_name, "view")
-                validate_identifier(view_schema, "schema")
-                results.append(
-                    ViewDefinition(
-                        name=view_name,
-                        schema_name=view_schema,
-                        definition=view_def,
-                    )
-                )
-        return results
+        """Return user views in the configured schemas. Delegates to ``view.discover_views``."""
+        return _mssql_view.discover_views(self._conn, self._config)
 
     def list_all_sequences(self) -> list:
         """Return user sequences in the configured schemas with SQL Server metadata."""
