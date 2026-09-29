@@ -38,6 +38,7 @@ from core.connectors.mssql._models import (
 )
 from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
+from core.connectors.mssql.objects import trigger as _mssql_trigger
 
 
 class MSSQLTargetConnector(TargetConnector):
@@ -387,95 +388,9 @@ class MSSQLTargetConnector(TargetConnector):
     def create_trigger(self, trigger: "TriggerDef") -> None:
         """Create or alter a trigger on the target database.
 
-        Uses ``CREATE OR ALTER TRIGGER`` (SQL Server 2016+ SP1) for idempotency.
-        The DDL from ``sys.sql_modules`` is rewritten so the trigger name is
-        schema-qualified (``[schema].[name]``) — the original text may use an
-        unqualified name that would resolve to the wrong schema on the target.
-
-        The enabled/disabled state is re-applied after creation so the target
-        matches the source regardless of whether ``CREATE OR ALTER`` preserved
-        a pre-existing state.
-
-        Supports cross-schema triggers via trigger.table_schema.
+        Delegates to ``core.connectors.mssql.objects.trigger.create_trigger``.
         """
-        validate_identifier(trigger.name, "trigger")
-        schema_name = trigger.schema_name or "dbo"
-        validate_identifier(schema_name, "schema")
-        trigger_qname = f"[{schema_name}].[{trigger.name}]"
-        table_schema = trigger.table_schema or schema_name
-        table_qname = _qualify(table_schema, trigger.table)
-
-        with self._conn.cursor() as cur:
-            # Ensure the target schema exists (dbo always exists in SQL Server).
-            if schema_name != "dbo":
-                cur.execute("SELECT name FROM sys.schemas WHERE name = ?", (schema_name,))
-                if cur.fetchone() is None:
-                    cur.execute(f"CREATE SCHEMA {quote_identifier(schema_name)}")
-                    audit_log(
-                        phase="create_schema", status="created",
-                        details={"schema": schema_name},
-                    )
-
-            # Ensure the target table exists — a trigger cannot be created on
-            # a missing parent table.
-            cur.execute(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ?",
-                (trigger.table, table_schema),
-            )
-            if cur.fetchone() is None:
-                audit_log(
-                    phase="create_trigger", status="skipped",
-                    details={"trigger": trigger.name, "reason": f"parent table {table_qname} not found"},
-                )
-                return
-
-            try:
-                ddl = trigger.ddl
-                # Rewrite CREATE TRIGGER <name> → CREATE OR ALTER TRIGGER [schema].[name]
-                # for idempotency AND to ensure the correct schema regardless of
-                # whether the source DDL used an unqualified name.
-                qualified_trigger = f"[{schema_name}].[{trigger.name}]"
-                new_ddl, n = re.subn(
-                    r"CREATE\s+TRIGGER\s+\S+",
-                    f"CREATE OR ALTER TRIGGER {qualified_trigger}",
-                    ddl,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-                if n == 0:
-                    if new_ddl.upper().startswith("CREATE "):
-                        new_ddl = "CREATE OR ALTER " + new_ddl[len("CREATE "):]
-                ddl = new_ddl
-                cur.execute(ddl)
-                self._conn.commit()
-                audit_log(
-                    phase="create_trigger", status="created",
-                    details={"trigger": trigger_qname, "table": table_qname,
-                             "disabled": trigger.is_disabled},
-                )
-
-                # Re-apply enabled/disabled state to match the source.
-                if trigger.is_disabled:
-                    cur.execute(
-                        f"ALTER TABLE {table_qname} DISABLE TRIGGER {quote_identifier(trigger.name)}"
-                    )
-                else:
-                    cur.execute(
-                        f"ALTER TABLE {table_qname} ENABLE TRIGGER {quote_identifier(trigger.name)}"
-                    )
-                self._conn.commit()
-                audit_log(
-                    phase="create_trigger", status="applied_state",
-                    details={"trigger": trigger_qname, "disabled": trigger.is_disabled},
-                )
-            except Exception as exc:
-                self._conn.rollback()
-                audit_log(
-                    phase="create_trigger", status="failed",
-                    details={"trigger": trigger.name, "schema": schema_name, "reason": str(exc)},
-                )
-                raise
+        _mssql_trigger.create_trigger(self._conn, trigger)
 
     def create_synonym(self, synonym: "SynonymDef") -> None:
         """Create a synonym on the target database."""

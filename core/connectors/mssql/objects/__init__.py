@@ -8,11 +8,11 @@ accept an explicit *conn* parameter, avoiding coupling to
 circular imports.
 
 Currently implemented:
-  - table : Table discovery, DDL, creation, data export/upsert/delete
-  - view  : View discovery, DDL creation
+  - table   : Table discovery, DDL, creation, data export/upsert/delete
+  - view    : View discovery, DDL creation
+  - trigger : Trigger discovery, DDL creation
 
 Future object modules (NOT yet created):
-  - trigger
   - function / procedure
   - sequence
   - partition
@@ -20,5 +20,6 @@ Future object modules (NOT yet created):
 """
 from core.connectors.mssql.objects import table
 from core.connectors.mssql.objects import view
+from core.connectors.mssql.objects import trigger
 
-__all__ = ["table", "view"]
+__all__ = ["table", "view", "trigger"]

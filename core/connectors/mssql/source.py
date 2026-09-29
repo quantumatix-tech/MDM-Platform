@@ -45,6 +45,7 @@ from core.connectors.mssql._models import (
 )
 from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
+from core.connectors.mssql.objects import trigger as _mssql_trigger
 
 
 class MSSQLSourceConnector(SourceConnector):
@@ -1005,54 +1006,6 @@ class MSSQLSourceConnector(SourceConnector):
     def get_all_triggers(self) -> list[TriggerDef]:
         """Return user DML triggers in the configured schemas.
 
-        SQL Server stores trigger definitions in ``sys.sql_modules`` and
-        metadata (parent table, enabled state) in ``sys.triggers``.  Only
-        DML triggers (``type = 'TR'``) are migrated — DDL triggers
-        (``type = 'TA'``) are server-scoped and skipped.
+        Delegates to ``core.connectors.mssql.objects.trigger.discover_triggers``.
         """
-        schemas = _resolve_mssql_schemas(self._config)
-        results: list[TriggerDef] = []
-        with self._conn.cursor() as cur:
-            if schemas:
-                placeholders = ", ".join("?" for _ in schemas)
-                cur.execute(
-                    "SELECT OBJECT_SCHEMA_NAME(t.object_id), "
-                    "t.name, OBJECT_SCHEMA_NAME(p.object_id), p.name, "
-                    "CAST(m.definition AS NVARCHAR(MAX)) AS definition, "
-                    "t.is_disabled "
-                    "FROM sys.triggers t "
-                    "JOIN sys.objects p ON t.parent_id = p.object_id "
-                    "JOIN sys.sql_modules m ON t.object_id = m.object_id "
-                    f"WHERE OBJECT_SCHEMA_NAME(t.object_id) IN ({placeholders}) "
-                    "AND t.type = 'TR' "
-                    "ORDER BY OBJECT_SCHEMA_NAME(t.object_id), p.name, t.name",
-                    list(schemas),
-                )
-            else:
-                cur.execute(
-                    "SELECT OBJECT_SCHEMA_NAME(t.object_id), "
-                    "t.name, OBJECT_SCHEMA_NAME(p.object_id), p.name, "
-                    "CAST(m.definition AS NVARCHAR(MAX)) AS definition, "
-                    "t.is_disabled "
-                    "FROM sys.triggers t "
-                    "JOIN sys.objects p ON t.parent_id = p.object_id "
-                    "JOIN sys.sql_modules m ON t.object_id = m.object_id "
-                    "WHERE OBJECT_SCHEMA_NAME(t.object_id) NOT IN "
-                    "('sys', 'INFORMATION_SCHEMA', 'guest') "
-                    "AND t.type = 'TR' "
-                    "ORDER BY OBJECT_SCHEMA_NAME(t.object_id), p.name, t.name",
-                )
-            for schema_name, trig_name, table_schema, table_name, definition, is_disabled in cur.fetchall():
-                validate_identifier(trig_name, "trigger")
-                validate_identifier(schema_name, "schema")
-                results.append(
-                    TriggerDef(
-                        name=trig_name,
-                        table=table_name,
-                        schema_name=schema_name,
-                        table_schema=table_schema or schema_name,
-                        ddl=definition,
-                        is_disabled=bool(is_disabled),
-                    )
-                )
-        return results
+        return _mssql_trigger.discover_triggers(self._conn, self._config)
