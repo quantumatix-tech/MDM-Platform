@@ -8,10 +8,14 @@ former monolithic ``core/connectors/mssql.py`` module:
     ...
 
 The implementation lives in sub-modules:
-  - ``_models``    constants, partition dataclasses, and DDL helpers
-  - ``source``     ``MSSQLSourceConnector``
-  - ``target``     ``MSSQLTargetConnector``
+  - ``_models``    constants, dataclasses, and shared schema/type/qualification
+                   and catalog-introspection helpers
+  - ``source``     ``MSSQLSourceConnector`` (connector-facing source API)
+  - ``target``     ``MSSQLTargetConnector`` (connector-facing target API)
   - ``cdc``        ``MSSQLCDCEngine``
+  - ``objects``    per-object implementations (table, view, trigger, function,
+                   sequence, synonym, type, comment, partition, security) that
+                   ``source`` and ``target`` delegate to
 
 ``_models`` is imported first (it has no intra-package dependencies), then the
 class-bearing sub-modules so that there are no circular imports.

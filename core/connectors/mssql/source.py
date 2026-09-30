@@ -1,13 +1,33 @@
-"""MSSQL Source Connector.
+"""MSSQL Source Connector — connector-facing source API / routing layer.
 
-Extracted from ``core/connectors/mssql.py`` — all discovery and export
-logic for the source database.
+Every object-specific discovery and export implementation lives under
+``core.connectors.mssql.objects``; this module owns the connector surface
+and forwards to it:
 
-Table-specific discovery and export logic is delegated to
-``core.connectors.mssql.objects.table``, partition-specific discovery to
-``core.connectors.mssql.objects.partition`` and security-specific discovery
-to ``core.connectors.mssql.objects.security`` so that ``source.py`` acts as
-the connector-facing router.
+  table     : table discovery, row counts, data export
+  view      : view discovery
+  trigger   : DML trigger discovery
+  function  : function/procedure discovery
+  sequence  : sequence discovery
+  synonym   : synonym discovery
+  type      : user-defined (alias) type discovery
+  comment   : extended property (comment) discovery
+  partition : partition function/scheme and partitioned-table discovery
+  security  : grant, user, role and role-membership discovery
+
+Two responsibilities intentionally remain here rather than in an object
+module:
+
+``connect()``
+    Shared connector infrastructure (ODBC connection string, driver
+    setup, retry, audit).
+
+``get_schema()``
+    Mixed composition point. It assembles the cross-engine ``Schema``
+    DTO from several metadata families in one pass — columns/identity/
+    computed, user-defined types, indexes, primary key, foreign keys,
+    CHECK constraints and DEFAULT constraints — so it belongs to no
+    single object type. See its docstring for details.
 """
 from __future__ import annotations
 
@@ -41,8 +61,6 @@ from core.connectors.mssql._models import (
     PartitionSchemeDef,
     PartitionedTableDef,
     _build_mssql_index_ddl,
-    _mssql_column_type,
-    _qualify,
 )
 from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
@@ -102,6 +120,23 @@ class MSSQLSourceConnector(SourceConnector):
         yield from _mssql_table.export_table_data(self._conn, object_name, schema_name)
 
     def get_schema(self, object_name: str) -> Schema:
+        """Build the cross-engine ``Schema`` DTO for a base table.
+
+        Intentionally retained in ``source.py`` rather than moved to an
+        object module. This is a *composition point*, not a single object
+        implementation: it combines several metadata families in one
+        pass — columns with identity/computed attributes, user-defined
+        type references, indexes, primary key, foreign keys, CHECK
+        constraints and DEFAULT constraints — into the single
+        cross-engine ``Schema`` contract that the target consumes.
+
+        It is the source-side counterpart of
+        ``MSSQLTargetConnector.apply_constraints()``, which applies the
+        very same four constraint families in the same order. Splitting
+        discovery into artificial index / FK / CHECK / DEFAULT modules
+        would fragment that contract and leave both the DTO assembly and
+        the orchestration behind as the largest remaining methods.
+        """
         validate_identifier(object_name, "table")
         columns: list[Column] = []
         primary_key: list[str] = []
@@ -378,7 +413,7 @@ class MSSQLSourceConnector(SourceConnector):
         return _mssql_type.discover_types(self._conn, self._config)
 
     # ------------------------------------------------------------------
-    # Step 14 — Security: Grants (Phase 16)
+    # Step 14 — Security: Grants
     # ------------------------------------------------------------------
 
     def list_grants(self) -> list[GrantDef]:

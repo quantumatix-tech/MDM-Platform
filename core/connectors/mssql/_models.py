@@ -1,7 +1,21 @@
 """MSSQL connector internal models, constants, and helper functions.
 
-This module is the internal home for partition dataclasses and DDL builder
-helpers that were previously inline in ``core/connectors/mssql.py``.
+Holds four kinds of shared, connector-independent building blocks used by
+``source.py``, ``target.py`` and ``objects/*``:
+
+  - constants          (system-schema and fixed-role sets, type sets)
+  - dataclasses        (partition function/scheme/table metadata)
+  - schema, type and qualification helpers
+                        (``_resolve_mssql_schemas``, ``_qualify``,
+                        ``_build_mssql_index_ddl``, ``_mssql_column_type``)
+  - catalog introspection helpers
+                        (``_non_computed_column_names``,
+                        ``_target_identity_columns``,
+                        ``_variant_column_names``)
+
+The introspection helpers are re-exported from the package ``__init__`` and
+resolved there at call time by ``objects/table.py``, which is what lets tests
+patch ``core.connectors.mssql._non_computed_column_names``. Keep them here.
 
 Public import path remains: ``from core.connectors.mssql import ...``
 """

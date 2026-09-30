@@ -50,7 +50,6 @@ class MSSQLCDCEngine(CDCEngine):
         audit_log(phase="cdc_start", status="success", details={"engine": "mssql"})
 
     def poll_changes(self) -> list[ChangeEvent]:
-        self._config["database"]
         schema_name = "dbo"
 
         with self._conn.cursor() as cur:

@@ -1,17 +1,38 @@
-"""MSSQL Target Connector.
+"""MSSQL Target Connector — connector-facing target API / routing layer.
 
-Extracted from ``core/connectors/mssql.py`` — all DDL creation, constraint
-application, and write logic for the target database.
+Every object-specific creation and application implementation lives under
+``core.connectors.mssql.objects``; this module owns the connector surface
+and forwards to it:
 
-Table-specific operations (creation, upsert, export, delete, row count)
-are delegated to ``core.connectors.mssql.objects.table``, partition-specific
-operations to ``core.connectors.mssql.objects.partition`` and
-security-specific operations to ``core.connectors.mssql.objects.security``
-so that ``target.py`` acts as the connector-facing router.
+  table     : table creation, upsert, export, delete, row counts
+  view      : view creation
+  trigger   : trigger creation
+  function  : function/procedure creation
+  sequence  : sequence creation
+  synonym   : synonym creation
+  type      : user-defined (alias) type creation
+  comment   : extended property (comment) application
+  partition : partition function/scheme and partitioned-table creation
+  security  : role, user, role-membership and GRANT application
+
+Three responsibilities intentionally remain here rather than in an object
+module:
+
+``connect()``
+    Shared connector infrastructure (ODBC connection string, driver
+    setup, retry, audit).
+
+``ensure_database_exists()``
+    Database bootstrap infrastructure, not an object operation. It must
+    run before any schema/table/object deployment.
+
+``apply_constraints()``
+    Deliberate combined constraint layer for indexes, foreign keys, CHECK
+    and DEFAULT constraints, applied in dependency order and sharing one
+    existence/idempotency/audit/rollback pattern. See its docstring.
 """
 from __future__ import annotations
 
-import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -74,6 +95,15 @@ class MSSQLTargetConnector(TargetConnector):
         audit_log(phase="connect", status="success", details={"engine": "mssql", "role": "target"})
 
     def ensure_database_exists(self) -> None:
+        """Create the target database if it does not exist.
+
+        Database bootstrap infrastructure, not an object-level operation:
+        it must complete before any schema, table or object deployment.
+
+        Intentionally does not call ``validate_identifier`` — SQL Server
+        database names may legitimately contain hyphens, and the name must
+        still reach ``CREATE DATABASE`` correctly.
+        """
         db_name = self._config["database"]
         with self._conn.cursor() as cur:
             cur.execute("SELECT name FROM sys.databases WHERE name = ?", (db_name,))
@@ -125,6 +155,24 @@ class MSSQLTargetConnector(TargetConnector):
         yield from _mssql_table.export_table_data(self._conn, object_name, schema_name)
 
     def apply_constraints(self, schema: "Schema") -> None:
+        """Apply indexes, foreign keys, CHECK and DEFAULT constraints.
+
+        Intentionally retained in ``target.py`` as a single combined
+        constraint layer. The four families are applied in dependency
+        order — indexes, then foreign keys, then CHECK, then DEFAULT —
+        because each stage can depend on the objects created by the
+        previous one.
+
+        All four families share the same shape: probe for an existing
+        object, skip with an audit entry when present, otherwise execute,
+        commit and audit, rolling back and auditing on failure. Splitting
+        them into separate modules would duplicate that scaffolding and
+        still require this method to orchestrate the ordering.
+
+        This is the target-side counterpart of
+        ``MSSQLSourceConnector.get_schema()``, which discovers the same
+        four families in the same order.
+        """
         validate_identifier(schema.name, "table")
         schema_name = schema.schema_name or "dbo"
         validate_identifier(schema_name, "schema")
