@@ -166,6 +166,6 @@ class MySQLSourceConnector(SourceConnector):
         return security_ops.list_grants(self._conn, self._config)
 
     def get_capabilities(self) -> dict[str, dict[str, Any]]:
-        direct = ("tables", "columns", "defaults", "primary_keys", "auto_increment", "indexes", "unique_constraints", "check_constraints", "foreign_keys", "generated_columns", "partitions", "views", "functions", "procedures", "triggers", "events", "comments", "grants", "security_principals")
-        unsupported = {"materialized_views": "MySQL has no native materialized views", "rls_policies": "MySQL has no row-level security policies", "extensions": "MySQL has no PostgreSQL extension model", "custom_types": "MySQL has no PostgreSQL domain/type model", "sequences": "AUTO_INCREMENT is table-bound", "schemas": "MySQL databases are namespaces, not PostgreSQL schemas"}
+        direct = ("tables", "columns", "defaults", "primary_keys", "auto_increment", "indexes", "unique_constraints", "check_constraints", "foreign_keys", "generated_columns", "partitions", "views", "functions", "procedures", "triggers", "events", "comments", "grants")
+        unsupported = {"materialized_views": "MySQL has no native materialized views", "rls_policies": "MySQL has no row-level security policies", "extensions": "MySQL has no PostgreSQL extension model", "custom_types": "MySQL has no PostgreSQL domain/type model", "sequences": "AUTO_INCREMENT is table-bound", "schemas": "MySQL databases are namespaces, not PostgreSQL schemas", "security_principals": "MySQL exposes accounts and grants, not a separate principal object model"}
         return {x: {"supported": True, "mode": "direct"} for x in direct} | {x: {"supported": False, "mode": "unsupported", "reason": r} for x, r in unsupported.items()}
