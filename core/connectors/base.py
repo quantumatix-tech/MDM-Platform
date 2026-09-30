@@ -4,6 +4,7 @@ import abc
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -48,6 +49,9 @@ class Column:
     size: int | None = None
     default: str | None = None          # column default expression (non-sequence)
     generated: str | None = None        # GENERATED ALWAYS AS (expr) STORED expression
+    generated_kind: str | None = None   # engine-specific storage mode, e.g. VIRTUAL/STORED
+    auto_increment: bool = False
+    comment: str | None = None
     is_identity: bool = False
     identity_seed: int | None = None
     identity_increment: int | None = None
@@ -63,6 +67,7 @@ class Index:
     columns: list[str]
     unique: bool = False
     ddl: str | None = None              # full DDL from pg_get_indexdef (handles partial/expression)
+    index_type: str | None = None       # e.g. BTREE, FULLTEXT, SPATIAL
     included_columns: list[str] = field(default_factory=list)  # INCLUDE (col1, col2)
     filter_definition: str | None = None  # WHERE clause for filtered indexes
 
@@ -105,6 +110,11 @@ class Schema:
     sequences: list[str] = field(default_factory=list)     # column names backed by sequences
     rls_enabled: bool = False
     partition_key: str | None = None    # e.g. "RANGE (created_at)" for partitioned tables
+    partition_method: str | None = None        # engine partition method, e.g. RANGE/LIST/HASH
+    partition_expression: str | None = None    # engine partition expression, e.g. YEAR(created_at)
+    partitions: list["TablePartition"] = field(default_factory=list)
+    comment: str | None = None
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +127,17 @@ class PartitionDef:
     name: str
     parent_table: str
     bound: str          # e.g. "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')"
+
+
+@dataclass
+class TablePartition:
+    """One ordered partition of a partitioned table (engine-neutral).
+
+    Used by engines that express partitions as an inline list on the parent
+    table rather than as child partition tables (``PartitionDef``).
+    """
+    name: str
+    description: str | None = None
 
 
 @dataclass
@@ -181,6 +202,7 @@ class FunctionDef:
     name: str
     ddl: str            # complete DDL from pg_get_functiondef — ready to execute
     schema_name: str = "public"
+    kind: str = "function"             # function or procedure
 
 
 @dataclass
@@ -193,6 +215,26 @@ class TriggerDef:
     schema_name: str = "public"
     table_schema: str | None = None  # schema of the parent table (for cross-schema triggers)
     is_disabled: bool = False  # True if the trigger is disabled on the source
+
+
+@dataclass
+class EventDef:
+    """A scheduled database event (native to MySQL/MariaDB)."""
+    name: str
+    ddl: str
+    schema_name: str = "public"
+    event_type: str | None = None
+    status: str | None = None
+    execute_at: datetime | None = None
+    interval_value: str | None = None
+    interval_field: str | None = None
+    starts: datetime | None = None
+    ends: datetime | None = None
+    on_completion: str | None = None
+    time_zone: str | None = None
+    definer: str | None = None
+    snapshot_at: datetime | None = None
+    safety_lead_seconds: int = 300
 
 
 @dataclass
@@ -224,6 +266,19 @@ class GrantDef:
     object_name: str    # schema-qualified when applicable
     grantee: str
     schema_name: str = "public"
+    grant_option: bool = False
+    grantee_host: str | None = None
+
+
+@dataclass
+class SecurityPrincipalDef:
+    """A database account or role; authentication secrets are never included."""
+    user: str
+    host: str
+    principal_type: str  # USER or ROLE
+    authentication_plugin: str | None = None
+    account_locked: bool | None = None
+    password_expired: bool | None = None
 
 
 @dataclass
@@ -246,13 +301,51 @@ class UserDef:
     """A database user principal."""
     name: str
     type: str = "S"     # 'S' = SQL user, 'U' = Windows user
+    host: str | None = None  # MySQL account host; None for engines without host-scoped users
 
 
-@dataclass
+@dataclass(init=False)
 class RoleMembershipDef:
-    """A mapping of a database principal to a database role."""
-    member_name: str
-    role_name: str
+    """A role edge between database principals."""
+    member_name: str | None = None
+    role_name: str | None = None
+    role_user: str | None = None
+    role_host: str | None = None
+    grantee_user: str | None = None
+    grantee_host: str | None = None
+    with_admin_option: bool = False
+
+    def __init__(
+        self,
+        *args: str,
+        member_name: str | None = None,
+        role_name: str | None = None,
+        role_user: str | None = None,
+        role_host: str | None = None,
+        grantee_user: str | None = None,
+        grantee_host: str | None = None,
+        with_admin_option: bool = False,
+    ) -> None:
+        if args:
+            if len(args) in (2, 3) and member_name is None and role_name is None:
+                member_name, role_name = args[:2]
+                if len(args) == 3:
+                    with_admin_option = bool(args[2])
+            elif len(args) in (4, 5) and all(
+                value is None for value in (member_name, role_name, role_user, role_host, grantee_user, grantee_host)
+            ):
+                role_user, role_host, grantee_user, grantee_host = args[:4]
+                if len(args) == 5:
+                    with_admin_option = bool(args[4])
+            else:
+                raise TypeError("RoleMembershipDef accepts either (member_name, role_name) or (role_user, role_host, grantee_user, grantee_host)")
+        self.member_name = member_name
+        self.role_name = role_name
+        self.role_user = role_user
+        self.role_host = role_host
+        self.grantee_user = grantee_user
+        self.grantee_host = grantee_host
+        self.with_admin_option = with_admin_option
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +433,10 @@ class SourceConnector(abc.ABC):
     @abc.abstractmethod
     def connect(self) -> None: ...
 
+    def close(self) -> None:
+        """Release connector resources when a migration run finishes."""
+        return None
+
     @abc.abstractmethod
     def list_objects(self) -> list[str]: ...
 
@@ -375,6 +472,17 @@ class SourceConnector(abc.ABC):
     def get_all_triggers(self) -> list[TriggerDef]:
         return []
 
+    def list_events(self) -> list[EventDef]:
+        return []
+
+    def get_capabilities(self) -> dict[str, dict[str, Any]]:
+        """Describe engine object support for planning and reporting.
+
+        Values intentionally remain connector-owned: the orchestrator consumes
+        these outcomes without encoding source/target engine pairs.
+        """
+        return {}
+
     def get_rls_policies(self, table: str, schema_name: str | None = None) -> list[RLSPolicy]:
         return []
 
@@ -403,11 +511,15 @@ class TargetConnector(abc.ABC):
     @abc.abstractmethod
     def connect(self) -> None: ...
 
+    def close(self) -> None:
+        """Release connector resources when a migration run finishes."""
+        return None
+
     @abc.abstractmethod
     def ensure_database_exists(self) -> None: ...
 
     @abc.abstractmethod
-    def create_object_if_missing(self, schema: Schema) -> None: ...
+    def create_object_if_missing(self, schema: Schema) -> str | None: ...
 
     @abc.abstractmethod
     def upsert_batch(self, object_name: str, rows: Iterator[dict[str, Any]], schema: Schema | None = None) -> UpsertResult: ...
@@ -435,6 +547,13 @@ class TargetConnector(abc.ABC):
     def apply_constraints(self, schema: Schema) -> None:
         pass
 
+    def get_capabilities(self) -> dict[str, dict[str, Any]]:
+        return {}
+
+    def inspect_schema(self, object_name: str, schema_name: str | None = None) -> Schema | None:
+        """Read target metadata needed by post-migration verification."""
+        return None
+
     def create_view(self, view: ViewDefinition) -> None:
         pass
 
@@ -449,6 +568,31 @@ class TargetConnector(abc.ABC):
 
     def create_trigger(self, trigger: TriggerDef) -> None:
         pass
+
+    def create_event(self, event: EventDef) -> None:
+        pass
+
+    def suspend_triggers_for_data_load(self, triggers: list[TriggerDef]) -> list[TriggerDef]:
+        """Temporarily remove target triggers that would observe migration DML."""
+        return []
+
+    def clear_objects_for_full_sync(self, objects: list[str]) -> list[str]:
+        """Remove target rows for a full replacement sync before loading data.
+
+        Connectors which do not define full replacement semantics retain the
+        historical upsert-only behaviour.  Relational targets can override
+        this to make a successful full run exactly match the source.
+        """
+        return []
+
+    def sync_auto_increment(self, table: str, column: str) -> None:
+        pass
+
+    def reconcile_mysql_table(self, schema: Schema, managed_tables: set[str]) -> str:
+        raise NotImplementedError("Target does not support MySQL schema reconciliation")
+
+    def finalize_schema_reconciliations(self) -> list[str]:
+        return []
 
     def apply_rls_policy(self, policy: RLSPolicy) -> None:
         pass
@@ -468,15 +612,15 @@ class TargetConnector(abc.ABC):
     def create_synonym(self, synonym: SynonymDef) -> None:
         pass
 
+    def create_user_if_not_exists(self, user_name: str, host: str | None = None) -> None:
+        pass
 
     def create_role_if_not_exists(self, role_name: str) -> None:
         pass
 
-    def create_user_if_not_exists(self, user_name: str) -> None:
-        pass
-
     def create_role_membership(self, member_name: str, role_name: str) -> None:
         pass
+
 
 
 class CDCEngine(abc.ABC):
