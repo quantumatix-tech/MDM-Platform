@@ -271,17 +271,6 @@ class GrantDef:
 
 
 @dataclass
-class SecurityPrincipalDef:
-    """A database account or role; authentication secrets are never included."""
-    user: str
-    host: str
-    principal_type: str  # USER or ROLE
-    authentication_plugin: str | None = None
-    account_locked: bool | None = None
-    password_expired: bool | None = None
-
-
-@dataclass
 class SynonymDef:
     """A database synonym (alias for another object)."""
     name: str
