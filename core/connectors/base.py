@@ -293,48 +293,12 @@ class UserDef:
     host: str | None = None  # MySQL account host; None for engines without host-scoped users
 
 
-@dataclass(init=False)
+@dataclass
 class RoleMembershipDef:
-    """A role edge between database principals."""
-    member_name: str | None = None
-    role_name: str | None = None
-    role_user: str | None = None
-    role_host: str | None = None
-    grantee_user: str | None = None
-    grantee_host: str | None = None
+    """A mapping of a database principal to a database role."""
+    member_name: str
+    role_name: str
     with_admin_option: bool = False
-
-    def __init__(
-        self,
-        *args: str,
-        member_name: str | None = None,
-        role_name: str | None = None,
-        role_user: str | None = None,
-        role_host: str | None = None,
-        grantee_user: str | None = None,
-        grantee_host: str | None = None,
-        with_admin_option: bool = False,
-    ) -> None:
-        if args:
-            if len(args) in (2, 3) and member_name is None and role_name is None:
-                member_name, role_name = args[:2]
-                if len(args) == 3:
-                    with_admin_option = bool(args[2])
-            elif len(args) in (4, 5) and all(
-                value is None for value in (member_name, role_name, role_user, role_host, grantee_user, grantee_host)
-            ):
-                role_user, role_host, grantee_user, grantee_host = args[:4]
-                if len(args) == 5:
-                    with_admin_option = bool(args[4])
-            else:
-                raise TypeError("RoleMembershipDef accepts either (member_name, role_name) or (role_user, role_host, grantee_user, grantee_host)")
-        self.member_name = member_name
-        self.role_name = role_name
-        self.role_user = role_user
-        self.role_host = role_host
-        self.grantee_user = grantee_user
-        self.grantee_host = grantee_host
-        self.with_admin_option = with_admin_option
 
 
 # ---------------------------------------------------------------------------
