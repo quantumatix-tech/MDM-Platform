@@ -117,6 +117,13 @@ class Schema:
     schema_name: str = "public"
     columns: list[Column] = field(default_factory=list)
     primary_key: list[str] = field(default_factory=list)
+    # Name of the source PRIMARY KEY constraint, when the source declared one
+    # explicitly (``CONSTRAINT pk_x PRIMARY KEY (...)``). None means the source
+    # used an unnamed/auto-named constraint, in which case the target keeps
+    # emitting a bare ``PRIMARY KEY (...)`` and lets the engine generate its own
+    # name — exactly the previous behaviour. Carried on Schema rather than as a
+    # separate PK object so the existing column list and DTO shape are reused.
+    primary_key_name: str | None = None
     type_map_hints: dict[str, str] = field(default_factory=dict)
     indexes: list[Index] = field(default_factory=list)
     foreign_keys: list[ForeignKey] = field(default_factory=list)

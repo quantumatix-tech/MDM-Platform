@@ -23,6 +23,7 @@ from core.audit_logger import audit_log
 from core.connectors.base import (
     Schema,
     UpsertResult,
+    quote_identifier,
     validate_identifier,
 )
 from core.connectors.postgresql._models import _qualify
@@ -180,7 +181,20 @@ def create_table(conn: Any, schema: Schema) -> None:
 
             if schema.primary_key:
                 pk_cols = ", ".join(schema.primary_key)
-                col_defs.append(f"PRIMARY KEY ({pk_cols})")
+                # Reproduce an explicitly named source PK constraint. The name is
+                # quoted via the shared helper so uppercase, hyphenated or
+                # otherwise awkward identifiers survive; the columns keep their
+                # existing unquoted form. When the source had no explicit name,
+                # the bare clause is emitted exactly as before and PostgreSQL
+                # generates its own name.
+                if schema.primary_key_name:
+                    pk_clause = (
+                        f"CONSTRAINT {quote_identifier(schema.primary_key_name)} "
+                        f"PRIMARY KEY ({pk_cols})"
+                    )
+                else:
+                    pk_clause = f"PRIMARY KEY ({pk_cols})"
+                col_defs.append(pk_clause)
 
             table_qname = _qualify(table_schema, schema.name)
             ddl = f"CREATE TABLE {table_qname} ({', '.join(col_defs)})"

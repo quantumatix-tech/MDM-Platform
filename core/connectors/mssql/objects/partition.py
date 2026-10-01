@@ -365,7 +365,16 @@ def create_partitioned_table(
 
         if schema.primary_key:
             pk_cols = ", ".join(schema.primary_key)
-            col_defs.append(f"PRIMARY KEY ({pk_cols})")
+            # Mirror the non-partitioned path: an explicitly named source PK keeps its
+            # name; an unnamed/auto-named one still emits a bare PRIMARY KEY so SQL
+            # Server generates its own name, exactly as before.
+            if schema.primary_key_name:
+                col_defs.append(
+                    f"CONSTRAINT {quote_identifier(schema.primary_key_name)} "
+                    f"PRIMARY KEY ({pk_cols})"
+                )
+            else:
+                col_defs.append(f"PRIMARY KEY ({pk_cols})")
 
         ddl = (
             f"CREATE TABLE {qualified} ({', '.join(col_defs)}) "

@@ -119,6 +119,7 @@ class PostgresSourceConnector(SourceConnector):
         validate_identifier(object_name, "table")
         columns: list[Column] = []
         primary_key: list[str] = []
+        primary_key_name: str | None = None
         indexes: list[Index] = []
         foreign_keys: list[ForeignKey] = []
         check_constraints: list[CheckConstraint] = []
@@ -185,18 +186,31 @@ class PostgresSourceConnector(SourceConnector):
                 ))
 
             # --- Primary Key ---
+            # The constraint name is selected alongside the columns so an
+            # explicitly named source PK can be reproduced on the target.
+            # pg_constraint is joined on conrelid (not on relname alone) so a
+            # same-named table in another schema cannot contribute a constraint.
+            # Column ordering still comes from kcu.ordinal_position, unchanged.
             cur.execute(
-                "SELECT kcu.column_name "
+                "SELECT kcu.column_name, pgc.conname "
                 "FROM information_schema.table_constraints tc "
                 "JOIN information_schema.key_column_usage kcu "
                 "  ON tc.constraint_name = kcu.constraint_name "
                 "  AND tc.table_schema = kcu.table_schema "
+                "LEFT JOIN pg_catalog.pg_constraint pgc "
+                "  ON pgc.conname = tc.constraint_name "
+                " AND pgc.contype = 'p' "
+                " AND pgc.conrelid = to_regclass(quote_ident(tc.table_schema) || '.' || quote_ident(tc.table_name)) "
                 "WHERE tc.table_name = %s AND tc.table_schema = %s "
                 "  AND tc.constraint_type = 'PRIMARY KEY' "
                 "ORDER BY kcu.ordinal_position",
                 (object_name, table_schema),
             )
-            primary_key = [row[0] for row in cur.fetchall()]
+            pk_rows = cur.fetchall()
+            primary_key = [row[0] for row in pk_rows]
+            # All rows of one PK share a single constraint name; take it from
+            # the first row so composite keys resolve to the same constraint.
+            primary_key_name = pk_rows[0][1] if pk_rows else None
 
             # --- Indexes (full DDL via pg_get_indexdef — handles partial & expression) ---
             cur.execute(
@@ -321,6 +335,7 @@ class PostgresSourceConnector(SourceConnector):
             schema_name=table_schema,
             columns=columns,
             primary_key=primary_key,
+            primary_key_name=primary_key_name,
             indexes=indexes,
             foreign_keys=foreign_keys,
             check_constraints=check_constraints,

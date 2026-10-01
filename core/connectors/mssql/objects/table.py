@@ -286,7 +286,19 @@ def create_table(conn: Any, schema: Schema, config: dict[str, Any]) -> None:
 
         if schema.primary_key:
             pk_cols = ", ".join(schema.primary_key)
-            col_defs.append(f"PRIMARY KEY ({pk_cols})")
+            # Reproduce an explicitly named source PK constraint. The name goes
+            # through the shared identifier quoting helper so uppercase,
+            # hyphenated or otherwise awkward identifiers survive. Without a
+            # source name the bare clause is emitted exactly as before and
+            # SQL Server generates its own name.
+            if schema.primary_key_name:
+                pk_clause = (
+                    f"CONSTRAINT {quote_identifier(schema.primary_key_name)} "
+                    f"PRIMARY KEY ({pk_cols})"
+                )
+            else:
+                pk_clause = f"PRIMARY KEY ({pk_cols})"
+            col_defs.append(pk_clause)
 
         ddl = f"CREATE TABLE {qualified} ({', '.join(col_defs)})"
         cur.execute(ddl)

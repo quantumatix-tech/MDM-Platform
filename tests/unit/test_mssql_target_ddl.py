@@ -1010,7 +1010,7 @@ def test_get_schema_resolves_udt_column_type():
         [("code", "sales", "order_code_t")],
         [("id", "int", "NO", None, 10, 0), ("code", "int", "NO", None, 10, 0), ("label", "nvarchar", "YES", 50, None, None)],
         [],
-        [("id",)],
+        [("id", "PK_sales_orders")],
         [],  # foreign keys (empty)
         [],  # check constraints (empty)
         [],  # default constraints (empty)
@@ -1575,7 +1575,7 @@ def test_get_schema_specialized_types():
         # indexes (empty)
         [],
         # primary key
-        [("id",)],
+        [("id", "PK_sales_orders")],
         [],  # foreign keys (empty)
         [],  # check constraints (empty)
         [],  # default constraints (empty)

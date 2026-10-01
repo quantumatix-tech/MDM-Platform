@@ -140,6 +140,7 @@ class MSSQLSourceConnector(SourceConnector):
         validate_identifier(object_name, "table")
         columns: list[Column] = []
         primary_key: list[str] = []
+        primary_key_name: str | None = None
         schema_name = "dbo"
 
         with self._conn.cursor() as cur:
@@ -285,15 +286,29 @@ class MSSQLSourceConnector(SourceConnector):
                 )
 
             cur.execute(
-                "SELECT kcu.COLUMN_NAME "
+                # The constraint name is selected alongside the columns so an
+                # explicitly named source PK can be reproduced on the target.
+                # Column ordering still comes from the PK ordinal position.
+                "SELECT kcu.COLUMN_NAME, tc.CONSTRAINT_NAME "
                 "FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc "
                 "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu "
                 "ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME "
+                "AND tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA "
+                # Constraint names are unique per database, not per table, so the
+                # table must be part of the join. Without it a same-named PK on a
+                # sibling table in the same schema contributes extra columns and a
+                # wrong column list on the target.
+                "AND tc.TABLE_NAME = kcu.TABLE_NAME "
                 "WHERE tc.TABLE_NAME = ? AND tc.TABLE_SCHEMA = ? "
-                "AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'",
+                "AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY' "
+                "ORDER BY kcu.ORDINAL_POSITION",
                 (object_name, schema_name),
             )
-            primary_key = [row[0] for row in cur.fetchall()]
+            pk_rows = cur.fetchall()
+            primary_key = [row[0] for row in pk_rows]
+            # All rows of one PK share a single constraint name; take it from
+            # the first row so composite keys resolve to the same constraint.
+            primary_key_name = pk_rows[0][1] if pk_rows else None
 
             # --- Foreign Keys (cross-schema aware) ---
             cur.execute(
@@ -368,6 +383,7 @@ class MSSQLSourceConnector(SourceConnector):
             schema_name=schema_name,
             columns=columns,
             primary_key=primary_key,
+            primary_key_name=primary_key_name,
             indexes=indexes,
             foreign_keys=foreign_keys,
             check_constraints=check_constraints,
