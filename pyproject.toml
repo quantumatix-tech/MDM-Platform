@@ -23,10 +23,12 @@ dependencies = [
     "hvac>=1.2",
     "cryptography>=41.0",
     "keyring>=24.0",
+    "rich>=13.0",
+    "azure-storage-blob>=12.0",
 ]
 
 [project.optional-dependencies]
-dev = ["ruff", "pytest", "pytest-mock"]
+dev = ["ruff>=0.6", "pytest>=8.0", "pytest-mock>=3.14"]
 aws = ["boto3>=1.28"]
 gcp = ["google-cloud-secret-manager>=2.16"]
 vault = ["hvac>=1.2"]

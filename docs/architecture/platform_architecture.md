@@ -247,7 +247,7 @@ Migration_platform/
 ├── bootstrap.py                 # dev environment setup
 ├── logs/                        # runtime audit output (gitignored)
 ├── reports/                     # runtime HTML/JSON reports (gitignored)
-└── pyproject.toml / requirements.txt
+└── pyproject.toml                  # single source of truth for version + dependencies
 ```
 
 ### 4.1 Package dependency rules
@@ -292,6 +292,30 @@ Rules:
 
 The changelog itself is the record of changes. This section documents only the mechanism
 and deliberately does not restate release contents.
+
+#### 4.2.1 Where the version is consumed
+
+| Consumer | Mechanism |
+|---|---|
+| CLI | `python -m migration_platform --version` prints `migration-platform <version>`. |
+| Migration report (JSON) | `platform_version` key, written by `ReportBuilder.build_json()`. |
+| Migration report (HTML) | Rendered in the footer alongside `Report v2.0`. |
+| Runtime prerequisite check | `core/preflight.py` re-validates the Python floor at startup. |
+
+`report_version` (`"2.0"`) is the **report format** version and is independent of the
+application version. The two must not be conflated.
+
+The reporting layer reads installed metadata directly rather than importing
+`migration_platform`, because §4.1 forbids `core/*` from depending on the package layer.
+
+#### 4.2.2 Related documents
+
+| Topic | Document |
+|---|---|
+| Release procedure and checklist | `docs/release_process.md` |
+| Version compatibility, tool and driver inventory | `docs/compatibility_matrix.md` |
+
+Where any document disagrees about a version claim, `docs/compatibility_matrix.md` wins.
 
 ---
 

@@ -29,9 +29,12 @@ from core.connectors import (
     PostgresTargetConnector,
 )
 from core.orchestrator import MigrationOrchestrator
+from core.preflight import assert_python_version
 from core.progress_display import create_progress_display
 from core.reporting.report_builder import ReportBuilder
 from core.status_server import StatusServer
+
+from . import __version__
 
 SOURCE_CONNECTORS = {
     "postgresql": PostgresSourceConnector,
@@ -78,6 +81,12 @@ def main():
         description="Migration Platform — enterprise-grade data migration tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"migration-platform {__version__}",
+        help="Show the Migration Platform version and exit",
+    )
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument(
         "--mode",
@@ -94,6 +103,10 @@ def main():
         help="Disable rich terminal UI (raw JSON output)",
     )
     args = parser.parse_args()
+
+    # requires-python is only enforced by pip at install time; re-check at
+    # startup so an interpreter downgraded after install fails fast.
+    assert_python_version()
 
     with open(args.config, encoding="utf-8") as f:
         config = yaml.safe_load(f)

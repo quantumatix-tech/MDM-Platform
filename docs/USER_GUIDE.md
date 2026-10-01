@@ -77,14 +77,52 @@ Connector   (Slack/Teams/Email/Webhook)
 
 ## 3. Installation & Setup
 
-### Step 1 — Install All Dependencies
+### Step 1 — Install the Project (Recommended)
+
+`pyproject.toml` is the single source of truth for Python dependencies. There is
+no separate requirements file — installing the project installs everything it
+declares.
 
 ```powershell
-# Run from: r:\unifide_migration_platform\migration-platform
+# Run from the repository root
 python bootstrap.py
 ```
 
-This installs everything in [`requirements.txt`](file:///r:/unifide_migration_platform/migration-platform/requirements.txt):
+`bootstrap.py` runs `pip install .` against `pyproject.toml`, then verifies the
+drivers your config needs.
+
+For a plain virtualenv with no bootstrap, install the project directly:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install .
+python -m migration_platform --version
+```
+
+For day-to-day development, install editable so local edits take effect
+immediately:
+
+```powershell
+python -m pip install -e ".[dev]"
+python -m migration_platform --version
+```
+
+Optional extras add provider-specific tooling on top of the base install:
+
+| Extra | Command | Contents |
+|---|---|---|
+| Development | `pip install -e ".[dev]"` | `ruff`, `pytest`, `pytest-mock` |
+| AWS | `pip install ".[aws]"` | `boto3` |
+| GCP | `pip install ".[gcp]"` | `google-cloud-secret-manager` |
+| Vault | `pip install ".[vault]"` | `hvac` |
+
+`boto3`, `google-cloud-secret-manager`, and `hvac` are also base dependencies, so
+the extras are for explicit opt-in and CI matrices rather than for unlocking
+additional packages.
+
+This installs everything declared in `pyproject.toml`:
 
 | Package | Used For |
 |---|---|
@@ -100,6 +138,8 @@ This installs everything in [`requirements.txt`](file:///r:/unifide_migration_pl
 | `hvac` | HashiCorp Vault |
 | `cryptography` + `keyring` | Local encrypted secrets file |
 | `requests` | Webhook / Slack / Teams alerts |
+| `rich` | Live terminal progress UI |
+| `azure-storage-blob` | Report upload to blob storage |
 
 ### Step 2 — Verify Drivers for Your Specific Config
 
