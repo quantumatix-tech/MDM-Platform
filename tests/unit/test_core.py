@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from core.connectors.base import (
     SourceConnector,
@@ -12,6 +12,7 @@ from core.connectors.base import (
     Index,
     ForeignKey,
     CheckConstraint,
+    UniqueConstraint,
     ViewDefinition,
     MaterializedViewDef,
     FunctionDef,
@@ -2473,10 +2474,11 @@ class TestPostgresCrossSchemaMetadataIsolation:
         }
         return PostgresSourceConnector(cfg)
 
-    def _mock_cursor_for_schema(self, pk_rows, idx_rows=None, fk_rows=None, check_rows=None):
+    def _mock_cursor_for_schema(self, pk_rows, idx_rows=None, fk_rows=None, check_rows=None, uq_rows=None):
         idx_rows = idx_rows if idx_rows is not None else []
         fk_rows = fk_rows if fk_rows is not None else []
         check_rows = check_rows if check_rows is not None else []
+        uq_rows = uq_rows if uq_rows is not None else []
         cur = MagicMock()
         cur.fetchone.side_effect = [
             ("cloud_test",),  # schema resolution
@@ -2484,11 +2486,12 @@ class TestPostgresCrossSchemaMetadataIsolation:
             None,             # partition key
         ]
         cur.fetchall.side_effect = [
-            [("customer_id", "integer", "NO", None, None, None)],  # columns
+            [("customer_id", "integer", "NO", None, None, None, False, None, None, None)],  # columns
             pk_rows,                                                 # PK
             idx_rows,                                                # indexes
             fk_rows,                                                 # FKs
             check_rows,                                              # check constraints
+            uq_rows,                                                 # unique constraints
         ]
         cur.__enter__.return_value = cur
         cur.__exit__.return_value = False
@@ -2521,7 +2524,8 @@ class TestPostgresCrossSchemaMetadataIsolation:
             pk_rows=[],
             idx_rows=[
                 ("idx_customer_id", True, ["customer_id"],
-                 "CREATE UNIQUE INDEX idx_customer_id ON cloud_test.customers (customer_id)"),
+                 "CREATE UNIQUE INDEX idx_customer_id ON cloud_test.customers (customer_id)",
+                 False),
             ],
         )
         connector._conn = conn
@@ -2538,6 +2542,7 @@ class TestPostgresCrossSchemaMetadataIsolation:
         )
         assert len(schema.indexes) == 1
         assert schema.indexes[0].name == "idx_customer_id"
+        assert schema.indexes[0].constraint_backed is False
 
     def test_get_schema_fk_query_scoped_by_schema(self):
         connector = self._source_conn()
@@ -2723,6 +2728,208 @@ class TestOrchestratorGrantFailureTracking:
 
         # Grant failure should be reflected in status
         assert result["status"] == "partial_success"
-# Grant failure should be recorded in the grants phase results
+        # Grant failure should be recorded in the grants phase results
         grants_phase = result["phases"].get("grants", [])
         assert any("failed" in str(g) and "role does not exist" in str(g) for g in grants_phase)
+
+
+class TestPostgresUniqueConstraintVsUniqueIndex:
+    """A UNIQUE constraint must migrate as a real constraint; a hand-made
+    UNIQUE INDEX must migrate as an independent index. The two are told apart by
+    the source using pg_constraint.conindid, never by name."""
+
+    def _target(self, failing=()):
+        """Build a target whose cursor is a plain fake.
+
+        ``failing`` maps a substring of the SQL to the exception it should raise,
+        letting a test fail one specific object and assert the others still run.
+        A real fake cursor is used (not MagicMock) so the recorded SQL is exact
+        and a raising statement does not recurse through the mock.
+        """
+        from core.connectors.postgresql import PostgresTargetConnector
+
+        executed: list[str] = []
+
+        class FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, *a, **kw):
+                executed.append(str(sql))
+                for fragment, err in failing:
+                    if fragment in str(sql):
+                        raise err
+
+        class FakeConn:
+            def __init__(self):
+                self.rollbacks = 0
+                self.commits = 0
+
+            def cursor(self):
+                return FakeCursor()
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def commit(self):
+                self.commits += 1
+
+        target = PostgresTargetConnector({"database": "t", "source_engine": "postgresql"})
+        target._conn = FakeConn()
+        return target, target._conn, executed
+
+    @staticmethod
+    def _sql(executed):
+        return executed
+
+    def test_unique_constraint_is_created_as_alter_table_add_constraint(self):
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+        )
+
+        target.apply_constraints(schema)
+
+        assert (
+            'ALTER TABLE "training"."customers" ADD CONSTRAINT uq_customers_email UNIQUE (email)'
+            in executed
+        )
+
+    def test_constraint_backed_index_is_not_recreated_standalone(self):
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            indexes=[Index(
+                name="uq_customers_email", columns=["email"], unique=True,
+                ddl="CREATE UNIQUE INDEX uq_customers_email ON training.customers (email)",
+                constraint_backed=True,
+            )],
+        )
+
+        target.apply_constraints(schema)
+
+        assert any("ADD CONSTRAINT uq_customers_email UNIQUE (email)" in s for s in executed)
+        assert not any("CREATE UNIQUE INDEX" in s for s in executed), (
+            "the constraint-backed index must not be recreated as a standalone index"
+        )
+
+    def test_manually_created_unique_index_is_still_migrated_as_index(self):
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            indexes=[Index(
+                name="uq_customers_name_manual", columns=["customer_name"], unique=True,
+                ddl="CREATE UNIQUE INDEX uq_customers_name_manual ON training.customers (customer_name)",
+                constraint_backed=False,
+            )],
+        )
+
+        target.apply_constraints(schema)
+
+        assert any("uq_customers_name_manual" in s and "CREATE UNIQUE INDEX" in s for s in executed)
+
+    def test_constraint_and_index_sharing_a_name_both_survive(self):
+        """A constraint-backed index and a similarly-named manual index must not
+        be conflated: the manual one is still created."""
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            indexes=[
+                Index(name="uq_customers_email", columns=["email"], unique=True,
+                      ddl="CREATE UNIQUE INDEX uq_customers_email ON training.customers (email)",
+                      constraint_backed=True),
+                Index(name="uq_customers_email_manual", columns=["city"], unique=True,
+                      ddl="CREATE UNIQUE INDEX uq_customers_email_manual ON training.customers (city)",
+                      constraint_backed=False),
+            ],
+        )
+
+        target.apply_constraints(schema)
+
+        assert any("ADD CONSTRAINT uq_customers_email UNIQUE (email)" in s for s in executed)
+        assert any("uq_customers_email_manual" in s and "CREATE UNIQUE INDEX" in s
+                   for s in executed)
+
+    def test_unique_constraint_applied_before_indexes(self):
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            indexes=[Index(name="idx_city", columns=["city"],
+                           ddl="CREATE INDEX idx_city ON training.customers (city)")],
+        )
+
+        target.apply_constraints(schema)
+
+        add = next(i for i, s in enumerate(executed) if "ADD CONSTRAINT uq_customers_email" in s)
+        idx = next(i for i, s in enumerate(executed) if "CREATE INDEX IF NOT EXISTS idx_city" in s)
+        assert add < idx, "UNIQUE constraint must be applied before normal indexes"
+
+    def test_failure_in_one_constraint_does_not_poison_following_objects(self):
+        """A real error must roll back so the next CHECK/index/FK still runs."""
+        target, conn, executed = self._target(failing=[
+            ("ADD CONSTRAINT uq_broken UNIQUE", RuntimeError('relation "uq_broken" already exists')),
+            ("ADD CONSTRAINT ck_name CHECK", RuntimeError("permission denied for schema training")),
+        ])
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[
+                UniqueConstraint(name="uq_broken", columns=["email"]),
+                UniqueConstraint(name="uq_ok", columns=["city"]),
+            ],
+            check_constraints=[CheckConstraint(name="ck_name", expression="length(city) > 2")],
+            indexes=[Index(name="idx_city", columns=["city"],
+                           ddl="CREATE INDEX idx_city ON training.customers (city)")],
+        )
+
+        target.apply_constraints(schema)
+
+        # both unique constraints attempted, despite the first one failing
+        assert any("ADD CONSTRAINT uq_broken UNIQUE" in s for s in executed)
+        assert any("ADD CONSTRAINT uq_ok UNIQUE" in s for s in executed)
+        # the failing CHECK and the index after it were still attempted
+        assert any("ADD CONSTRAINT ck_name CHECK" in s for s in executed)
+        assert any("CREATE INDEX IF NOT EXISTS idx_city" in s for s in executed)
+        # each failure rolled back individually rather than aborting the run
+        assert conn.rollbacks >= 2
+
+    def test_real_error_is_audited_as_failed_not_already_exists(self):
+        target, conn, executed = self._target(failing=[
+            ("ADD CONSTRAINT uq_customers_email UNIQUE",
+             RuntimeError("must be owner of relation customers")),
+        ])
+
+        with patch("core.connectors.postgresql.target.audit_log") as logged:
+            target.apply_constraints(Schema(
+                name="customers", schema_name="training",
+                unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            ))
+
+        unique_calls = [c for c in logged.call_args_list if c.kwargs.get("phase") == "create_unique"]
+        assert len(unique_calls) == 1
+        call = unique_calls[0]
+        assert call.kwargs["status"] == "failed"
+        assert "must be owner" in call.kwargs["details"]["reason"]
+
+    def test_duplicate_object_is_audited_as_skipped(self):
+        target, conn, executed = self._target(failing=[
+            ("ADD CONSTRAINT uq_customers_email UNIQUE",
+             RuntimeError('constraint "uq_customers_email" for relation "customers" already exists')),
+        ])
+
+        with patch("core.connectors.postgresql.target.audit_log") as logged:
+            target.apply_constraints(Schema(
+                name="customers", schema_name="training",
+                unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            ))
+
+        call = next(c for c in logged.call_args_list if c.kwargs.get("phase") == "create_unique")
+        assert call.kwargs["status"] == "skipped"
+        assert "already exists" in call.kwargs["details"]["reason"]

@@ -55,6 +55,7 @@ class Column:
     is_identity: bool = False
     identity_seed: int | None = None
     identity_increment: int | None = None
+    identity_kind: str | None = None   # "ALWAYS" / "BY DEFAULT"; None = engine default (ALWAYS)
     is_computed: bool = False
     computed_definition: str | None = None
     precision: int | None = None
@@ -70,6 +71,12 @@ class Index:
     index_type: str | None = None       # e.g. BTREE, FULLTEXT, SPATIAL
     included_columns: list[str] = field(default_factory=list)  # INCLUDE (col1, col2)
     filter_definition: str | None = None  # WHERE clause for filtered indexes
+    # True when this index is the backing index PostgreSQL created for a
+    # PRIMARY KEY / UNIQUE / EXCLUDE constraint (pg_constraint.conindid = oid).
+    # Such an index is recreated automatically by the constraint, so the target
+    # must not create it a second time as a standalone index. Manually-created
+    # unique indexes have no backing constraint and remain independent indexes.
+    constraint_backed: bool = False
 
 
 @dataclass
@@ -90,6 +97,14 @@ class CheckConstraint:
 
 
 @dataclass
+class UniqueConstraint:
+    name: str
+    columns: list[str]
+    deferrable: bool = False
+    initially_deferred: bool = False
+
+
+@dataclass
 class DefaultConstraint:
     name: str
     column: str
@@ -106,6 +121,7 @@ class Schema:
     indexes: list[Index] = field(default_factory=list)
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     check_constraints: list[CheckConstraint] = field(default_factory=list)
+    unique_constraints: list[UniqueConstraint] = field(default_factory=list)
     default_constraints: list[DefaultConstraint] = field(default_factory=list)
     sequences: list[str] = field(default_factory=list)     # column names backed by sequences
     rls_enabled: bool = False

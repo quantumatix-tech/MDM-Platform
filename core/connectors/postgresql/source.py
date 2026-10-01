@@ -42,6 +42,7 @@ from core.connectors.base import (
     Schema,
     SchemaDef,
     SequenceDef,
+    UniqueConstraint,
     SourceConnector,
     TriggerDef,
     TypeDef,
@@ -121,6 +122,7 @@ class PostgresSourceConnector(SourceConnector):
         indexes: list[Index] = []
         foreign_keys: list[ForeignKey] = []
         check_constraints: list[CheckConstraint] = []
+        unique_constraints: list[UniqueConstraint] = []
         sequences: list[str] = []
 
         with self._conn.cursor() as cur:
@@ -134,10 +136,10 @@ class PostgresSourceConnector(SourceConnector):
             schema_row = cur.fetchone()
             table_schema = schema_row[0] if schema_row else "public"
 
-            # --- Columns (with defaults + GENERATED ALWAYS detection) ---
+            # --- Columns (with defaults + GENERATED ALWAYS / IDENTITY detection) ---
             # Join pg_attribute to detect GENERATED ALWAYS AS (expr) STORED columns
-            # (attgenerated = 's').  Also read udt_name so ARRAY columns get their
-            # element type (e.g. "_int4" -> "integer[]") instead of just "ARRAY".
+            # (attgenerated = 's') and IDENTITY columns (attidentity = 'a'/'d').
+            # Also read udt_name so ARRAY columns get their element type.
             cur.execute(
                 "SELECT "
                 "  c.column_name, "
@@ -145,6 +147,10 @@ class PostgresSourceConnector(SourceConnector):
                 "  c.is_nullable, "
                 "  c.character_maximum_length, "
                 "  c.column_default, "
+                "  c.is_identity, "
+                "  c.identity_generation, "
+                "  c.identity_start, "
+                "  c.identity_increment, "
                 "  CASE WHEN a.attgenerated = 's' "
                 "       THEN pg_get_expr(ad.adbin, ad.adrelid) "
                 "       ELSE NULL END AS generation_expr "
@@ -159,7 +165,8 @@ class PostgresSourceConnector(SourceConnector):
                 (list(self._include_schemas), object_name, list(self._include_schemas)),
             )
             for row in cur.fetchall():
-                col_name, data_type, nullable, max_len, col_default, gen_expr = row
+                (col_name, data_type, nullable, max_len, col_default, is_identity,
+                 identity_generation, identity_start, identity_increment, gen_expr) = row
                 is_seq = col_default is not None and "nextval" in str(col_default)
                 if is_seq:
                     sequences.append(col_name)
@@ -169,10 +176,12 @@ class PostgresSourceConnector(SourceConnector):
                     target_type=None,
                     nullable=(nullable == "YES"),
                     size=max_len,
-                    # Keep nextval() default so the column wires to its sequence on target;
-                    # strip it only for generated columns (they use GENERATED ALWAYS syntax)
                     default=None if gen_expr else col_default,
-                    generated=gen_expr,   # non-None -> GENERATED ALWAYS AS (expr) STORED
+                    generated=gen_expr,
+                    is_identity = (is_identity == 'YES'),
+                    identity_seed=int(identity_start) if identity_start is not None else None,
+                    identity_increment=int(identity_increment) if identity_increment is not None else None,
+                    identity_kind=identity_generation if is_identity else None,
                 ))
 
             # --- Primary Key ---
@@ -193,7 +202,13 @@ class PostgresSourceConnector(SourceConnector):
             cur.execute(
                 "SELECT i.relname, ix.indisunique, "
                 "array_agg(a.attname ORDER BY a.attnum), "
-                "pg_get_indexdef(i.oid) "
+                "pg_get_indexdef(i.oid), "
+                # conindid points from a constraint to the index that backs it,
+                # so this identifies indexes PostgreSQL created automatically
+                # for UNIQUE/PK/EXCLUDE constraints. Manually-created unique
+                # indexes return NULL here and stay independent indexes.
+                "EXISTS (SELECT 1 FROM pg_constraint c "
+                "        WHERE c.conindid = i.oid) AS constraint_backed "
                 "FROM pg_class t "
                 "JOIN pg_index ix ON t.oid = ix.indrelid "
                 "JOIN pg_class i ON i.oid = ix.indexrelid "
@@ -204,12 +219,13 @@ class PostgresSourceConnector(SourceConnector):
                 (table_schema, object_name),
             )
             for row in cur.fetchall():
-                idx_name, is_unique, idx_cols, idx_ddl = row
+                idx_name, is_unique, idx_cols, idx_ddl, constraint_backed = row
                 indexes.append(Index(
                     name=idx_name,
                     columns=list(idx_cols),
                     unique=bool(is_unique),
                     ddl=idx_ddl,
+                    constraint_backed=bool(constraint_backed),
                 ))
 
             # --- Foreign Keys ---
@@ -260,6 +276,25 @@ class PostgresSourceConnector(SourceConnector):
                 chk_name, expression = row
                 check_constraints.append(CheckConstraint(name=chk_name, expression=expression))
 
+            # --- Unique Constraints (excluding primary keys) ---
+            cur.execute(
+                "SELECT conname, pg_get_constraintdef(oid) "
+                "FROM pg_constraint "
+                "WHERE conrelid = (SELECT oid FROM pg_class WHERE relname = %s AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = %s)) "
+                "  AND contype = 'u'",
+                (object_name, table_schema),
+            )
+            for row in cur.fetchall():
+                uq_name, uq_def = row
+                # Parse columns from constraint definition: UNIQUE (col1, col2)
+                import re
+                cols_match = re.search(r'UNIQUE\s*\(([^)]+)\)', uq_def, re.IGNORECASE)
+                if cols_match:
+                    cols = [c.strip().strip('"') for c in cols_match.group(1).split(',')]
+                else:
+                    cols = []
+                unique_constraints.append(UniqueConstraint(name=uq_name, columns=cols))
+
             # --- RLS enabled? ---
             cur.execute(
                 "SELECT c.relrowsecurity FROM pg_class c "
@@ -289,6 +324,7 @@ class PostgresSourceConnector(SourceConnector):
             indexes=indexes,
             foreign_keys=foreign_keys,
             check_constraints=check_constraints,
+            unique_constraints=unique_constraints,
             sequences=sequences,
             rls_enabled=rls_enabled,
             partition_key=partition_key,

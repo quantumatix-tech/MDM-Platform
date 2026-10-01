@@ -189,27 +189,67 @@ class PostgresTargetConnector(TargetConnector):
     # ------------------------------------------------------------------
 
     def apply_constraints(self, schema: Schema) -> None:
-        """Apply indexes, CHECK constraints and foreign keys.
+        """Apply unique constraints, CHECK constraints, indexes and foreign keys.
 
-        Retained in ``target.py`` as a single combined constraint layer. The
-        three families are applied in dependency order — indexes first, then
-        CHECK constraints, then foreign keys last, because every referenced
-        table must already exist.
+        Unique constraints are applied **before** indexes. A UNIQUE constraint
+        makes PostgreSQL create its own backing index carrying the constraint
+        name, so creating that index first makes the subsequent
+        ``ADD CONSTRAINT`` fail on the name collision. Unique constraints are
+        therefore created first, and the source marks indexes that back a
+        constraint (``Index.constraint_backed``, resolved from
+        ``pg_constraint.conindid`` on the source side) so they are not created a
+        second time as standalone indexes. A manually-created UNIQUE INDEX has
+        no backing constraint and is still migrated as an ordinary index.
 
-        All three share the same shape: execute, commit and audit, rolling back
-        and auditing a skip on failure. Splitting them into separate modules
-        would duplicate that scaffolding and still require this method to
-        orchestrate the ordering.
+        Remaining order is dependency order — CHECK constraints, then indexes,
+        then foreign keys last, because every referenced table must already
+        exist.
 
-        This is the target-side counterpart of
-        ``PostgresSourceConnector.get_schema()``, which discovers the same
-        families in the same order.
+        Every object is applied inside its own savepoint. A failure rolls back
+        only that savepoint, so one bad constraint cannot abort the surrounding
+        transaction and cascade into the CHECK/index/FK objects applied after
+        it. Genuine creation errors are audited as failures; only the
+        already-exists race (same object recreated by a concurrent/earlier run)
+        is downgraded to a skip.
         """
         validate_identifier(schema.name, "table")
         table_qname = _qualify(schema.schema_name, schema.name)
         with self._conn.cursor() as cur:
+            # Unique Constraints (first — see method docstring for ordering)
+            for uq in schema.unique_constraints:
+                self._apply_one_constraint(
+                    cur,
+                    f"ALTER TABLE {table_qname} "
+                    f"ADD CONSTRAINT {uq.name} UNIQUE ({', '.join(uq.columns)})",
+                    phase="create_unique",
+                    label=uq.name,
+                    table=schema.name,
+                )
+
+            # Check Constraints
+            for chk in schema.check_constraints:
+                self._apply_one_constraint(
+                    cur,
+                    f"ALTER TABLE {table_qname} "
+                    f"ADD CONSTRAINT {chk.name} CHECK ({chk.expression})",
+                    phase="create_check",
+                    label=chk.name,
+                    table=schema.name,
+                )
+
             # Indexes (use full DDL from pg_get_indexdef if available)
             for idx in schema.indexes:
+                if idx.constraint_backed:
+                    # Recreated automatically by the unique/PK constraint that
+                    # owns it — creating it again here would collide on name.
+                    audit_log(phase="create_index", status="skipped",
+                              details={"table": schema.name, "index": idx.name,
+                                       "reason": "backs constraint"})
+                    continue
+                try:
+                    cur.execute("SAVEPOINT apply_index")
+                except Exception:
+                    pass
                 try:
                     if idx.ddl:
                         # Replace CREATE INDEX with CREATE INDEX IF NOT EXISTS
@@ -231,26 +271,15 @@ class PostgresTargetConnector(TargetConnector):
                     audit_log(phase="create_index", status="skipped",
                               details={"index": idx.name, "reason": str(exc)})
 
-            # Check Constraints
-            for chk in schema.check_constraints:
-                try:
-                    cur.execute(
-                        f"ALTER TABLE {table_qname} "
-                        f"ADD CONSTRAINT {chk.name} CHECK ({chk.expression})"
-                    )
-                    self._conn.commit()
-                    audit_log(phase="create_check", status="created",
-                              details={"table": schema.name, "constraint": chk.name})
-                except Exception as exc:
-                    self._conn.rollback()
-                    audit_log(phase="create_check", status="skipped",
-                              details={"constraint": chk.name, "reason": str(exc)})
-
             # Foreign Keys (applied last — all tables must exist first)
             for fk in schema.foreign_keys:
                 col_list = ", ".join(fk.columns)
                 ref_col_list = ", ".join(fk.ref_columns)
                 ref_table_qname = _qualify(fk.ref_schema, fk.ref_table)
+                try:
+                    cur.execute("SAVEPOINT apply_fk")
+                except Exception:
+                    pass
                 try:
                     cur.execute(
                         f"ALTER TABLE {table_qname} "
@@ -266,6 +295,43 @@ class PostgresTargetConnector(TargetConnector):
                     self._conn.rollback()
                     audit_log(phase="create_fk", status="skipped",
                               details={"fk": fk.name, "reason": str(exc)})
+
+    def _apply_one_constraint(
+        self,
+        cur: Any,
+        sql: str,
+        *,
+        phase: str,
+        label: str,
+        table: str,
+    ) -> None:
+        """Apply a single ALTER TABLE ... ADD CONSTRAINT in its own savepoint.
+
+        Isolating each constraint keeps a failure local: the savepoint rollback
+        clears the aborted-transaction state so the next CHECK/index/FK object
+        still runs. The existing per-method contract is preserved — failures are
+        swallowed and audited rather than raised — but an object that genuinely
+        already exists is reported as a skip, and every other error is reported
+        with its real reason instead of being mislabelled.
+        """
+        try:
+            cur.execute("SAVEPOINT apply_constraint")
+        except Exception:
+            pass
+        try:
+            cur.execute(sql)
+            self._conn.commit()
+            audit_log(phase=phase, status="created",
+                      details={"table": table, "constraint": label})
+        except Exception as exc:
+            self._conn.rollback()
+            reason = str(exc)
+            if "already exists" in reason.lower():
+                audit_log(phase=phase, status="skipped",
+                          details={"constraint": label, "reason": reason})
+            else:
+                audit_log(phase=phase, status="failed",
+                          details={"constraint": label, "reason": reason})
 
     # ------------------------------------------------------------------
     # Row-Level Security
