@@ -1,0 +1,40 @@
+source:
+  engine: mysql
+  connection:
+    host: localhost
+    port: 33062
+    database: MigrationSource_MySQL
+    username: root
+    password_secret: mysql_source_pass
+    ssl: false
+
+target:
+  engine: mysql
+  connection:
+    host: localhost
+    port: 33062
+    database: MigrationTarget_MySQL
+    username: root
+    password_secret: mysql_target_pass
+    ssl: false
+    routine_definer: 'root@localhost'
+    preserve_source_definer: false
+
+migration:
+  mode: full
+  batch_size: 1000
+  stop_on_error: false
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO
+  file: logs/mysql_local_test.log

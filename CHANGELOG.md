@@ -10,6 +10,40 @@ The application version is defined by the `version` field in `pyproject.toml`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Centralized dependency management.** `pyproject.toml` is now the single
+  authoritative source for Python dependencies, package metadata, and the
+  application version. `requirements.txt` was removed, along with the parity
+  check that existed only to keep two hand-maintained dependency lists aligned.
+  `docker/Dockerfile` and `bootstrap.py` now install the project itself instead
+  of a duplicated dependency list.
+- **`bootstrap.py` installs the project**, not just its dependencies, and
+  verifies that a real installed distribution exists before reporting success.
+  Repository-local build artifacts such as a stale `migration_platform.egg-info`
+  are no longer accepted as proof of installation.
+- **Docker runtime installs from `pyproject.toml`** and no longer sets
+  `PYTHONPATH` to work around missing package metadata.
+
+### Added
+
+- **Runtime and CLI version visibility.** `python -m migration_platform
+  --version` reports the installed version, `requires-python` is re-validated at
+  startup by `core/preflight.py`, and generated reports expose
+  `platform_version` in both JSON and HTML.
+- **Release and compatibility tooling.** `scripts/release_validation.py`
+  validates packaging, versioning, and dependency metadata; `docs/
+  compatibility_matrix.md` records evidence-based engine compatibility;
+  `docs/release_process.md` documents the release procedure and checklist.
+
+### Notes
+
+- The Docker image build has not been verified; `docker` is unavailable in the
+  development environment. Installation layout was validated by replicating the
+  builder-stage prefix install locally.
+- The 4 pre-existing unit test failures and the existing Ruff backlog are
+  unchanged by this work.
+
 ## [0.2.0] - 2026-10-01
 
 First tagged release. Contains the completed platform architecture transition.
