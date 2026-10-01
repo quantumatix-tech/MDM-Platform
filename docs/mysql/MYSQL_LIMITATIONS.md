@@ -1,522 +1,185 @@
 # MySQL Limitations
 
-Documented limitations identified during the MySQL object migration audit
-on the Unified DMS / Migration Platform Local → Local test environment
-(MySQL Community Server 26.7.0).
+This document records current limits and validation boundaries for the MySQL migration path. It separates implementation behavior, audit coverage, environment dependencies, and differences between database engines. A source object count of zero means **Not exercised** in that run; it does not mean unsupported.
 
-The audit covered schema, tables, data, constraints, indexes, generated
-columns, views, functions, procedures, triggers, events, partitions,
-datatypes, comments, grants, dependencies, and end-to-end migration behavior.
+## A. Implementation Limitations
 
-Limitations are categorized as:
-
-- **Implementation limitation** — behavior gap in the current migration code
-- **Audit scope limitation** — not tested or not fully verified within the
-  current audit
-- **Environment limitation** — blocked by local server configuration,
-  privileges, infrastructure, or external prerequisites
-- **Engine capability limitation** — the target MySQL engine does not provide
-  a direct equivalent of a source-engine feature
-
----
-
-## Users and direct permissions
-
-MySQL migration supports user accounts and direct permissions. Locked accounts
-are excluded from user discovery. Authentication credentials and password
-definitions are not migrated. Global permissions are considered only for
-explicitly selected users and a supported privilege subset.
-
-### User account limitations
+### User credentials and privilege scope
 
 - **Category:** Implementation limitation
-- **Impact:** The current MySQL connector does not migrate authentication
-  credentials or password definitions on the target.
-- **Workaround:** Configure target authentication separately
-  before or after migration.
-- **Tracking:** Authentication setup remains outside the migration scope.
+- **Impact:** MySQL account discovery filters locked accounts. User/direct-permission migration does not copy authentication credentials or password definitions. Role memberships and some privilege scopes are outside the supported MySQL security path; global privileges are handled only for explicitly selected users and a supported subset. Table, database, column, and routine grants depend on the implemented grant path and source metadata visibility. A grantee may need to exist on the target before a grant can be applied.
+- **Workaround:** Provision target authentication separately. Select intended accounts using the supported security-user configuration/CLI option, review reported grants, and apply out-of-scope permissions separately under the site's security policy.
+- **Tracking:** `core/connectors/mysql.py`, `migration_platform/__main__.py`, `tests/unit/test_mysql_datatypes.py`, and [MYSQL_OBJECT_SUPPORT_MATRIX.md](MYSQL_OBJECT_SUPPORT_MATRIX.md). Do not grant broad `SELECT ON mysql.*` or `SUPER` as a routine migration prerequisite.
 
-### Global and database-level privileges have limited support
+### FULL migration retains unrelated target-only objects
+
+- **Category:** Implementation safety boundary
+- **Impact:** FULL migration processes objects in the source migration scope; it does not sweep the target and delete arbitrary objects absent from the source. This includes Events not present in the source snapshot. Extra target objects can therefore remain after a successful run.
+- **Workaround:** Use a clean dedicated target for exact source/target comparisons. Remove unrelated target-only objects separately only through an approved environment cleanup process.
+- **Tracking:** MySQL event tests assert there is no target-wide Event pruning; the Azure audit records retained target-only Events. This is intentional protection against deleting application-owned or out-of-scope objects, not a migration failure.
+
+### Target schema reconciliation is scoped and opt-in
+
+- **Category:** Implementation/configuration limitation
+- **Impact:** `migration.reconcile_target_schema: true` enables the implemented reconciliation path for supported MySQL target structure mismatches; it is not a general-purpose repair for every schema difference. Clearing rows does not make incompatible DDL equivalent.
+- **Workaround:** Prefer a clean target for ordinary E2E tests. Use a disposable target and enable reconciliation only for a dedicated, supported mismatch scenario.
+- **Tracking:** The option is present in MySQL configs and the orchestrator checks it before reconciliation. The local audit documents tested partition reconciliation; see [MYSQL_LOCAL_AUDIT.md](MYSQL_LOCAL_AUDIT.md) and [MYSQL_OBJECT_SUPPORT_MATRIX.md](MYSQL_OBJECT_SUPPORT_MATRIX.md).
+
+### View rewriting has a defined boundary
 
 - **Category:** Implementation limitation
-- **Impact:** Global privileges are filtered to an explicit user allowlist and
-  supported privilege subset. Database-level privileges are mapped to the
-  target database.
-- **Workaround:** Review unsupported privileges and apply them manually when
-  required.
-- **Tracking:** Direct database/table/column/routine grants are handled through
-  the common grant migration path.
+- **Impact:** The connector rewrites source database qualifiers when they identify migrated dependencies. It does not rewrite arbitrary SQL text, string literals, comments, or unrelated external database references. A view that intentionally depends on an external database may continue to do so.
+- **Workaround:** Review cross-database view dependencies and ensure external objects exist on the target, or adjust those definitions separately.
+- **Tracking:** `core/connectors/mysql.py`; local audit evidence verifies migrated views against target-local objects.
 
-### Table grants are conditionally supported
+## B. Validation / Audit Scope Limitations
 
-- **Category:** Implementation limitation
-- **Impact:** Explicit table grants can be discovered from
-  `INFORMATION_SCHEMA.TABLE_PRIVILEGES` and applied to the target, but the
-  target grantee must already exist. The platform does not create the
-  grantee account.
-- **Workaround:** Create the target account first and ensure the migration
-  account has sufficient privilege to apply the grant.
-- **Tracking:** Table grants are supported and were exercised during the
-  local audit.
+### Datatype coverage is representative, not exhaustive
 
-### Routine `EXECUTE` grants depend on catalog visibility
+- **Category:** Validation/audit scope limitation
+- **Impact:** The checked fixture covers representative MySQL numeric, text/character, binary, temporal and MySQL-specific types, but not every server version, type variant, expression, collation, or edge value.
+- **Workaround:** Add focused data and metadata validation for production-specific type variants.
+- **Tracking:** Local audit and `tests/unit/test_mysql_datatypes.py`; the tests include SET normalization. Successful representative coverage is not an exhaustive compatibility claim.
 
-- **Category:** Environment limitation
-- **Impact:** Routine privileges depend on visibility of
-  `INFORMATION_SCHEMA.ROUTINE_PRIVILEGES`. If the connected migration
-  account cannot access that metadata, routine grant discovery is skipped
-  without aborting supported table-grant processing.
-- **Workaround:** Run the migration with an account that has the required
-  metadata visibility, where organizational security policy permits it.
-- **Tracking:** The connector intentionally degrades to the available grant
-  metadata instead of requiring elevated system-schema access.
+### Partition coverage is narrower than implementation scope
 
-### Grant metadata can be invisible to the migration account
+- **Category:** Validation/audit scope limitation
+- **Impact:** Connector DDL generation handles MySQL `RANGE`, `RANGE COLUMNS`, `LIST`, `LIST COLUMNS`, `HASH`, and `KEY` partition methods. Live audit coverage is narrower: the documented local fixture exercises a representative RANGE/YEAR partition case. Other methods and combinations are not exhaustively validated in live E2E.
+- **Workaround:** Compare source/target `SHOW CREATE TABLE` and `information_schema.partitions` for required production strategies; create focused tests for any unexercised method.
+- **Tracking:** `core/connectors/mysql.py`, [MYSQL_LOCAL_AUDIT.md](MYSQL_LOCAL_AUDIT.md), and [MYSQL_OBJECT_SUPPORT_MATRIX.md](MYSQL_OBJECT_SUPPORT_MATRIX.md).
 
-- **Category:** Environment limitation
-- **Impact:** MySQL privilege metadata visible to an administrative account
-  is not necessarily visible to the migration account. During the local
-  audit, grants belonging to `migration_grant_test@localhost` were visible
-  to the administrative account but not to the DMS account
-  `mysql_test@%`.
-- **Workaround:** Use an appropriately privileged migration account or
-  perform grant administration separately.
-- **Tracking:** The DMS does not require root or broad system-schema access
-  merely to discover grants.
+### Cross-database dependency graphs are not exhaustively validated
 
-The platform intentionally does not rely on broad permissions such as
-`GRANT SELECT ON mysql.*` as a normal migration prerequisite because that
-would weaken the least-privilege boundary.
+- **Category:** Validation/audit scope limitation
+- **Impact:** Tested cross-database foreign-key/dependency behavior does not establish correctness for every dependency shape. Circular or complex cross-database graphs have not been exhaustively exercised.
+- **Workaround:** Ensure referenced databases/objects are available and in scope; validate complex or circular dependencies separately before production migration.
+- **Tracking:** Local audit documents tested cross-database FK behavior. MySQL databases act as object namespaces; this does not imply arbitrary dependency graphs were tested.
 
----
+### Comments and metadata coverage
 
-## Functions and triggers
+- **Category:** Validation/audit scope limitation
+- **Impact:** Table and column comments are within the implemented/tested path. Other possible metadata locations outside that path are not established by those tests.
+- **Workaround:** Identify required metadata types explicitly and verify them with a focused fixture.
+- **Tracking:** MySQL connector metadata queries and local audit evidence for table/column comments.
+
+### Production-scale and unusual workloads
+
+- **Category:** Validation/audit scope limitation
+- **Impact:** E2E evidence does not cover every production data volume, long-running workload, unusual SQL expression, privilege model, dependency graph, or server/version combination.
+- **Workaround:** Run a production-specific assessment and representative load/validation tests.
+- **Tracking:** Audits describe concrete fixtures and directions; consult [MYSQL_TEST_GUIDE.md](MYSQL_TEST_GUIDE.md) for repeatable checks.
+
+## C. Environment / Pre-existing State Limitations
 
 ### Function and trigger creation can be blocked by binary-log policy
 
 - **Category:** Environment limitation
-- **Impact:** When binary logging is enabled and
-  `log_bin_trust_function_creators=OFF`, MySQL can reject function or trigger
-  creation with error 1419 unless the executing account has the required
-  administrative privileges.
-- **Workaround:** A MySQL administrator can explicitly authorize the required
-  server configuration, for example:
+- **Impact:** When `log_bin=ON` and `log_bin_trust_function_creators=OFF`, MySQL may reject function or trigger creation with Error 1419, depending on privileges. A blocked object is not evidence that the migration code lacks support.
+- **Workaround:** Check `SHOW VARIABLES LIKE 'log_bin';` and `SHOW VARIABLES LIKE 'log_bin_trust_function_creators';`. If approved, a MySQL administrator may apply `SET PERSIST log_bin_trust_function_creators = ON;`. The migration platform does not change this server setting or acquire `SUPER`. If the prerequisite cannot be met, report the object as blocked/environment-dependent.
+- **Tracking:** Local audit documents the policy prerequisite and successful function/trigger migration after administrator action; `core/orchestrator.py` reports blocked function/trigger cases.
 
-  `SET PERSIST log_bin_trust_function_creators = ON;`
-
-  This is an administrator-controlled server configuration and is not changed
-  automatically by the migration platform.
-- **Tracking:** The local audit initially encountered this condition. After
-  the administrator-approved persistent setting was applied and MySQL was
-  restarted, functions and triggers migrated successfully.
-
-The platform reports affected objects as `FUNCTION: BLOCKED` or
-`TRIGGER: BLOCKED` instead of falsely reporting them as migrated.
-
-### Function and trigger migration remains dependent on target privileges
+### Grant discovery depends on privilege metadata visibility
 
 - **Category:** Environment limitation
-- **Impact:** Even when the binary-log policy is satisfied, creation can fail
-  if the target migration account does not have the privileges required by
-  MySQL for the object or its body.
-- **Workaround:** Grant the required target privileges or use an approved
-  migration account.
-- **Tracking:** The platform does not automatically elevate privileges.
+- **Impact:** `INFORMATION_SCHEMA.TABLE_PRIVILEGES` and `ROUTINE_PRIVILEGES` visibility depends on the migration account. If routine privilege metadata is unavailable, routine grant discovery can be skipped while supported grant processing continues. A missing visible grant is not proof that the grant does not exist.
+- **Workaround:** Use an appropriately authorized account where policy permits, or handle those grants separately. Avoid broad system-schema access solely to force a test pass.
+- **Tracking:** `core/connectors/mysql.py` and `tests/unit/test_mysql_datatypes.py`; local audit records account-dependent visibility.
 
----
-
-## Events
-
-### Event Scheduler is a server-level prerequisite
+### Target grantee and stored-object privileges
 
 - **Category:** Environment limitation
-- **Impact:** MySQL events require the Event Scheduler and appropriate target
-  privileges. An event can be created successfully as metadata but cannot
-  execute as intended when the required server capability or privileges are
-  unavailable.
-- **Workaround:** Enable/configure Event Scheduler according to the target
-  server's administrative policy. On the tested Azure target,
-  `SET GLOBAL event_scheduler = ON` returned Error 1227 because the migration
-  account lacks `SUPER`/`SYSTEM_VARIABLES_ADMIN`; DMS must not silently enable
-  the scheduler or obtain those privileges. Verify whether the actual Azure
-  server/version exposes a supported server-configuration parameter and have an
-  Azure administrator enable it if appropriate.
-- **Tracking:** The migration fixture included a one-time event and verified
-  event metadata on the target.
+- **Impact:** Applying grants requires target privileges and may require the grantee account to exist. Creating routines, triggers, events, or users also depends on target authorization and server policy.
+- **Workaround:** Provision accounts and required privileges through approved DBA procedures; review per-object results.
+- **Tracking:** MySQL connector grant/security paths and limitations documented in [MYSQL_OBJECT_SUPPORT_MATRIX.md](MYSQL_OBJECT_SUPPORT_MATRIX.md).
 
-### Event execution semantics depend on target server state
-
-- **Category:** Environment / audit scope limitation
-- **Impact:** Event execution is affected by Event Scheduler state, schedule,
-  event status, and target server timing. Metadata migration and functional
-  execution therefore need to be considered separately.
-- **Workaround:** Validate migrated event metadata first, then validate
-  execution in an environment where Event Scheduler behavior is explicitly
-  controlled.
-- **Tracking:** The local audit used a safe one-time event fixture to avoid
-  ambiguity from unrelated active events.
-  The dedicated Local → Azure audit records migration metadata/state as passed,
-  but automatic Event runtime as not verified while the Azure scheduler is OFF.
-
-### Enabled one-time Events inside the migration safety window are blocked
-
-- **Category:** Intentional safety behavior
-- **Impact:** An enabled one-time Event that is due, past due, or scheduled
-  within `migration.one_time_event_safety_lead_seconds` (default: 300 seconds)
-  cannot be migrated while guaranteeing its original execution semantics.
-- **Behavior:** DMS snapshots Event metadata and `SHOW CREATE EVENT` immediately
-  after source connection. It rechecks an enabled one-time Event in its source
-  Event time zone before target replacement. If either check is unsafe, DMS
-  records `EVENT: BLOCKED` and leaves an existing target Event untouched.
-- **Workaround:** Schedule the source Event sufficiently farther in the future
-  and rerun the migration. DMS never enables an expired Event to compensate.
-- **Tracking:** Recurring Event state/schedule preservation has Azure metadata
-  evidence from run `474f0d5157784c4d9bdf8d25f35d9523`; future and blocked
-  one-time paths are unit verified pending a credentialed Azure re-test.
-
-### FULL migration retains target-only Events
-
-- **Category:** Intentional safety boundary
-- **Impact:** FULL migration creates or replaces each Event in the source Event
-  snapshot, but does not delete target Events absent from that snapshot. This
-  includes stale Events from earlier migration tests.
-- **Reason:** The platform has no managed-Event ownership registry. A target
-  Event can be application-owned, created by another migration scope, or have
-  dependencies not represented by the Event catalog. Name/prefix matching
-  would not establish ownership safely.
-- **Safety behavior:** No target-wide Event inventory or `DROP EVENT` sweep is
-  performed. The only Event drop is the replacement of a same-named, current
-  source Event after one-time safety validation. Scheduler state is never
-  changed as part of this behavior.
-- **Tracking:** Azure FULL run `740ba5585c394826acd9257260c3332e` migrated the
-  sole source Event `evt_migration_e2e_final` and retained five target-only
-  Events. This is expected, not a migration failure.
-
----
-
-## FULL migration and target reconciliation
-
-### FULL migration does not remove unmanaged target-only objects
-
-- **Category:** Implementation limitation
-- **Impact:** FULL migration reconciles objects that belong to the migration
-  scope, but it does not automatically delete unrelated objects that already
-  exist only on the target database.
-- **Workaround:** Remove unmanaged target-only objects separately when an
-  exact target mirror is required.
-- **Tracking:** A manually created `child_cross_schema_test` object was
-  present only on the target during E2E comparison. It was removed manually
-  before the final comparison.
-
-This behavior prevents the migration platform from deleting arbitrary
-target objects that are outside the requested migration scope.
-
-### Existing target table structure may require schema reconciliation
-
-- **Category:** Implementation/configuration limitation
-- **Impact:** An existing target table whose structure differs from the source
-  cannot be treated as structurally equivalent merely by clearing and
-  reloading its rows.
-- **Workaround:** Enable the supported target schema reconciliation option
-  (`migration.reconcile_target_schema: true`) when FULL migration is expected
-  to reconcile incompatible target table structures.
-- **Tracking:** This was specifically identified during partition testing.
-  The implementation was enhanced to replace incompatible target structures
-  safely and was then verified with the partitioned MySQL fixture.
-
----
-
-## Partitions
-
-### Partition support is limited to supported MySQL partition definitions
-
-- **Category:** Audit scope limitation
-- **Impact:** The current audit directly exercised a MySQL `RANGE` partition
-  definition using `YEAR(created_at)`, including ordered partitions and
-  `MAXVALUE`. Other valid MySQL partition expressions and combinations were
-  not exhaustively exercised in live E2E testing.
-- **Workaround:** Validate additional partition strategies separately when
-  they are outside the tested fixture.
-- **Tracking:** Supported implementation includes MySQL table-level
-  `RANGE`, `RANGE COLUMNS`, `LIST`, `LIST COLUMNS`, `HASH`, and `KEY`
-  definitions. The tested `tbl_partition_test` structure was successfully
-  reconciled and verified on the target.
-
-Partition creation is part of the table DDL in MySQL; it does not require a
-separate partition plugin or restart in the tested MySQL 26.7.0 environment.
-
----
-
-## Views
-
-### Cross-database view dependencies have a deliberate rewrite boundary
-
-- **Category:** Implementation limitation
-- **Impact:** The view migration logic rewrites source database qualifiers
-  when they refer to migrated objects so that migrated views can reference
-  target-local objects. It does not rewrite arbitrary cross-database
-  references, literals, comments, or unrelated SQL text.
-- **Workaround:** Review views containing intentional external database
-  dependencies and adjust them separately when those dependencies are not
-  part of the migration scope.
-- **Tracking:** The local `customer_order_summary` view was verified against
-  target-local `customers` and `orders`.
-
----
-
-## Cross-schema / cross-database dependencies
-
-### Cross-database dependencies require target dependency availability
-
-- **Category:** Audit scope limitation
-- **Impact:** MySQL databases act as namespaces, and objects can reference
-  objects in another database. The current audit verified a cross-database
-  foreign-key scenario, but arbitrary circular and complex cross-database
-  dependency graphs were not exhaustively exercised.
-- **Workaround:** Ensure referenced databases and objects are migrated or
-  otherwise available on the target before dependent objects are created.
-- **Tracking:** Supported dependency ordering and foreign-key recreation were
-  verified for the tested scenarios.
-
-### Circular cross-database dependencies were not exhaustively tested
-
-- **Category:** Audit scope limitation
-- **Impact:** The migration orchestrator creates supported constraints after
-  the required tables exist, which handles normal dependency ordering.
-  Complex mutually dependent cross-database objects were not exhaustively
-  exercised in the local fixture.
-- **Workaround:** Validate circular dependency graphs separately before
-  production migration.
-- **Tracking:** Acknowledged as unverified beyond the tested dependency
-  scenarios.
-
----
-
-## Datatypes
-
-### Datatype coverage beyond the representative fixture is not exhaustive
-
-- **Category:** Audit scope limitation
-- **Impact:** The audit included a representative 31-column MySQL datatype
-  fixture covering numeric, character, text, binary/LOB, date/time, JSON,
-  ENUM, SET, and related definitions. It does not constitute exhaustive
-  coverage of every MySQL datatype variant and edge case.
-- **Workaround:** Add targeted fixtures for datatype variants required by a
-  production migration.
-- **Tracking:** The representative datatype fixture migrated successfully,
-  including values and target metadata.
-
-### MySQL `SET` values require connector normalization
-
-- **Category:** Implementation limitation
-- **Impact:** MySQL `SET` values are returned by the Python driver as a
-  collection type. The connector must serialize the collection into MySQL's
-  comma-separated representation before target insertion.
-- **Workaround:** None required for the supported implementation.
-- **Tracking:** This was identified and fixed during the datatype audit.
-  The successful datatype migration verified the corrected behavior.
-
-This is retained as a historical implementation consideration rather than
-an unresolved MySQL engine limitation.
-
----
-
-## Comments and metadata
-
-### Comment coverage is limited to supported metadata objects
-
-- **Category:** Audit scope limitation
-- **Impact:** The audit verified table and column comments. Other MySQL
-  metadata/comment locations outside the supported discovery and application
-  paths were not exhaustively tested.
-- **Workaround:** Validate additional metadata types separately when required.
-- **Tracking:** Table and column comment migration was fixed and verified
-  during the local audit.
-
----
-
-## DDL and transactional behavior
-
-### MySQL DDL is not transactionally equivalent to PostgreSQL DDL
-
-- **Category:** Engine capability limitation
-- **Impact:** MySQL DDL has different transactional and implicit-commit
-  semantics from PostgreSQL. A later migration failure cannot be assumed to
-  roll back every previously committed DDL operation.
-- **Workaround:** Use the migration platform's error isolation, reconciliation,
-  validation, and cleanup behavior rather than relying on one database-wide
-  DDL transaction.
-- **Tracking:** The orchestrator isolates object failures and records
-  per-object migration status.
-
----
-
-## MySQL namespace model
-
-### MySQL databases are not equivalent to PostgreSQL schemas
-
-- **Category:** Engine capability limitation
-- **Impact:** MySQL primarily uses databases as object namespaces, whereas
-  PostgreSQL supports multiple schemas within a database. A cross-engine
-  PostgreSQL-to-MySQL migration therefore cannot assume a one-to-one
-  translation of PostgreSQL schema semantics.
-- **Workaround:** Define the target database/namespace mapping explicitly
-  during migration planning.
-- **Tracking:** This is a cross-engine architectural difference rather than
-  a MySQL local-to-local migration failure.
-
----
-
-## PostgreSQL-specific capabilities without direct MySQL equivalents
-
-### Materialized views, RLS, extensions, domains, and standalone sequences
-
-- **Category:** Engine capability limitation
-- **Impact:** MySQL does not provide direct native equivalents for several
-  PostgreSQL-specific features, including PostgreSQL materialized views,
-  Row Level Security policies, extensions, domains/custom types, and
-  standalone sequences with PostgreSQL semantics.
-- **Workaround:** Implement an application-specific or MySQL-native
-  alternative where appropriate. Such alternatives are not automatically
-  generated by the current MySQL connector.
-- **Tracking:** These are capability differences between database engines,
-  not silent migration skips.
-
----
-
-## Azure / remote-server testing
-
-### Azure MySQL E2E coverage remains environment-dependent
+### Event Scheduler runtime is environment-dependent
 
 - **Category:** Environment limitation
-- **Impact:** Azure connectivity depends on network access, firewall/IP
-  allow-listing, TLS configuration, approved secrets, and target privileges.
-  Local-to-local verification does not prove Azure end-to-end compatibility.
-- **Workaround:** Run the migration in the approved Azure environment with
-  the required connection, TLS, secret, network, and privilege configuration.
-- **Tracking:** Azure-specific E2E verification was not completed as part of
-  the local audit.
+- **Impact:** Event definition migration and Event runtime are different checks. Automatic execution depends on `event_scheduler`, event status and schedule, target time/state, definer, and privileges. The Azure audit observed `event_scheduler=OFF`; an attempt to enable it with the migration account returned Error 1227. Azure event metadata/state was checked, but automatic runtime was not verified.
+- **Workaround:** Verify `SHOW VARIABLES LIKE 'event_scheduler';` and event metadata. Have the server administrator configure the scheduler when supported and authorized, then test a controlled event. Do not treat `STATUS=ENABLED` alone as proof of execution.
+- **Tracking:** [MYSQL_LOCAL_TO_AZURE_AUDIT.md](MYSQL_LOCAL_TO_AZURE_AUDIT.md); runtime remains blocked/not executed in the documented Azure environment.
 
-No host-name-specific migration code path is required; differences are
-expected to come from configuration, connectivity, TLS, permissions, and
-server policy.
+### One-time Event safety window
 
----
+- **Category:** Implementation safety behavior / validation scope
+- **Impact:** An enabled one-time Event due, past due, or within `migration.one_time_event_safety_lead_seconds` (default 300 seconds) is blocked because the original execution timing cannot safely be preserved. The orchestrator snapshots and rechecks event timing; unsafe events are not created/replaced on the target. The platform does not enable an expired event to compensate.
+- **Workaround:** Schedule the source event sufficiently far in the future and rerun in a controlled environment. Keep scheduler/runtime validation separate from DDL migration.
+- **Tracking:** `core/orchestrator.py` and `tests/unit/test_mysql_events.py` verify due/near events are blocked without target replacement. Azure event metadata runs do not establish runtime behavior for every event schedule.
 
-## Audit coverage limitations
+### Network, TLS, authentication, and managed-server policy
 
-### Production-scale and exhaustive object coverage was not performed
+- **Category:** Environment limitation
+- **Impact:** Remote/Azure connectivity requires reachable endpoints, firewall/network access, correct TLS settings, credentials, and target privileges. Failures before source/target operations do not establish an object-migration defect.
+- **Workaround:** Confirm endpoint, port 3306, TLS, firewall allow-list, secrets, and account grants before rerunning.
+- **Tracking:** Both Local → Azure and Azure → Local have documented E2E results; exact prerequisites remain environment-specific.
 
-- **Category:** Audit scope limitation
-- **Impact:** The local audit provides focused functional evidence across the
-  supported MySQL object categories but does not represent every possible
-  production schema shape, SQL expression, privilege model, workload size,
-  or dependency graph.
-- **Workaround:** Execute production-specific pre-migration assessment and
-  targeted validation fixtures before production use.
-- **Tracking:** The audit deliberately distinguishes tested scenarios from
-  unsupported or unverified scenarios.
+### Pre-existing target contents affect comparisons
 
----
+- **Category:** Pre-existing-state limitation
+- **Impact:** Existing target rows or objects can affect counts and object comparisons. In particular, target-only objects are intentionally retained; successful migration does not mean the target is an exact mirror.
+- **Workaround:** Begin with a clean dedicated target or record known pre-existing state. Never clean a shared/production target as part of an audit.
+- **Tracking:** The local and Azure audits call out target-state boundaries; FULL mode does not prune unmanaged target-only objects.
 
-## Resolved implementation findings
+## D. MySQL / Engine Capability Limitations
 
-The following issues were discovered during the MySQL audit and fixed. They
-are **not current unresolved limitations**, but are retained here so the
-audit history remains traceable.
+### DDL transaction behavior differs between engines
 
-### Default-value quoting
+- **Category:** Engine capability limitation
+- **Impact:** MySQL DDL has implicit-commit and transactional behavior that differs from PostgreSQL. A later failure cannot be assumed to roll back all earlier DDL in a migration.
+- **Workaround:** Use object-level error reporting, supported reconciliation, validation, and an approved cleanup/retry plan rather than relying on one database-wide DDL transaction.
+- **Tracking:** MySQL orchestrator isolates and records object outcomes; this is an engine semantic difference, not a MySQL defect.
 
-Source default metadata was initially emitted without the quoting required
-by MySQL, causing table creation failures for string defaults.
+### MySQL databases are not PostgreSQL schemas
 
-**Status:** Fixed and verified.
+- **Category:** Engine capability limitation
+- **Impact:** MySQL uses databases as object namespaces and does not provide the same namespace model as PostgreSQL schemas. Cross-engine migration cannot assume a one-to-one semantic mapping.
+- **Workaround:** Decide and validate database/namespace mapping during migration planning.
+- **Tracking:** Documented in [MYSQL_MIGRATION_FLOW.md](MYSQL_MIGRATION_FLOW.md).
 
-### Generated-column data loading
+### Source-engine features without direct MySQL equivalents
 
-The loader initially attempted to insert generated-column values rather than
-allowing MySQL to calculate them.
+- **Category:** Engine capability limitation
+- **Impact:** MySQL has no direct native equivalent for PostgreSQL materialized views, RLS policies, extensions, domains/custom types, or standalone sequences with PostgreSQL semantics. These are cross-engine capability differences, not MySQL-to-MySQL migration failures. MySQL `AUTO_INCREMENT` is table-bound and is not a standalone sequence equivalent.
+- **Workaround:** Design an application-specific or MySQL-native alternative where needed; do not expect automatic semantic conversion.
+- **Tracking:** MySQL connector capability declarations and [MYSQL_OBJECT_SUPPORT_MATRIX.md](MYSQL_OBJECT_SUPPORT_MATRIX.md).
 
-**Status:** Fixed and verified.
+## E. Azure / Remote MySQL Limitations
 
-### CHECK constraint escaping
+### Azure validation is direction-specific and incomplete for some runtime behavior
 
-Escaped catalog expressions were initially reused incorrectly when generating
-target CHECK constraints.
+- **Category:** Validation/audit scope and environment limitation
+- **Impact:** Repository evidence includes Local → Azure and Azure → Local runs; these prove only the recorded dataset, configuration, and direction. They do not prove all objects or runtimes behave identically across Azure/server versions. The documented Azure scheduler was OFF, blocking automatic Event runtime verification. Function/trigger creation remains subject to Azure target policy and privileges.
+- **Workaround:** Run the relevant direction with approved TLS/network/secrets/privileges and verify target metadata and data. Record metadata migration separately from functional runtime.
+- **Tracking:** Local → Azure run `9f15eae2f1a84933a7ffe9746b828932` is recorded as 6 tables, 6,340 source/migrated rows, 0 failed, 100%. Azure → Local run `fb374e4480d84894b22d5917807b507f` is recorded as 13 tables, 45 source/migrated rows, 0 failed, 100%. See [MYSQL_LOCAL_TO_AZURE_AUDIT.md](MYSQL_LOCAL_TO_AZURE_AUDIT.md), [MYSQL_LOCAL_AUDIT.md](MYSQL_LOCAL_AUDIT.md), and [MYSQL_MIGRATION_FLOW.md](MYSQL_MIGRATION_FLOW.md). These outcomes must not be combined as one run or direction.
 
-**Status:** Fixed and verified.
+## F. Resolved Implementation Findings
 
-### Foreign-key namespace mapping
+The following are historical defects, not current limitations, based on the repository audit and current code/tests:
 
-Source database qualifiers were initially retained in target foreign-key
-definitions.
+| Finding | Resolution / evidence |
+|---|---|
+| Default-value quoting | MySQL default expressions are rendered with appropriate quoting; documented as fixed and verified in the local audit. |
+| Generated-column loading | Generated values are omitted from ordinary load DML so MySQL computes them; audit records recalculation validation. |
+| CHECK expression escaping | Escaped catalog expressions are handled when producing target CHECK DDL; audit records constraint validation. |
+| Foreign-key database mapping | Migrated dependency references are mapped to target database names; audit records valid/invalid FK checks. |
+| Routine DDL extraction | Uses authoritative `SHOW CREATE` output; documented routine migration/runtime evidence. |
+| Trigger connection lifecycle | Connector cleanup/rollback behavior was corrected; local audit records successful trigger migration/runtime checks. |
+| Grant discovery fallback | Unavailable routine privilege metadata no longer aborts supported table-grant processing; covered by `tests/unit/test_mysql_datatypes.py`. |
+| Cross-engine type safety | Missing target type mapping raises `UnmappedTypeError` rather than silently emitting source-native DDL; covered by current implementation and cross-engine tests. |
+| MySQL SET value serialization | Driver-returned collection values are normalized to the declared SET representation; `tests/unit/test_mysql_datatypes.py` covers the behavior and the local audit records datatype validation. |
 
-**Status:** Fixed and verified with valid and invalid FK runtime tests.
+## Final Verified Disposition
 
-### Routine DDL extraction
+The repository documents successful MySQL migrations in Local → Azure and Azure → Local directions, and a successful local report. The latest checked-in Local report is `reports/1584f5a5ebc04e8a8d9e288ee150b23c.json` (5 tables, 5,710 source/migrated rows, success); the audit also retains a historical Local → Local result of 11 tables and 44/44 rows. These are distinct runs and must not be conflated.
 
-The implementation initially selected the wrong `SHOW CREATE` output field
-for some routine objects.
+The evidence supports the tested object sets, not every MySQL feature or production schema. Security/grant migration is scoped and visibility-dependent; routine/trigger creation can be blocked by server policy; Event metadata does not establish runtime; Azure E2E exists in both directions but some Azure runtime behavior remains unverified. Partition strategies, complex dependency graphs, type variants, and production-scale behavior remain audit-scope boundaries. MySQL DDL and namespace behavior remain engine differences. The resolved findings above are not current known failures.
 
-**Status:** Fixed and verified.
+## Reference
 
-### Trigger connection lifecycle
+- [MySQL Local Audit](MYSQL_LOCAL_AUDIT.md)
+- [MySQL Local → Azure Audit](MYSQL_LOCAL_TO_AZURE_AUDIT.md)
+- [MySQL Object Support Matrix](MYSQL_OBJECT_SUPPORT_MATRIX.md)
+- [MySQL Test Guide](MYSQL_TEST_GUIDE.md)
+- [MySQL E2E Runbook](MYSQL_E2E_RUNBOOK.md)
+- [MySQL Migration Flow](MYSQL_MIGRATION_FLOW.md)
 
-Open source read transactions and connector cleanup behavior could leave
-connections in an undesirable state and interfere with trigger DDL.
-
-The fix added source autocommit, rollback-safe cleanup, and failed-DDL
-rollback handling.
-
-**Status:** Fixed and verified.
-
-### Grant discovery fallback
-
-Routine grant discovery could abort the broader grant phase when
-`ROUTINE_PRIVILEGES` was unavailable.
-
-**Status:** Fixed. Table-grant discovery continues when routine-grant
-metadata is unavailable.
-
-### Cross-engine type safety
-
-MySQL/MSSQL target DDL previously fell back to the source-native type when a
-cross-engine mapping was missing.
-
-**Status:** Fixed. Missing cross-engine mappings now raise an explicit
-`UnmappedTypeError` instead of silently producing unsafe target DDL.
-
----
-
-## Final verified disposition
-
-The final MySQL Local → Local verification demonstrated successful migration
-of the tested supported object set, including:
-
-- tables and data
-- columns and datatypes
-- primary keys
-- unique constraints
-- foreign keys
-- CHECK constraints
-- indexes
-- AUTO_INCREMENT
-- generated columns
-- defaults
-- views
-- functions
-- procedures
-- triggers
-- events
-- partitions
-- table and column comments
-- supported grants
-
-The final verified run completed with **11 tables, 44/44 rows migrated,
-0 errors, Functions/Procedures 2/2, Triggers 2/2**, after the required
-administrator-approved MySQL binary-log function/trigger policy was enabled.
-
-The remaining limitations in this document are therefore primarily
-**unsupported object/security scope, environment prerequisites, engine
-capability differences, and audit-coverage boundaries**, rather than known
-failures in the verified Local → Local migration path.

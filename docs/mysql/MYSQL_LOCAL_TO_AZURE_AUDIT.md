@@ -1,148 +1,170 @@
 # MySQL Local → Azure Cloud Audit
 
-This dedicated Local → Azure audit complements [MYSQL_LOCAL_AUDIT.md](MYSQL_LOCAL_AUDIT.md) and [MYSQL_LIMITATIONS.md](MYSQL_LIMITATIONS.md). It does not replace either. Some recorded work predates the current Codex session and was completed through earlier Copilot/manual work. Only results explicitly labelled Local → Azure are Azure evidence.
+This audit records Local MySQL to Azure Database for MySQL Flexible Server evidence only. It complements the local audit and MySQL reference guides; Azure → Local results are not used as proof here. Report artifacts establish migration outcome and reported object counts. Where noted, separate target inspection established metadata or runtime behavior; report counts alone do not prove runtime behavior.
 
-## Objective and environment
+## 1. Objective
+
+Exercise a MySQL `FULL` migration from a local MySQL Community Server to Azure Database for MySQL Flexible Server. The audit distinguishes successful migration/report evidence from local-only runtime coverage and from Azure behavior blocked by target policy or configuration.
+
+## 2. Environment
+
+### Local MySQL Source
 
 | Item | Value |
 |---|---|
-| Project / branch | Unified DMS / MDM-Platform / `feature/unified-dms-platform` |
-| Source | Local MySQL Community Server 26.7.0; `mysql_migration_source`; `mysql_test` |
-| Target | Azure MySQL Flexible Server 8.4.7-azure; `mysql-mdm-migration-test.mysql.database.azure.com`; `mysql_migration_target`; `mysql_admin` |
-| Config / command | `config/mysql_local_test.yaml`; `python -m migration_platform --config config/mysql_local_test.yaml --mode full` |
+| Engine | MySQL Community Server 26.7.0 (as recorded for the audit) |
+| Database | `mysql_migration_source` |
+| Historical source user | `mysql_test` (as recorded for the audit) |
 
-Secrets are omitted. The same MySQL code path is used for Local/Azure; Azure uses TLS-required connection behavior. Evidence used reports, source/target metadata, SHOW CREATE, target definers, and runtime where permitted. Metadata alone is not runtime proof.
+### Azure MySQL Target
 
-## Tasks 1–3 — Core safety, FULL behavior, lifecycle
-
-| Task | Problem / root cause | Fix / implementation | Azure status |
-|---|---|---|---|
-| 1 | Cross-engine MySQL/MSSQL could fall back from `col.target_type` to source-native `col.source_type`. | `UnmappedTypeError` requires explicit mapping; same-engine MySQL stays native; CLI passes source-engine metadata. Generic Phase-0 error isolation, `stop_on_error`, and PostgreSQL WAL restart safety are not Azure MySQL features. | **PASS implementation; PARTIAL Azure type matrix** |
-| 2 | One object failure could stop unrelated work. | `stop_on_error` defaults false; per-object failures yield `partial_success`; true stops first failure. FULL uses DELETE and connection-scoped FK checks for known tables, then parent-before-child loading. | **PASS implementation; PARTIAL exhaustive Azure fault paths** |
-| 3 | Read transactions/unclosed connectors caused metadata locks/sleeping sessions; trigger DDL lacked reliable rollback. | Source autocommit; FULL/CDC/assessment rollback-and-close cleanup; failed trigger DDL rollback; no SUPER/PROCESS/manual termination. | **PASS; platform defect fixed, not Azure limitation** |
-
-## Tasks 4–6 — Tables, indexes, views
-
-| Task | Fix / implementation | Evidence / status |
-|---|---|---|
-| 4 | `INFORMATION_SCHEMA.PARTITIONS` preserves RANGE/RANGE COLUMNS/LIST/LIST COLUMNS/HASH/KEY, expressions, ordered names/bounds, MAXVALUE in CREATE TABLE. Opt-in `reconcile_target_schema` stages/verifies/swaps source-derived tables, retains `__dms_backup_*`, and blocks unmanaged inbound FKs. | Local `4c78ab8ea2724257a64fc2209dcfdb66`: 10 tables, 43/43 rows, three verified partitions. Azure FULL reports 3 partitions but no separate Azure partition runtime. **PASS implementation; PARTIAL Azure runtime**. |
-| 5 | `INDEX_TYPE` is retained in model/DDL/equivalence so FULLTEXT/SPATIAL work correctly. | Local metadata/runtime covered normal, unique, composite, FULLTEXT/SPATIAL, MATCH, POINT, ST_Within. Azure FULL reports 8 indexes; no Azure index runtime evidence. **PASS implementation/Local runtime; PARTIAL Azure runtime**. |
-| 6 | Rewrite only source-qualified references to migrated objects; never blindly rewrite literals/comments/external references. | Local target-local views/runtime verified. Azure `6b0407345782400f861be4927a409fd0` reports 2 views; no separate Azure view inspection/runtime. **PASS implementation/Local runtime; PARTIAL Azure runtime**. |
-
-## Tasks 7–8 — Routines, definers, triggers
-
-| Task | Problem / root cause | Fix / implementation | Azure status |
-|---|---|---|---|
-| 7 | Wrong SHOW CREATE field; missing `mysql_test@%` on Azure caused actual ERROR 1449. | Authoritative SHOW CREATE extraction; optional `routine_definer`, otherwise cached CURRENT_USER; narrow rewrite only of CREATE DEFINER for routines/triggers/Events, not body/literals/comments. | `6b0407345782400f861be4927a409fd0`: 2 functions/2 procedures, runtime and `mysql_admin@%` definers verified. **PASS** |
-| 8 | Lifecycle issue plus ERROR 1419 when binary logging ON and trust setting OFF. | DMS reports BLOCKED and never changes global setting/logging or grants SUPER. Administrator applied `SET PERSIST log_bin_trust_function_creators = ON;`; persistence verified. | Azure trigger metadata, SHOW CREATE, `mysql_admin@%`, INSERT/UPDATE runtime verified in `6b0407345782400f861be4927a409fd0`. **PASS after server-policy prerequisite** |
-
-## Task 9 — Events
-
-**Problem/root cause:** Late discovery captured only name plus SHOW CREATE; an enabled preserved one-time Event could fire and become DISABLED before capture.
-
-**Fix:** Immediately after connection, DMS snapshots DDL, EVENT_TYPE, STATUS, EXECUTE_AT, interval, STARTS, ENDS, ON_COMPLETION, TIME_ZONE, definer, and timestamp. Later creation reuses the snapshot. Default `migration.one_time_event_safety_lead_seconds=300`. Enabled one-time Events due/near-due at snapshot or target creation are `EVENT: BLOCKED` before DROP EVENT; same-name targets are untouched. Recurring state and safe target-definer rewriting remain preserved.
-
-| Evidence | Result |
+| Item | Value |
 |---|---|
-| `b1c3002060db4e7cae8759aa57ff7b56` | 2 Events migrated, 0 blocked/failed/errors. `evt_task9_recurring_enabled` source/target: RECURRING, ENABLED, EVERY 1 MINUTE, STARTS `2026-09-21 14:42:11`, no end, PRESERVE. Target SHOW CREATE retained action/schedule and `DEFINER=mysql_admin@%`. |
-| `c36d4e89a58a43acae41e10165649f2a` | 3 Events migrated, 0 blocked/failed/errors. `evt_task9_one_time_future` source/target: ONE TIME, ENABLED, EXECUTE_AT `2026-09-21 14:55:55`, PRESERVE. Target SHOW CREATE retained exact AT schedule/action/ENABLE/definer. |
-| Due/past observation | `evt_task9_one_time_due` was already DISABLED through MySQL before DMS observed it. This proves timing risk, not live proof of enabled-due DMS blocking; that path is unit tested. |
-| Scheduler | Azure `event_scheduler=OFF`: metadata/state is PASS; automatic target runtime is **BLOCKED / NOT EXECUTED**. STATUS=ENABLED is not scheduler ON. |
-| `740ba5585c394826acd9257260c3332e` | After source retained only `evt_migration_e2e_final`, Events migrated=1, blocked=0, failed=0. Target-only old Events remained intentionally: no managed-Event ownership registry exists, so FULL creates/replaces source-snapshot Events only and must not prune by name/prefix. |
+| Service | Azure Database for MySQL Flexible Server 8.4.7-azure (as recorded for the audit) |
+| Host | `mysql-mdm-migration-test.mysql.database.azure.com` |
+| Port | 3306 |
+| Database | `mysql_migration_target` |
+| Historical target user | `mysql_admin` (as recorded for the audit) |
+| Transport | TLS required for the tested target configuration |
 
-**Task 9 status:** **PASS** metadata/state/schedule; **BLOCKED / NOT EXECUTED** Azure runtime; **PASS** intentional target-only retention.
+The report JSON records MySQL on both ends, run mode, phases, counts, and outcome; it does not record endpoint identity or server version. The host/version/user attribution above comes from the audit's environment notes, not those JSON fields. Secrets are intentionally omitted.
 
-### Azure Event Scheduler Runtime Limitation
+**Configuration direction requires care.** In the current checkout, `config/mysql_local_test.yaml` points from Azure `mysql_migration_source` to local `mysql_migration_target`; it is Azure → Local and is not the reproduction config for this audit. `config/mysql_onpremise_cloud_test.yaml` points from `192.168.1.2` / `retail_customerdb` to the Azure target above. The historical `6b040...` report does not record its config path, so the repository cannot prove that the current config reproduces the historical source endpoint/database/user exactly.
 
-Event definition migration is **PASS**. Tested recurring Events retained their
-enabled state and schedules; future one-time Events retained `ENABLED` and their
-future `EXECUTE_AT`; and target-definer rewriting was verified. Azure automatic
-Event execution is **NOT VERIFIED / BLOCKED BY TARGET CONFIGURATION**.
+## 3. Test Fixture / Scope
 
-The Azure target reported `event_scheduler=OFF` through:
+The primary FULL report records 13 tables and 55 source rows, along with columns, primary keys, auto-increment attributes, indexes, unique and check constraints, foreign keys, generated columns, defaults, partitions, comments, views, routines, triggers, and an Event. It reports zero source grants, so security/grant migration was not exercised by this run. This is a description of this fixture, not a claim that every MySQL object variation is Azure-verified.
 
-```sql
-SHOW VARIABLES LIKE 'event_scheduler';
-```
+## 4. Audit Method
 
-An attempted `SET GLOBAL event_scheduler = ON;` returned `ERROR 1227 (42000)`:
-the current `mysql_admin` account lacks `SUPER` or `SYSTEM_VARIABLES_ADMIN`.
-This is a managed Azure server/configuration limitation, not a DMS Event
-migration defect. DMS must not silently enable `event_scheduler`; it is a
-server-level operational setting under Azure/server administrator control.
+1. Review the migration JSON/HTML report and JSONL phase log for run ID, mode, outcome, table rows, object counts, and validation results.
+2. Compare reported source and target row counts and inspect the report's partition test results.
+3. For selected Azure objects, inspect `INFORMATION_SCHEMA` and `SHOW CREATE` output; treat those checks separately from runtime checks.
+4. Record server-policy and connectivity blockers without changing Azure policy to manufacture a pass.
 
-`EVENT.STATUS=ENABLED` means the Event definition is enabled.
-`event_scheduler=ON` means the server scheduler is active. Both are required
-for automatic execution. Preserving Event `ENABLED` does not prove runtime.
+The primary artifact reports FULL table clearing/loading for the configured 13-table set, count validation for every table, and matching counts. It does not assert that every target object outside that managed set is deleted.
 
-#### Future test / environment prerequisite
+## 5. Local → Azure E2E Results
 
-Before runtime testing, verify whether this Azure MySQL Flexible Server/version
-exposes `event_scheduler` as a supported configurable server parameter in the
-actual Azure administration interface. Do not assume a Portal path or that every
-server/version exposes it. If it is supported and requires an Azure
-administrator, have that administrator enable it through Azure/server
-configuration; do not grant arbitrary `SUPER` or `SYSTEM_VARIABLES_ADMIN` to
-`mysql_admin` merely for this test. Reconnect and verify:
+**Primary FULL run:** [`6b0407345782400f861be4927a409fd0`](../../reports/6b0407345782400f861be4927a409fd0.json)
 
-```sql
-SHOW VARIABLES LIKE 'event_scheduler';
-```
+| Measure | Reported result |
+|---|---:|
+| Mode / status | `full` / `success` |
+| Duration | 43.34 seconds |
+| Tables | 13 migrated; 0 failed |
+| Rows | 55 source rows; 55 migrated; 0 failed |
+| Count validation | All 13 table counts matched |
+| Views | 2 migrated |
+| Functions / procedures | 2 / 2 migrated |
+| Triggers / Events | 2 / 1 migrated |
+| Indexes / partitions | 8 / 3 migrated |
+| Other reported categories | 84 columns, 13 primary keys, 11 auto-increment attributes, 3 unique constraints, 2 foreign keys, 4 check constraints, 2 generated columns, 15 defaults, 8 comments |
 
-Expected result: `ON`. Then run a controlled future-scheduled Event and verify
-its target-database side effect, recording the result/date in this audit.
+The JSON report marks partition testing PASS for `tbl_partition_test`: RANGE method, expression `year(created_at)`, three partitions with matching source/target structure and three rows. The JSONL log independently records successful connection roles for source and target and the phases for table clearing/loading. The report's SUCCESS is evidence for this run and fixture, not universal compatibility or runtime proof for all objects.
 
-| Condition | Meaning | Action |
+## 6. Object / Capability Verification
+
+| Capability | Local implementation / runtime evidence | Azure evidence and boundary |
 |---|---|---|
-| `event_scheduler=OFF` | Server scheduler inactive | Azure administrator must enable supported server configuration before runtime test. |
-| `SET GLOBAL ... = ON` returns ERROR 1227 | Current account lacks required privilege | Do not grant arbitrary SUPER; use Azure/server administration. |
-| Event `STATUS=ENABLED` + scheduler OFF | Definition enabled, scheduler inactive | Migration is not necessarily faulty; runtime cannot execute/verify. |
-| Event `STATUS=ENABLED` + scheduler ON | Runtime can be tested | Run controlled scheduled-Event test. |
+| Tables and data | FULL load and count validation implemented | 13 tables / 55 rows; all table counts match in primary report |
+| Partitions | Metadata is read from `INFORMATION_SCHEMA.PARTITIONS`; implementation preserves partition method, expression, names, and bounds | Primary report records 3 partitions and a PASS source/target partition signature check for one table; broader partition runtime coverage is not established |
+| Indexes | Index type and definitions are preserved by the MySQL connector | 8 reported migrated in Azure; report counts do not establish index query behavior; runtime coverage is narrower than local |
+| Views | Selective source-qualifier rewriting is implemented | 2 reported created; broader Azure view runtime coverage is not established |
+| Functions / procedures | SHOW CREATE extraction and definer handling are implemented | 2 of each reported migrated; selected Azure runtime checks were recorded for the tested fixture only |
+| Triggers | Trigger definitions are captured and recreated around FULL data loading | 2 reported migrated; selected Azure INSERT/UPDATE behavior was checked; this does not cover every trigger configuration |
+| Events | Event metadata snapshot and safe definition recreation are implemented | Primary run reports 1; separate runs below verify selected definition/state/schedule properties. Automatic Azure execution is blocked/unverified |
+| Cross-engine type safety | Explicit target mapping is required; unmapped cross-engine types raise `UnmappedTypeError`, with no unsafe source-native fallback | **Implementation: PASS. Azure type-matrix coverage: PARTIAL.** The primary same-engine MySQL run is not broad cross-engine type evidence |
+| Error isolation | `migration.stop_on_error` defaults to false; object failures are recorded and eligible independent work can continue with partial success. Setting it true enables fail-fast behavior | **Implementation: PASS. Exhaustive Azure fault-path coverage: PARTIAL.** |
+| FULL target handling | Clears/loads the configured migrated table set using the implemented FK-aware process | Primary report lists the 13 cleared tables. FULL does not blindly prune unmanaged target-only objects; Events have no ownership registry and target-only Events are intentionally retained |
 
-#### Future verification checklist
+### Additional Event-specific Local → Azure Evidence
 
-- [ ] Confirm Azure supports/configures `event_scheduler` for this server/version.
-- [ ] Enable it through Azure/server administration.
-- [ ] Reconnect to MySQL.
-- [ ] Verify `SHOW VARIABLES LIKE 'event_scheduler'` returns `ON`.
-- [ ] Verify a recurring migrated Event is `STATUS=ENABLED`.
-- [ ] Verify its scheduled side effect occurs.
-- [ ] Record runtime evidence.
-- [ ] Restore/disable scheduler only if test-environment policy requires it.
+These are separate FULL runs focused on Event definitions; they are not additional counts for the primary run.
 
-## Cross-cutting Cloud issues and run history
+| Run ID | Report result | Separate target evidence recorded |
+|---|---|---|
+| [`b1c3002060db4e7cae8759aa57ff7b56`](../../reports/b1c3002060db4e7cae8759aa57ff7b56.json) | Success; 2 Events reported migrated; 0 blocked/failed | Recurring Event definition, enabled state, schedule, and rewritten `DEFINER=mysql_admin@%` inspected with target metadata / `SHOW CREATE` |
+| [`c36d4e89a58a43acae41e10165649f2a`](../../reports/c36d4e89a58a43acae41e10165649f2a.json) | Success; 3 Events reported migrated; 0 blocked/failed | Future one-time Event's `EXECUTE_AT`, enabled state, and definition inspected on target |
+| [`740ba5585c394826acd9257260c3332e`](../../reports/740ba5585c394826acd9257260c3332e.json) | Success; 1 Event reported migrated | A source Event replacement was recorded; older target-only Events remained, as intended without a managed-Event ownership registry |
 
-| Item | Classification / outcome |
-|---|---|
-| `4948680233ce49c8bbf696fcc8fae643` | Environment failure: Azure timeout 10060 after laptop restart. Later port-3306 test and TLS-required MySQL CLI succeeded. |
-| `6b0407345782400f861be4927a409fd0` | FULL PASS: 13 tables, 55 rows, 0 failed/errors, 2 functions, 2 procedures, 2 triggers, 1 Event, 8 indexes, 3 partitions, 2 views. |
-| TLS / target privilege | Environment/configuration: TLS required; required object privileges only, no broad administration claim. |
-| Definer difference | Migration defect fixed: Error 1449 resolved by narrow rewrite to `mysql_admin@%`. |
-| Error 1419 | Server policy: administrator SET PERSIST; DMS does not auto-remediate global policy or use SUPER. |
-| Jenkins port 8080 | Local tooling issue: Jenkins interfered with UI/report server; strict port-8080 behavior replaced random fallback. |
+The reports support the Event counts and successful migration outcome. The definition/state/schedule observations are separate inspection evidence in the audit record, not fields proven by report counts alone. A due one-time Event observed already disabled on the source demonstrates the timing risk; it is not live proof of DMS blocking an enabled due Event.
 
-## Evidence, limits, and reproduction
+## 7. MySQL-Specific Azure Findings
 
-## Users and direct permissions
+### Definer Handling
 
-Current MySQL security migration scope contains user accounts and direct
-permissions. Passwords, hashes, authentication secrets, role-derived grants,
-and proxy permissions are not migrated. Global permissions require explicit
-user selection and a supported privilege subset. Validate the result against
-the exact report and connector version used for a run; older Task 13 evidence
-below this heading has been superseded by this implementation.
+An Azure Error 1449 exposed a missing source definer account on the target. The implementation now takes the authoritative definition from `SHOW CREATE`, supports optional `routine_definer`, and otherwise uses the cached target `CURRENT_USER`. It narrowly rewrites the `CREATE DEFINER` clause for routines, triggers, and Events; it does not rewrite routine bodies, literals, comments, or unrelated references. For the tested fixture, `mysql_admin@%` and selected target runtime behavior were verified. Definer compatibility is verified for that fixture only, not every security configuration.
 
-```sql
-SELECT EVENT_NAME, EVENT_TYPE, STATUS, EXECUTE_AT, INTERVAL_VALUE,
-       INTERVAL_FIELD, STARTS, ENDS, ON_COMPLETION
-FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = '<database>';
-SHOW CREATE EVENT <event_name>;
-SHOW CREATE TRIGGER <trigger_name>;
-SHOW CREATE FUNCTION <function_name>;
-SHOW CREATE PROCEDURE <procedure_name>;
-SHOW VARIABLES LIKE 'event_scheduler';
-```
+### Error 1419 / Binary Logging
 
-No secrets are documented and no Azure target object was manually created, altered, or deleted to make a result pass. Azure Event automatic runtime remains **NOT VERIFIED / BLOCKED BY TARGET CONFIGURATION** while `event_scheduler=OFF`; the current `mysql_admin` account received ERROR 1227 when attempting `SET GLOBAL event_scheduler = ON`. Azure runtime evidence is narrower than Local→Local for indexes/views/partitions/recurring Events. Function/trigger creation depends on server policy. FULL does not delete unknown target-only Events.
+When `log_bin=ON` and `log_bin_trust_function_creators=OFF`, MySQL can reject function or trigger creation with Error 1419. An administrator applied `SET PERSIST log_bin_trust_function_creators = ON` and verified persistence for the recorded Azure test. This is an environment/server-policy prerequisite: DMS does not change it, grant `SUPER`, or disable binary logging. The platform reports the blocked condition with remediation guidance.
 
-To reproduce: provide configured secrets without documenting them, confirm Azure TLS/network access to port 3306, run the command above, inspect reports plus source/target metadata and SHOW CREATE, and do not alter scheduler/global settings or prune target-only Events.
+### Events / Event Scheduler
+
+| Area | Status | Evidence / interpretation |
+|---|---|---|
+| Event definition and selected state/schedule preservation | **PASS for tested cases** | Primary report and separate Event-specific runs; selected target metadata and `SHOW CREATE` were inspected |
+| Azure automatic Event runtime | **NOT VERIFIED / BLOCKED BY TARGET CONFIGURATION** | Azure reported `event_scheduler=OFF`; preserving `STATUS=ENABLED` does not start the server scheduler |
+| Scheduler enable attempt | **Blocked** | `SET GLOBAL event_scheduler = ON` returned Error 1227 for the tested account, which lacked the required administrative privilege |
+| Target-only Event handling | **Intentional retention** | Without a managed-Event ownership registry, FULL replaces source-snapshot Events and does not prune unknown target-only Events |
+
+Do not grant arbitrary `SUPER` or `SYSTEM_VARIABLES_ADMIN` to make this test pass. If Event runtime must be tested, an Azure/server administrator must first confirm that the service/version exposes a supported configuration path, enable it under environment policy, and verify `SHOW VARIABLES LIKE 'event_scheduler'` returns `ON`. Then verify a controlled scheduled side effect separately from migration metadata.
+
+### TLS / Connectivity
+
+The tested Azure configuration requires TLS on port 3306. Run `4948680233ce49c8bbf696fcc8fae643` failed before migration with MySQL connection timeout 10060 after a laptop restart. Later port-3306 connectivity and a TLS-required MySQL CLI connection succeeded. This is recorded as a network/environment event, not evidence of a migration implementation defect.
+
+## 8. Cloud-Specific Limitations
+
+- Azure runtime evidence is narrower than local runtime coverage for indexes, views, partitions, and recurring Events. Azure migration counts or metadata inspection do not establish query behavior or scheduled execution.
+- Event execution could not be verified while the Azure server scheduler was OFF and the test account could not enable it.
+- Routine and trigger creation depends on Azure binary-logging policy and compatible definers. Error 1419 and Error 1449 are environment/target compatibility conditions that the platform must report; this audit does not claim they are automatically remediated in every server.
+- The primary report has zero source grants. It does not establish Azure user/grant migration behavior.
+- The historical primary report does not record its config path or endpoint details, and the current `mysql_local_test.yaml` is reverse-direction. Reproduction must use a verified Local → Azure config and record its actual source/target details with the run.
+
+## 9. Cross-Cutting Issues / Run History
+
+| Finding | Status | Evidence / interpretation |
+|---|---|---|
+| Primary Local → Azure FULL | **PASS for recorded fixture** | Run `6b040...`: 13 tables, 55 rows, reported object counts, zero failed categories; report status success |
+| Event-specific migrations | **PASS for tested definitions** | Runs `b1c300...` and `c36d4...`; definition/state/schedule inspection is separate from count evidence |
+| Error 1419 | **Environment/server policy** | Administrator persisted `log_bin_trust_function_creators=ON`; DMS does not change global policy |
+| Error 1449 / DEFINER | **Compatibility fix; tested fixture verified** | Narrow `CREATE DEFINER` rewrite to the tested target account, with selected runtime checks |
+| Event scheduler OFF / Error 1227 | **Blocked by target configuration** | Event automatic execution not verified; no arbitrary privilege grant recommended |
+| Timeout 10060 | **Network/environment event** | Failed connect phase; later port and TLS CLI checks succeeded |
+| Type mapping and error isolation | **Implementation PASS; Azure coverage partial** | Implementation behavior is distinct from exhaustive cloud fault/type testing |
+| Target-only Events | **Intentionally retained** | No ownership registry exists to distinguish DMS-managed Events from unrelated target Events |
+
+## 10. Final Assessment
+
+The documented Local → Azure FULL path was successfully exercised for the recorded fixture: 13 tables and 55 rows migrated with matching table counts and zero reported failures, alongside reported migration of selected MySQL object categories. The repository report verifies outcome and counts; separate inspection supports selected Azure metadata and runtime claims. Several capabilities have stronger local runtime coverage than Azure runtime evidence, and automatic Event execution remains blocked by target configuration. This audit does not claim universal MySQL object compatibility or production readiness.
+
+## 11. Reproduction
+
+1. Verify the local MySQL source and the Azure MySQL Flexible Server target, including database names and account privileges.
+2. Select a configuration whose `source` is Local MySQL and `target` is Azure MySQL. In the current checkout, `config/mysql_onpremise_cloud_test.yaml` has that direction, but its source values are `192.168.1.2` / `retail_customerdb` / `eds_remote`; adjust only in your local working configuration if your intended fixture differs. Do not use `config/mysql_local_test.yaml` for Local → Azure; it is Azure → Local.
+3. Supply configured secrets through the environment; do not put secret values in this document or commit them.
+4. Confirm network access to Azure port 3306 and TLS. Check target privileges and the Error 1419 prerequisite if routines/triggers are in scope.
+5. Run the selected verified Local → Azure config, for example:
+
+   ```powershell
+   python -m migration_platform `
+     --config config\mysql_onpremise_cloud_test.yaml `
+     --mode full
+   ```
+
+6. Record the generated run ID; inspect its JSON, HTML, and JSONL artifacts. Compare source/target row counts and object counts, and use `SHOW CREATE` / `INFORMATION_SCHEMA` for selected objects.
+7. Where applicable, test functions, procedures, and triggers with controlled calls/DML. Check Event definition/state and scheduler state separately; do not treat `STATUS=ENABLED` as proof that the scheduler executes Events.
+8. Do not change Azure server policy solely to manufacture a passing result. If an administrator-supported setting is changed under environment policy, record it as a prerequisite and separately verify the resulting behavior.
+
+## 12. References
+
+- [Local MySQL audit](MYSQL_LOCAL_AUDIT.md)
+- [MySQL limitations](MYSQL_LIMITATIONS.md)
+- [MySQL object support matrix](MYSQL_OBJECT_SUPPORT_MATRIX.md)
+- [MySQL test guide](MYSQL_TEST_GUIDE.md)
+- [MySQL E2E runbook](MYSQL_E2E_RUNBOOK.md)
+- [MySQL migration flow](MYSQL_MIGRATION_FLOW.md)
+- Current Local → Azure config: `config/mysql_onpremise_cloud_test.yaml`
+- Current reverse-direction config: `config/mysql_local_test.yaml`

@@ -5,7 +5,7 @@ source:
     port: 3306
     database: mysql_migration_source
     username: mysql_test
-    password_secret: mysql_source_pass
+    password_secret: mysql-source-password
     ssl: true
 
 target:
@@ -15,7 +15,7 @@ target:
     port: 3306
     database: mysql_migration_target
     username: mysql_admin
-    password_secret: mysql_target_pass
+    password_secret: mysql-target-password
     ssl: true
 
 migration:
@@ -29,7 +29,9 @@ retry:
   max_delay_seconds: 30.0
 
 secrets:
-  provider: env
+  provider: azure_keyvault
+  azure_keyvault:
+    url: https://mdm-migration-kv.vault.azure.net/
 
 alerting:
   notifier: none
@@ -40,3 +42,4 @@ validation:
 
 logging:
   level: INFO
+  

@@ -1,320 +1,143 @@
 # MySQL Object Support Matrix
 
-Latest Local → Local evidence is based on the completed MySQL migration and
-supporting object-level validation runs. This matrix describes actual DMS
-platform support and verification status; MySQL engine capability alone does
-not imply that the DMS supports the object.
+Quick reference for MySQL migration capabilities and the evidence available in this repository. Directional status refers only to the cited run/dataset; it is not a guarantee for every object variation or server configuration.
 
-## Classification keys
-
-| Class | Meaning |
-|---|---|
-| **Supported / Verified** | Object migrates end-to-end and was verified on the target |
-| **Partial** | Object is supported with documented constraints or environment dependencies |
-| **Out of Scope** | Object is intentionally not supported by the current DMS implementation |
-| **Environment Blocked** | Implementation exists, but live verification is blocked by environment, privileges, or server policy |
-| **N/A** | MySQL has no native equivalent or the concept does not apply directly |
-
-## E2E Validation Status Key
+## Classification
 
 | Status | Meaning |
 |---|---|
-| **Local → Local** | Verified in MySQL Local → Local migration |
-| **Unit tested** | Implementation behavior verified through automated tests, but not necessarily through a live E2E run |
-| **Environment Blocked** | Verification depends on server privilege/configuration that is unavailable |
-| **Not E2E tested** | Implementation exists or is understood, but no live E2E evidence is recorded |
-| **N/A** | Native MySQL equivalent does not exist |
+| **Supported / Verified** | Implemented and exercised in the cited E2E scenario. |
+| **Supported / Partial** | Implemented, with known scope or behavior limits. |
+| **Implemented / Not E2E tested** | Implementation or focused tests exist; direction-specific E2E evidence is absent. |
+| **Not Exercised** | The cited source dataset had no such object or did not exercise the behavior. |
+| **Environment Dependent** | Requires privileges, metadata visibility, server policy, or configuration. |
+| **Out of Scope / N/A** | Intentionally excluded or no direct native MySQL equivalent. |
 
----
+“Not Exercised” and “Environment Dependent” do not mean unsupported or failed.
 
-## Databases / Schema Mapping
+## Evidence Direction Key
 
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| MySQL database | **Supported / Verified** | Local → Local | Source and target databases are explicitly mapped by migration configuration |
-| PostgreSQL-style schema | **N/A** | N/A | MySQL databases are the closest namespace concept; PostgreSQL schema semantics are not reproduced as a separate MySQL object |
-| Cross-database object references | **Supported / Verified** | Local → Local | MySQL database-qualified references are handled where the referenced object is part of the migration set |
-| External/unmanaged database references | **Partial** | Not exhaustively E2E tested | References to objects outside the managed migration scope are not rewritten into unrelated target objects |
+| Direction | Configured scenario / evidence |
+|---|---|
+| **Local → Local** | The local audit documents a historical broad run (11 tables, 44/44 rows). A checked-in report, `1584f5a5ebc04e8a8d9e288ee150b23c`, records a separate MySQL → MySQL run (5 tables, 5,710/5,710 rows); most object categories in that dataset had source count 0. The historical broad run's report artifact is not in the current reports directory. |
+| **Local → Cloud** | `config/mysql_onpremise_cloud_test.yaml`; run `9f15eae2f1a84933a7ffe9746b828932`. |
+| **Cloud → Local** | `config/mysql_local_test.yaml`; run `fb374e4480d84894b22d5917807b507f`. |
 
----
+## 1. Databases / Namespace
 
-## Tables
+| Object / capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| Target database selection/creation | Supported / Verified | Verified in checked-in report | Verified in run | Verified in run | MySQL database is the object namespace. Existing config names and target provisioning must be checked for each environment. |
+| PostgreSQL-style schemas | Out of Scope / N/A | N/A | N/A | N/A | MySQL databases are not PostgreSQL schemas; `include_schemas` is not the MySQL namespace mapping mechanism. |
 
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| `CREATE TABLE` | **Supported / Verified** | Local → Local | Tables created and populated successfully |
-| Existing target table | **Supported / Verified** | Local → Local | Existing compatible structures can be reused |
-| Target schema reconciliation | **Supported / Verified** | Local → Local | Controlled by `migration.reconcile_target_schema`; incompatible partitioned structures are replaced using source-derived DDL |
-| `IF NOT EXISTS` behavior | **Supported / Verified** | Unit / Local → Local | Object creation handles existing objects without uncontrolled duplicate creation |
-| Table columns | **Supported / Verified** | Local → Local | Column metadata preserved |
-| `NOT NULL` | **Supported / Verified** | Local → Local | Nullability preserved |
-| Primary key | **Supported / Verified** | Local → Local | Primary keys verified on target |
-| Foreign key | **Supported / Verified** | Local → Local | FK metadata and rejection behavior verified |
-| Cross-database foreign key | **Supported / Verified** | Local → Local | MySQL cross-database FK enforcement verified with valid and invalid inserts |
-| UNIQUE constraint | **Supported / Verified** | Local → Local | Duplicate-value rejection verified |
-| CHECK constraint | **Supported / Verified** | Local → Local | Invalid values rejected by target |
-| Defaults | **Supported / Verified** | Local → Local | Default expressions/values preserved and verified |
-| `AUTO_INCREMENT` | **Supported / Verified** | Local → Local | Counter synchronization performed after data load |
-| Generated columns | **Supported / Verified** | Local → Local | Generated expression and stored/generated behavior preserved |
-| Table comments | **Supported / Verified** | Local → Local | Source table comments emitted and verified |
-| Column comments | **Supported / Verified** | Local → Local | Source column comments emitted and verified |
+## 2. Tables / Columns
 
----
+| Object / capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| Tables and row data | Supported / Verified | 5 tables / 5,710 rows in report `1584…`; historical broad audit 11 / 44 | 6 / 6,340 | 13 / 45 | All cited runs report successful migration and zero failed rows. The different fixtures are not directly comparable. |
+| Columns and MySQL data types | Supported / Partial | 73 columns in report `1584…`; representative datatype audit | 66 columns | 65 columns | Data-type coverage is representative, not exhaustive. See `tests/unit/test_mysql_datatypes.py`. |
+| NULL / NOT NULL, defaults | Supported / Verified | Defaults not exercised in report `1584…`; covered by historical audit | Not exercised in this run | 13 defaults in run | Preserve source behavior where the type/definition is supported. |
+| Primary keys | Supported / Verified | 5 in report `1584…` | 6 | 13 | Counts are direction-specific. |
+| UNIQUE constraints / indexes | Supported / Verified | Not exercised in report `1584…`; historical audit coverage | Not exercised in this run | 3 unique constraints | See audit/support details for local functional checks. |
+| CHECK constraints | Supported / Verified | Not exercised in report `1584…`; historical audit coverage | Not exercised in this run | 6 | Constraint rejection is also covered by local audit evidence. |
+| Foreign keys | Supported / Verified | Not exercised in report `1584…`; cross-database case documented in local audit | Not exercised in this run | 3 | Complex/circular cross-database graphs are not exhaustively validated. |
+| `AUTO_INCREMENT` | Supported / Verified | Not exercised in report `1584…`; historical audit coverage | Not exercised in this run | 9 | MySQL-native auto-increment metadata/state, not MSSQL IDENTITY. |
+| Generated columns | Supported / Verified | Not exercised in report `1584…`; historical audit coverage | Not exercised in this run | 2 | Generated values are recalculated by MySQL, not inserted as ordinary values. |
+| Representative datatype fixture / SET values | Supported / Partial | Datatype-specific validation documented | Not exercised in cloud run | Dataset-specific | `SET` collection values are normalized by connector; focused unit tests exist. No claim of exhaustive datatype coverage. |
 
-## Table Data
+## 3. Indexes / Partitions
 
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Row data migration | **Supported / Verified** | Local → Local | Latest successful run migrated 44/44 rows |
-| Row count validation | **Supported / Verified** | Local → Local | Source and target row counts compared |
-| Data value validation | **Supported / Verified** | Local → Local | Representative source/target values verified |
-| Binary value preservation | **Supported / Verified** | Local → Local | HEX-based validation included in datatype testing |
-| Full-mode target data clearing | **Supported / Verified** | Local → Local | Existing migrated target tables are cleared deterministically before reload |
-| Parent-before-child data loading | **Supported / Verified** | Local → Local | Topological ordering allows FK enforcement to remain enabled |
-| Object-level failure isolation | **Supported / Verified** | Unit / Local → Local | Independent object failures are recorded without unnecessarily stopping the full migration |
+| Object / capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| Secondary, unique, composite indexes | Supported / Verified | Historical audit; not exercised in report `1584…` | Not exercised in this run | 13 indexes reported | Index variants should be checked against the actual source fixture. |
+| MySQL partition definitions | Supported / Partial | RANGE/YEAR scenario and reconciliation documented in local audit | Not exercised in this run | 14 partitions reported | Connector handles RANGE, RANGE COLUMNS, LIST, LIST COLUMNS, HASH, and KEY; live audit coverage is narrower than implementation scope. |
+| Target schema reconciliation | Supported / Partial | Tested for a supported partition mismatch | Not exercised in this run | Not exercised in this run | Opt-in `migration.reconcile_target_schema`; not a general repair facility. A clean target is preferred for normal E2E. |
 
----
+## 4. Views / Stored Routines
 
-## Representative MySQL Data Types
+| Object / capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| Views | Supported / Verified | Historical local audit; 0 in report `1584…` | Not exercised in this run | 2 | Source database qualifiers are rewritten for migrated dependencies only; arbitrary SQL/external references are not rewritten. |
+| Stored functions | Supported / Environment Dependent | Historical local audit; 0 in report `1584…` | Not exercised in this run | 2 definitions migrated | Creation/runtime depends on target privileges and binary-log policy. |
+| Stored procedures | Supported / Verified | Historical local audit; 0 in report `1584…` | Not exercised in this run | 2 definitions migrated | Runtime should be tested separately from metadata creation. |
+| `DEFINER` handling | Supported / Partial | Unit and audit evidence | Not exercised in this run | Present in routine/event coverage | MySQL-to-MySQL config preserves compatible source definers when possible; fallback/override behavior and privileges are configuration/environment dependent. Exact identity preservation is not unconditional. |
 
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Integer types | **Supported / Verified** | Local → Local | `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`, `BIGINT` including unsigned representation tested |
-| Fixed/precision numeric types | **Supported / Verified** | Local → Local | `DECIMAL` / `NUMERIC` tested |
-| Floating-point types | **Supported / Verified** | Local → Local | `FLOAT`, `DOUBLE` tested |
-| Character types | **Supported / Verified** | Local → Local | `CHAR`, `VARCHAR`, `TEXT`, `MEDIUMTEXT`, `LONGTEXT` tested |
-| Binary types | **Supported / Verified** | Local → Local | `BINARY`, `VARBINARY`, `BLOB`, `MEDIUMBLOB`, `LONGBLOB` tested |
-| Date/time types | **Supported / Verified** | Local → Local | `DATE`, `TIME`, `DATETIME(6)`, `TIMESTAMP(6)`, `YEAR` tested |
-| Boolean aliases | **Supported / Verified** | Local → Local | `BOOLEAN` / `BOOL` tested |
-| JSON | **Supported / Verified** | Local → Local | JSON type included in representative datatype fixture |
-| ENUM | **Supported / Verified** | Local → Local | Included in representative 31-column datatype fixture |
-| SET | **Supported / Verified** | Local → Local | SET values normalized to declared member order before target insert |
-| Representative datatype fixture | **Supported / Verified** | Local → Local | 31-column fixture; source/target metadata and values verified |
+## 5. Triggers / Events
 
----
+| Object / capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| Triggers | Supported / Environment Dependent | Historical local audit (2); 0 in report `1584…` | Not exercised in this run | 2 | DDL/metadata and runtime evidence exist for cited fixtures; creation may be blocked by target server policy. |
+| Event DDL / metadata | Supported / Partial | Historical local audit; 0 in report `1584…` | Event metadata in Azure audit, direction-specific run categories vary | 2 in run | Definition migration is distinct from scheduler-driven execution. |
+| Recurring event schedule/state | Supported / Partial | Fixture-specific local evidence | Metadata/state checked in Azure audit | Included in event evidence | Do not infer automatic runtime from `STATUS=ENABLED`. |
+| Enabled one-time event safety window | Supported / Unit tested | Not counted as broad E2E | Not E2E verified for all schedules | Unit tests cover due/near-event blocking | Default safety lead is 300 seconds; unsafe events are blocked rather than silently shifted/enabled. |
+| Event Scheduler runtime | Environment Dependent | Depends on server state | Blocked/not executed in documented Azure environment (`event_scheduler=OFF`) | Depends on local target state | Runtime also depends on timing, definer, and privileges. |
+| Target-only events in FULL mode | Supported / Verified behavior | Unit tested | Azure audit observed retention | Unit tested behavior | FULL replaces applicable source events but does not prune unrelated target-only events. |
+| Function/trigger Error 1419 policy | Environment Dependent | Local audit required approved policy | Azure target privileges/policy apply | Target policy applies | If `log_bin=ON` and `log_bin_trust_function_creators=OFF`, MySQL may reject creation. DMS does not change the global setting. |
 
-## Indexes
+## 6. Comments / Metadata
 
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Secondary index | **Supported / Verified** | Local → Local | Index metadata verified |
-| Unique index | **Supported / Verified** | Local → Local | Unique index creation and duplicate rejection verified |
-| Composite index | **Supported / Verified** | Local → Local | Composite index metadata verified |
-| Index ordering / columns | **Supported / Verified** | Local → Local | Target index definitions compared with source |
-| Indexes after data load | **Supported / Verified** | Local → Local | Indexes created as part of post-load constraint/index phases |
+| Object / capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| Table and column comments | Supported / Verified | Historical local audit; 0 in report `1584…` | Not exercised in this run | 17 comment records | Other comment/metadata locations are not established by this coverage. |
 
----
+## 7. Users / Grants / Security Principals
 
-## Views
+| Object / capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| User/account identity | Supported / Partial | 3 principals in report `1584…`; historical audit | 3 principals | 12 principals | Locked accounts are filtered; target authentication passwords/secrets are not migrated. |
+| Table/database/column grants | Supported / Environment Dependent | Historical audit; report `1584…` has 0 grants | 18 grants | 1 grant | Migration account must see source grant metadata; target account must have permission and grantee prerequisites may apply. |
+| Routine `EXECUTE` privileges | Partial / Environment Dependent | Not exercised in report `1584…` | Not exercised in this run | Not separately established by count | Discovery depends on `INFORMATION_SCHEMA.ROUTINE_PRIVILEGES` visibility. |
+| Global direct privileges | Partial / Environment Dependent | User-selection dependent | User-selection dependent | User-selection dependent | Limited to explicitly selected accounts and supported privilege subset. No password/role-derived privilege migration claim. |
 
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Standard view | **Supported / Verified** | Local → Local | Target view created and queried successfully |
-| Schema/database-qualified view | **Supported / Verified** | Local → Local | MySQL database qualification handled |
-| Source → target namespace rewrite | **Supported / Verified** | Local → Local | References to migrated source objects are rewritten to target-local database |
-| View functional execution | **Supported / Verified** | Local → Local | Target view executed successfully against migrated target tables |
-| External/unmanaged view dependency | **Partial** | Not exhaustively E2E tested | Only migrated source dependencies are rewritten; unmanaged external dependencies remain external |
+## 8. Validation / Reporting / Operational Controls
 
----
+| Capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| Count validation and reports | Supported / Verified | Count validation in report `1584…` | Run report; 0 failed | Run report; 0 failed | Reports include run status, object counts, row counts, and validation results. |
+| Per-object error isolation | Supported / Unit tested | Partial-success path covered by MySQL unit tests | Run had 0 failed; isolation not fault-injected | Run had 0 failed; isolation not fault-injected | Default `migration.stop_on_error: false`; a failed object can be recorded while independent work continues. |
+| `stop_on_error: true` | Supported / Unit tested | E2E fault behavior not established | Not exercised | Not exercised | Fail-fast policy is configurable. Unit-tested behavior is not direction-specific E2E evidence. |
+| Partial-success reporting | Supported / Unit tested | Partial result path tested | No partial result in cited run | No partial result in cited run | Actual direction runs completed successfully; they do not prove fault-path behavior. |
+| Source connector cleanup | Supported / Implemented and tested | Local audit records lifecycle fix | Shared MySQL code path | Shared MySQL code path | Autocommit and rollback/close cleanup are implemented; this is not a claim of exhaustive soak testing. |
+| MySQL CDC / continuous mode | Implemented / Not E2E tested | Not E2E tested | Not E2E tested | Not E2E tested | FULL migration success does not verify CDC, continuous mode, or incremental INSERT/UPDATE/DELETE replication. |
 
-## Procedures
+## 9. Cross-Engine Type Safety
 
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Stored procedure | **Supported / Verified** | Local → Local | Procedure DDL migrated |
-| Procedure DDL extraction | **Supported / Verified** | Local → Local | Authoritative `SHOW CREATE` definition used |
-| Procedure runtime execution | **Supported / Verified** | Local → Local | Procedure executed successfully on target |
-| Procedure parameter handling | **Supported / Verified** | Local → Local | Tested procedure executed with expected input |
-| Procedure grants | **Partial** | Unit tested / Environment dependent | `ROUTINE_PRIVILEGES` visibility and existing target grantee are required |
+| Capability | Support | Local → Local | Local → Cloud | Cloud → Local | Evidence / Notes |
+|---|---|---|---|---|---|
+| Same-engine MySQL type preservation | Supported / Verified | MySQL→MySQL report and datatype tests | MySQL→MySQL run | MySQL→MySQL run | Native MySQL types are retained where the mapping path permits. |
+| Explicit cross-engine type mappings | Supported / Partial | Not applicable | Not applicable | Not applicable | Cross-engine path uses configured/implemented target mappings; each required type must be mapped. |
+| Unmapped/unknown cross-engine type | Safety guard / Unit tested | Not applicable | Not applicable | Not applicable | Raises `UnmappedTypeError`; prevents unsafe source-native type passthrough. Does not imply every type has a mapping. |
 
----
+## 10. Out of Scope / Native MySQL Limitations
 
-## Functions
-
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Stored function | **Supported / Verified** | Local → Local | Function migrated and executed successfully after server policy remediation |
-| Function DDL extraction | **Supported / Verified** | Local → Local | Authoritative `SHOW CREATE` definition used |
-| Function runtime execution | **Supported / Verified** | Local → Local | `fn_get_active_customer_count()` returned expected result |
-| Function under binary logging policy | **Partial / Environment dependent** | Environment dependent | With `log_bin_trust_function_creators=OFF`, MySQL may reject creation with Error 1419 |
-| Function `EXECUTE` grants | **Partial** | Unit tested / Environment dependent | Requires accessible `ROUTINE_PRIVILEGES` metadata and existing target grantee |
-
----
-
-## Triggers
-
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| `CREATE TRIGGER` | **Supported / Verified** | Local → Local | Trigger migrated and attached to target table |
-| Trigger runtime behavior | **Supported / Verified** | Local → Local | Target insert/update behavior verified |
-| Trigger dependency on migrated table | **Supported / Verified** | Local → Local | Trigger created after required table/object dependencies |
-| Trigger under binary logging policy | **Partial / Environment dependent** | Environment dependent | Error 1419 can block creation when `log_bin_trust_function_creators=OFF` |
-| Trigger enabled/disabled state | **Partial** | Local → Local | Creation state is preserved as supported by MySQL DDL; broader state-management scenarios are not separately exhaustively tested |
-| Trigger connection lifecycle | **Supported / Verified** | Local → Local | Source read connections use autocommit and cleanup to avoid stale/sleeping connection issues |
-
----
-
-## Events
-
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| `CREATE EVENT` | **Supported / Verified** | Local → Local; Azure metadata evidence | Source Event DDL is snapshotted at migration start and created on target |
-| Event definition | **Supported / Verified** | Local → Local; Azure recurring evidence | Authoritative `SHOW CREATE EVENT` DDL is replayed with target definer rewriting |
-| Event status / recurring schedule | **Supported / Verified** | Azure run `474f0d5157784c4d9bdf8d25f35d9523` | `ENABLED`, `EVERY`, `STARTS`, `ENDS`, and `ON COMPLETION` were retained for `evt_recurring_event_test` |
-| One-time event, safely future-dated | **Supported / Unit verified** | Live Azure re-test pending configured credentials | Enabled Events are created only when outside the configured safety window at both snapshot and creation |
-| One-time event due or near due | **Supported safety behavior / Unit verified** | Live Azure re-test pending configured credentials | Reported as `EVENT: BLOCKED`; DMS does not drop or replace the target Event and does not claim preservation |
-| Target-only stale Events during FULL | **Not reconciled by design** | Azure run `740ba5585c394826acd9257260c3332e` | FULL creates/replaces only Events present in the source snapshot; no managed-Event ownership registry exists, so target-only Events are retained |
-| Event Scheduler dependency | **Partial / Environment dependent** | Local → Local | Runtime execution depends on MySQL Event Scheduler being enabled |
-| Event definer/privilege dependency | **Partial / Environment dependent** | Not exhaustively tested | Execution depends on valid target definer and required privileges |
-| Recurring event scheduling | **Partial** | Not exhaustively E2E tested | One-time event verified; broader recurring scheduler scenarios are not exhaustively covered |
-
----
-
-## Partitions
-
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Partitioned table | **Supported / Verified** | Local → Local | Native MySQL table partitioning preserved |
-| RANGE partition | **Supported / Verified** | Local → Local | Verified with `RANGE(YEAR(created_at))` |
-| RANGE COLUMNS | **Supported / Verified** | Implementation supported | Emitted through partition DDL generation |
-| LIST partition | **Supported / Verified** | Implementation supported | Emitted through partition DDL generation |
-| LIST COLUMNS | **Supported / Verified** | Implementation supported | Emitted through partition DDL generation |
-| HASH partition | **Supported / Verified** | Implementation supported | Emitted through partition DDL generation |
-| KEY partition | **Supported / Verified** | Implementation supported | Emitted through partition DDL generation |
-| Partition names/order | **Supported / Verified** | Local → Local | Partition metadata and ordering preserved |
-| `MAXVALUE` boundary | **Supported / Verified** | Local → Local | `pmax` / `MAXVALUE` verified |
-| Partition metadata reporting | **Supported / Verified** | Local → Local | Partitions reported as an object category; detailed structure retained in metadata/report data |
-| Existing incompatible partition structure | **Supported / Verified** | Local → Local | Controlled reconciliation can replace incompatible target partition structure |
-| Unmanaged inbound FK during reconciliation | **Partial** | Local → Local | Reconciliation is blocked clearly when an inbound FK references an unmanaged object outside the migration set |
-
----
-
-## Comments / Metadata
-
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Table comments | **Supported / Verified** | Local → Local | Exact comments verified |
-| Column comments | **Supported / Verified** | Local → Local | Exact comments verified |
-| View comments | **Not separately verified** | Not E2E tested | No standalone live evidence recorded |
-| Routine comments | **Not separately verified** | Not E2E tested | No standalone live evidence recorded |
-| Index/constraint comments | **Not supported / not enumerated** | Not E2E tested | No dedicated extraction/application path recorded |
-
----
-
-## Grants
-
-> MySQL security scope contains users and direct permissions only. Account
-> authentication secrets are not migrated. Global permissions require explicit
-> user selection and are limited to supported direct privileges.
-
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Explicit table grants | **Partial** | Unit tested / live visibility blocked | Extracted from `INFORMATION_SCHEMA.TABLE_PRIVILEGES` and applied to mapped target database |
-| Table `SELECT` grant | **Partial** | Unit tested | Supported when grant metadata is visible and target grantee exists |
-| Table `INSERT` grant | **Partial** | Unit tested | Same metadata/grantee requirements |
-| Other supported table privileges | **Partial** | Unit tested | Applied according to discovered source table privilege metadata |
-| Routine `EXECUTE` grant | **Partial** | Unit tested / environment dependent | Extracted from `ROUTINE_PRIVILEGES` when accessible |
-| Target grantee existence | **Required prerequisite** | Tested | DMS does not create the target account for these grant paths |
-| User creation | **Supported / Conditional** | Unit tested | Unlocked user identity is created without copying credentials |
-| Supported direct global permissions | **Filtered / Conditional** | Unit tested | Requires explicit user selection and an allowed privilege |
-| Database-level privileges | **Supported / Conditional** | Unit tested | Mapped to the configured target database |
-| Password/authentication attributes | **Out of Scope** | N/A | User authentication configuration is not migrated |
-| Cross-account grant metadata visibility | **Environment Blocked** | Local least-privilege environment | `mysql_test` cannot see another account's grants under the tested privilege set |
-
----
-
-## Validation / Reporting
-
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Object existence validation | **Supported / Verified** | Local → Local | Source/target objects compared |
-| Row count validation | **Supported / Verified** | Local → Local | Source and target counts compared |
-| Column metadata validation | **Supported / Verified** | Local → Local | Columns/types/nullability compared |
-| Constraint validation | **Supported / Verified** | Local → Local | PK, UK, FK, CHECK metadata verified |
-| Index validation | **Supported / Verified** | Local → Local | Index metadata verified |
-| Partition validation | **Supported / Verified** | Local → Local | Partition metadata compared |
-| Routine validation | **Supported / Verified** | Local → Local | Functions/procedures verified |
-| Trigger validation | **Supported / Verified** | Local → Local | Trigger definitions/behavior verified |
-| Event validation | **Supported / Verified** | Local → Local | Event metadata verified |
-| Object-level failure reporting | **Supported / Verified** | Unit / Local → Local | Failures are recorded independently |
-| Migration status reporting | **Supported / Verified** | Local → Local | Run status, rows, errors and object outcomes reported |
-| `partial_success` status | **Supported / Verified** | Unit / Local → Local | Used when independent objects fail while migration continues |
-| `stop_on_error` mode | **Supported / Verified** | Unit tested | Optional fail-fast behavior |
-
----
-
-## Safety / Operational Controls
-
-| Object | Support | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| Concurrent migration protection | **Supported / Verified** | Unit / Local → Local | Filesystem lock keyed by effective source/target scope |
-| Source connection cleanup | **Supported / Verified** | Local → Local | Autocommit and rollback/close cleanup implemented |
-| Source service restart protection | **Supported / Verified** | Unit tested | DMS does not restart source MySQL service as part of the PostgreSQL WAL-specific safety mechanism |
-| MySQL function/trigger server-policy handling | **Supported / Verified** | Local → Local | DMS reports Error 1419 as an explicit BLOCKED outcome and does not attempt privileged server-variable changes |
-| Deterministic port handling | **Supported / Verified** | Local environment | Fixed UI port behavior; occupied port produces a clear failure rather than random fallback |
-
----
-
-## Unsupported / Native MySQL Limitations
-
-| Object / Feature | Class | Evidence / Notes |
+| Feature | Status | Notes |
 |---|---|---|
-| Materialized views | **N/A** | MySQL has no native PostgreSQL-style materialized view feature |
-| PostgreSQL schemas | **N/A** | MySQL database namespace semantics differ from PostgreSQL schemas |
-| PostgreSQL extensions | **N/A** | No direct general-purpose MySQL equivalent |
-| PostgreSQL domains | **N/A** | No direct equivalent implemented |
-| PostgreSQL composite types | **N/A** | No direct equivalent implemented |
-| PostgreSQL RLS / policies | **N/A** | MySQL implementation does not provide PostgreSQL RLS/policy objects |
-| Standalone PostgreSQL sequences | **N/A** | MySQL normally uses `AUTO_INCREMENT`; standalone PostgreSQL sequence semantics are not directly reproduced |
-| PostgreSQL-specific object semantics | **N/A** | PostgreSQL-only constructs are outside native MySQL object migration scope |
+| Passwords/authentication secrets | Out of Scope | Accounts may be migrated within supported scope; authentication credentials are not copied. |
+| PostgreSQL materialized views, RLS policies, extensions, domains/custom types, standalone sequences | N/A for native MySQL | No direct native MySQL equivalent with the same semantics; these are cross-engine capability differences. MySQL `AUTO_INCREMENT` is table-bound. |
+| Exhaustive MySQL production schema coverage | Not Exercised | Audits cover selected datasets, versions, object combinations, and workloads only. |
 
----
+## Evidence Summary
 
-## CDC
+### Local → Local
 
-| Object | Class | E2E Validation | Evidence / Notes |
-|---|---|---|---|
-| MySQL CDC | **Not E2E tested** | Not E2E tested in this Local → Local object-support audit | No completed MySQL CDC E2E evidence is recorded in this matrix; therefore it is not classified as Verified |
-| Continuous migration / CDC mode | **Not E2E tested** | Not E2E tested | Do not interpret successful FULL migration as CDC verification |
-| Incremental INSERT / UPDATE / DELETE replication | **Not E2E tested** | Not E2E tested | Requires dedicated CDC test evidence |
+- Checked-in report `1584f5a5ebc04e8a8d9e288ee150b23c`: MySQL → MySQL, SUCCESS, 5 tables, 5,710/5,710 rows, 0 failed. It migrated 73 columns and 5 primary keys; most other object categories had source count 0 in this dataset.
+- The local audit/migration-flow docs also record historical broad evidence: 11 tables, 44/44 rows, 0 failures. The corresponding report artifact is not present in the current reports directory; treat the object-level result as documented historical evidence, not as the current report's inventory.
 
----
+### Local → Cloud
 
-## Final Local → Local Evidence
+- Run `9f15eae2f1a84933a7ffe9746b828932`: FULL, 6 tables, 6,340 source/migrated rows, 0 failed, 100%, about 355.7 seconds; 66 columns, 6 primary keys, 18 grants, and 3 security principals.
 
-| Metric | Result |
-|---|---:|
-| Latest successful migration run | `84e6100202584c8cbaf2a52b64276fa2` |
-| Migration mode | FULL |
-| Tables migrated | 11 |
-| Source rows | 44 |
-| Target rows | 44 |
-| Rows migrated | 44/44 |
-| Errors | 0 |
-| Migration status | SUCCESS |
+### Cloud → Local
 
-### Additional verified evidence
+- Run `fb374e4480d84894b22d5917807b507f`: FULL, 13 tables, 45 source/migrated rows, 0 failed, 100%, about 15.7 seconds. The report records 65 columns, 13 primary keys, 9 `AUTO_INCREMENT` columns, 13 indexes, 3 unique constraints, 3 foreign keys, 6 CHECK constraints, 2 generated columns, 13 defaults, 14 partitions, 17 comments, 1 grant, 12 security principals, 2 views, 2 functions, 2 procedures, 2 triggers, and 2 events.
 
-- Representative MySQL datatype fixture: 31 columns
-- Partition fixture: 3 partitions / 3 rows
-- Functions and procedures: runtime verified
-- Triggers: runtime verified
-- Views: runtime verified with target-local namespace rewriting
-- Constraints: metadata and rejection behavior verified
-- Indexes: metadata verified
-- Comments: table/column comments verified
-- Target partition reconciliation: verified
-- Grant implementation: unit tested; cross-account live visibility remains environment-dependent
+Evidence applies only to the stated direction, report, and source dataset. Zero source-object count means **Not Exercised**, not unsupported. Environment blocked is not implementation failure. A successful FULL run is not proof of every object feature, event runtime, or CDC behavior.
 
-## Important Interpretation
+## References
 
-`UNSUPPORTED` / `Out of Scope` means an explicit DMS capability outcome.
-It does **not** mean that MySQL itself cannot support the feature.
-
-Likewise, `Environment Blocked` does **not** mean the implementation is
-incorrect; it means the available server configuration, privileges, or
-environment prevented live verification.
-
-A successful migration run alone is not treated as proof of object support.
-Object support is classified using the corresponding metadata, runtime,
-constraint, data, or functional verification evidence.
+- [MySQL Local Audit](MYSQL_LOCAL_AUDIT.md)
+- [MySQL Local → Azure Audit](MYSQL_LOCAL_TO_AZURE_AUDIT.md)
+- [MySQL Test Guide](MYSQL_TEST_GUIDE.md)
+- [MySQL Limitations](MYSQL_LIMITATIONS.md)
+- [MySQL Migration Flow](MYSQL_MIGRATION_FLOW.md)
+- [MySQL E2E Runbook](MYSQL_E2E_RUNBOOK.md)

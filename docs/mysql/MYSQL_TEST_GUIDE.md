@@ -1,961 +1,443 @@
 # MySQL Object E2E Test Guide
 
-This guide explains how to run and verify MySQL object migration end-to-end using
-the current MySQL Local → Local test configuration. It preserves the
-MySQL-specific testing already documented in the project, including datatype,
-partition, function/trigger policy, view isolation, and grant-visibility testing.
+This guide explains how to prepare, run, and verify a MySQL object migration using the repository's MySQL connector. It covers the available directional configs and MySQL-specific structural, data, functional, and negative checks.
 
-Targeted Local → Azure testing is complete for the evidence recorded in
-[MYSQL_LOCAL_TO_AZURE_AUDIT.md](MYSQL_LOCAL_TO_AZURE_AUDIT.md). Do not mark
-unrecorded Azure behavior verified from Local → Local evidence alone.
-
----
+A zero source count means **Not exercised in this dataset**. It is not evidence that the object type is unsupported.
 
 ## Prerequisites
 
-- MySQL 26.7.0 or compatible MySQL server running and accessible.
-- `mysql` client available.
-- Python 3.11+ with project dependencies installed.
-- Source and target databases accessible to the migration account.
-- Migration account has the object/data privileges required by the configured scope.
-- On a binary-logged server, `log_bin_trust_function_creators` may affect
-  function/trigger creation.
-- For grant testing, source grant metadata must be visible to the migration
-  identity and the target grantee must already exist.
+- MySQL 8.0-compatible source and target servers reachable from the migration host.
+- MySQL client (`mysql`) available for connection and verification.
+- Python 3.11+ and project dependencies installed (`pip install -e .`).
+- Migration accounts with required source metadata/read access and target DDL/data privileges for the selected scope.
+- Azure MySQL testing: TLS enabled in the config, network route and firewall access to port 3306.
+- Grant testing: required privilege metadata must be visible to the migration account.
+- Function/trigger testing: check binary logging policy and target privileges; Error 1419 may occur when `log_bin=ON` and `log_bin_trust_function_creators=OFF`.
 
-The migration platform does **not** grant `SUPER` and does not change MySQL
-server-global or persistent variables.
+## Secret Environment Variables
 
-## Environment Variables
-
-### Windows PowerShell
+The `env` secret provider resolves `password_secret` names from `SECRET_<name>` environment variables at runtime.
 
 ```powershell
 $env:SECRET_mysql_source_pass = "<source_password>"
 $env:SECRET_mysql_target_pass = "<target_password>"
 ```
 
-### Bash / Linux / macOS
-
-```bash
-export SECRET_mysql_source_pass=<source_password>
-export SECRET_mysql_target_pass=<target_password>
-```
+Do not put real passwords in YAML or commit them to Git.
 
 ## Configuration
 
-Use:
+### Local → Local
 
-```text
-config/mysql_local_test.yaml
-```
-
-The configuration uses source/target connection values and the corresponding
-secret references.
-
-For target structural reconciliation:
+There is no dedicated Local → Local YAML config in `config/` at present. The checked-in `config/mysql_local_test.yaml` actually configures Azure MySQL → local MySQL; do not use it as Local → Local without changing and reviewing both endpoints. For a Local → Local test, create a local-only config based on this verified structure:
 
 ```yaml
+source:
+  engine: mysql
+  connection:
+    host: <source-host>
+    port: 3306
+    database: <source-database>
+    username: <source-user>
+    password_secret: mysql_source_pass
+    ssl: <true-or-false-for-server>
+
+target:
+  engine: mysql
+  connection:
+    host: <target-host>
+    port: 3306
+    database: <target-database>
+    username: <target-user>
+    password_secret: mysql_target_pass
+    ssl: <true-or-false-for-server>
+
 migration:
+  mode: full
+  batch_size: 1000
   reconcile_target_schema: false
+
+secrets:
+  provider: env
 ```
 
-Set it to `true` only when specifically testing existing incompatible target
-structures.
+Set each `ssl` value to match the actual server. Other repository options such as retry, validation, and logging are optional to the basic run.
 
----
+### Local → Azure
 
-# Step 1 — Prepare / Reset the MySQL Test Databases
+Use `config/mysql_onpremise_cloud_test.yaml`. It points from a local/on-premise MySQL source to Azure MySQL, with TLS enabled. Verify the checked-in endpoints/database names before running.
 
-Connect to MySQL:
+### Azure → Local
 
-```powershell
-& "C:\Program Files\MySQL\MySQL Server 26.7\bin\mysql.exe" `
-  -h 127.0.0.1 -P 3306 -u mysql_test -p
-```
+Use `config/mysql_local_test.yaml`. It points from Azure MySQL to a local MySQL target, with TLS enabled. Verify both endpoints before running.
 
-Check the server:
+### Target Schema Reconciliation
 
-```sql
-SELECT VERSION();
-
-SHOW VARIABLES LIKE 'log_bin';
-SHOW VARIABLES LIKE 'log_bin_trust_function_creators';
-```
-
-Check databases:
-
-```sql
-SHOW DATABASES LIKE 'mysql_migration_source';
-SHOW DATABASES LIKE 'mysql_migration_target';
-```
-
-### Function / trigger Error 1419 prerequisite
-
-With binary logging enabled and:
-
-```text
-log_bin_trust_function_creators = OFF
-```
-
-function/trigger creation can fail with Error 1419.
-
-The platform records each affected object once as:
-
-```text
-FUNCTION: BLOCKED
-TRIGGER: BLOCKED
-```
-
-and does not count it as migrated.
-
-If an administrator intentionally enables the prerequisite:
-
-```sql
-SET PERSIST log_bin_trust_function_creators = ON;
-```
-
-`SET GLOBAL ...` is runtime-only and can be lost after restart.
-
-The migration platform never executes either command itself.
-
----
-
-# Step 2 — Populate the Source Fixture
-
-Use the existing MySQL fixture/test data. Completed Local → Local coverage
-includes:
-
-- Tables and columns
-- Primary keys
-- Foreign keys
-- Cross-database foreign keys
-- UNIQUE constraints
-- CHECK constraints
-- Defaults
-- `AUTO_INCREMENT`
-- Generated columns
-- Secondary and composite indexes
-- Table and column comments
-- Views
-- Functions
-- Procedures
-- Triggers
-- Events
-- Partitions
-- Representative MySQL datatypes
-- Explicit table grants / routine grants when metadata is visible
-
-Use descriptive object names such as:
-
-```text
-vw_...
-fn_...
-sp_...
-trg_...
-evt_...
-```
-
-Do not use `E2E` in test object names.
-
----
-
-# Step 3 — Verify the Source Fixture
-
-```sql
-USE mysql_migration_source;
-SHOW TABLES;
-```
-
-### Table definitions
-
-```sql
-SHOW CREATE TABLE customers;
-SHOW CREATE TABLE products;
-SHOW CREATE TABLE orders;
-```
-
-### Columns
-
-```sql
-SELECT
-    TABLE_NAME,
-    COLUMN_NAME,
-    ORDINAL_POSITION,
-    COLUMN_DEFAULT,
-    IS_NULLABLE,
-    DATA_TYPE,
-    COLUMN_TYPE,
-    EXTRA,
-    COLUMN_KEY
-FROM INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA = 'mysql_migration_source'
-ORDER BY TABLE_NAME, ORDINAL_POSITION;
-```
-
-### Indexes
-
-```sql
-SHOW INDEX FROM customers;
-SHOW INDEX FROM products;
-SHOW INDEX FROM orders;
-```
-
-### Constraints
-
-```sql
-SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
-FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
-WHERE CONSTRAINT_SCHEMA = 'mysql_migration_source'
-ORDER BY TABLE_NAME, CONSTRAINT_NAME;
-```
-
-### Foreign keys
-
-```sql
-SELECT
-    TABLE_NAME,
-    CONSTRAINT_NAME,
-    REFERENCED_TABLE_SCHEMA,
-    REFERENCED_TABLE_NAME
-FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-WHERE TABLE_SCHEMA = 'mysql_migration_source'
-  AND REFERENCED_TABLE_NAME IS NOT NULL
-ORDER BY TABLE_NAME, CONSTRAINT_NAME;
-```
-
-### Views
-
-```sql
-SHOW FULL TABLES
-FROM mysql_migration_source
-WHERE TABLE_TYPE = 'VIEW';
-
-SHOW CREATE VIEW mysql_migration_source.customer_order_summary;
-```
-
-### Functions / Procedures / Triggers / Events
-
-```sql
-SHOW FUNCTION STATUS
-WHERE Db = 'mysql_migration_source';
-
-SHOW PROCEDURE STATUS
-WHERE Db = 'mysql_migration_source';
-
-SHOW TRIGGERS FROM mysql_migration_source;
-
-SHOW EVENTS FROM mysql_migration_source;
-```
-
-### Partitions
-
-```sql
-SELECT
-    TABLE_NAME,
-    PARTITION_NAME,
-    PARTITION_METHOD,
-    PARTITION_EXPRESSION,
-    PARTITION_DESCRIPTION,
-    PARTITION_ORDINAL_POSITION
-FROM INFORMATION_SCHEMA.PARTITIONS
-WHERE TABLE_SCHEMA = 'mysql_migration_source'
-  AND PARTITION_NAME IS NOT NULL
-ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION;
-```
-
-### Comments
-
-```sql
-SELECT TABLE_NAME, TABLE_COMMENT
-FROM INFORMATION_SCHEMA.TABLES
-WHERE TABLE_SCHEMA = 'mysql_migration_source';
-
-SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT
-FROM INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA = 'mysql_migration_source'
-ORDER BY TABLE_NAME, ORDINAL_POSITION;
-```
-
----
-
-# Step 4 — Run the Migration
-
-Set the secrets and run:
-
-```powershell
-python -m migration_platform `
-  --config config/mysql_local_test.yaml `
-  --mode full `
-  --no-live-ui
-```
-
-Record:
-
-- Run ID
-- Final status
-- Tables migrated
-- Source rows
-- Migrated rows
-- Failed objects
-- Error count
-- Object-level outcomes
-
-A successful row count alone is not object-support evidence.
-
----
-
-# Step 5 — Verify the Migration Result
-
-## 5a. Automatic / Report Verification
-
-Inspect the generated report and confirm:
-
-- Overall status
-- Object migration results
-- Failed / blocked objects
-- Row counts
-- Validation results
-- Partition processing
-- Function/trigger outcomes
-- View/procedure/event outcomes
-
-An object recorded as `BLOCKED`, `FAILED`, or `SKIPPED` must not be counted
-as migrated.
-
-## 5b. Manual Target Verification
-
-```sql
-USE mysql_migration_target;
-
-SHOW TABLES;
-
-SELECT TABLE_NAME, TABLE_ROWS
-FROM INFORMATION_SCHEMA.TABLES
-WHERE TABLE_SCHEMA = 'mysql_migration_target'
-ORDER BY TABLE_NAME;
-```
-
-For exact counts:
-
-```sql
-SELECT COUNT(*) FROM customers;
-SELECT COUNT(*) FROM products;
-SELECT COUNT(*) FROM orders;
-```
-
-### Table definitions
-
-```sql
-SHOW CREATE TABLE customers;
-SHOW CREATE TABLE products;
-SHOW CREATE TABLE orders;
-```
-
-Verify columns, nullability, types, defaults, generated columns,
-`AUTO_INCREMENT`, keys, constraints, comments and partition definitions.
-
-### Indexes
-
-```sql
-SHOW INDEX FROM customers;
-SHOW INDEX FROM products;
-SHOW INDEX FROM orders;
-```
-
-### Constraints / FKs
-
-```sql
-SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
-FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
-WHERE CONSTRAINT_SCHEMA = 'mysql_migration_target'
-ORDER BY TABLE_NAME, CONSTRAINT_NAME;
-
-SELECT
-    TABLE_NAME,
-    CONSTRAINT_NAME,
-    REFERENCED_TABLE_SCHEMA,
-    REFERENCED_TABLE_NAME
-FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-WHERE TABLE_SCHEMA = 'mysql_migration_target'
-  AND REFERENCED_TABLE_NAME IS NOT NULL
-ORDER BY TABLE_NAME, CONSTRAINT_NAME;
-```
-
-### View isolation
-
-```sql
-SHOW FULL TABLES
-FROM mysql_migration_target
-WHERE TABLE_TYPE = 'VIEW';
-
-SHOW CREATE VIEW mysql_migration_target.customer_order_summary;
-```
-
-The target view must not contain migrated dependencies qualified with:
-
-```text
-mysql_migration_source.customers
-mysql_migration_source.orders
-```
-
-After migration, insert a customer only in target and a separate customer only
-in source. The target view must see the target-only row and must not depend on
-the source-only row.
-
-### Functions / procedures
-
-```sql
-SHOW FUNCTION STATUS
-WHERE Db = 'mysql_migration_target';
-
-SHOW PROCEDURE STATUS
-WHERE Db = 'mysql_migration_target';
-```
-
-Inspect definitions with `SHOW CREATE FUNCTION` and `SHOW CREATE PROCEDURE`,
-then execute them and verify expected results/effects.
-
-### Triggers
-
-```sql
-SHOW TRIGGERS FROM mysql_migration_target;
-```
-
-Inspect with:
-
-```sql
-SHOW CREATE TRIGGER mysql_migration_target.trg_after_customer_insert_log;
-```
-
-Do not mark trigger coverage PASS from metadata alone.
-
-### Events
-
-```sql
-SHOW EVENTS FROM mysql_migration_target;
-```
-
-Runtime execution depends on Event Scheduler state and valid definer/privileges.
-
----
-
-# Step 5c — Negative / Functional Tests
-
-1. **Duplicate UNIQUE value** — duplicate insert must be rejected.
-2. **Invalid FOREIGN KEY** — invalid referenced key must be rejected.
-3. **Invalid CHECK** — violating value must be rejected.
-4. **Default value** — omitted defaulted column must receive expected value.
-5. **Generated column** — generated expression must calculate expected value.
-6. **AUTO_INCREMENT** — omitted ID must receive the next identifier.
-7. **View functionality** — target view must return expected target data.
-8. **Procedure functionality** — target procedure must produce expected effect.
-9. **Function functionality** — target function must return expected value.
-10. **Trigger functionality** — target trigger must produce its expected effect.
-11. **Event functionality** — event metadata and, where applicable, scheduled
-    behavior must be verified.
-12. **Partition structure** — structure and data must both be verified.
-
-### Trigger dependency fixture
-
-```sql
-CREATE TABLE customer_insert_log (
-    id INT NOT NULL AUTO_INCREMENT,
-    customer_id INT NOT NULL,
-    customer_name VARCHAR(100) NOT NULL,
-    customer_status VARCHAR(20) NOT NULL,
-    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (id)
-) COMMENT='Customer insert trigger test log';
-
-CREATE TRIGGER trg_after_customer_insert_log
-AFTER INSERT ON customers
-FOR EACH ROW
-INSERT INTO customer_insert_log
-    (customer_id, customer_name, customer_status)
-VALUES
-    (NEW.id, NEW.name, NEW.status);
-```
-
-Verify the source trigger with a source insert, run a clean migration, then
-insert a target customer and verify the target log row.
-
-Do not grant `SUPER` to the migration account solely for this test.
-
----
-
-# Step 6 — Task 10: Partition Testing
-
-Create:
-
-```sql
-CREATE TABLE tbl_partition_test (
-    id INT NOT NULL,
-    name VARCHAR(100) NOT NULL,
-    created_at DATE NOT NULL,
-    PRIMARY KEY (id, created_at)
-)
-PARTITION BY RANGE (YEAR(created_at)) (
-    PARTITION p2025 VALUES LESS THAN (2026),
-    PARTITION p2026 VALUES LESS THAN (2027),
-    PARTITION pmax VALUES LESS THAN MAXVALUE
-);
-
-INSERT INTO tbl_partition_test
-    (id, name, created_at)
-VALUES
-    (1, 'Partition 2025', '2025-06-15'),
-    (2, 'Partition 2026', '2026-09-13'),
-    (3, 'Partition Future', '2027-01-01');
-```
-
-After clean FULL migration:
-
-```sql
-SHOW CREATE TABLE mysql_migration_target.tbl_partition_test;
-```
-
-```sql
-SELECT
-    PARTITION_NAME,
-    PARTITION_METHOD,
-    PARTITION_EXPRESSION,
-    PARTITION_DESCRIPTION,
-    PARTITION_ORDINAL_POSITION
-FROM INFORMATION_SCHEMA.PARTITIONS
-WHERE TABLE_SCHEMA = 'mysql_migration_target'
-  AND TABLE_NAME = 'tbl_partition_test'
-  AND PARTITION_NAME IS NOT NULL
-ORDER BY PARTITION_ORDINAL_POSITION;
-```
-
-Confirm:
-
-- `RANGE(YEAR(created_at))`
-- `p2025`
-- `p2026`
-- `pmax`
-- correct boundaries
-- correct ordering
-- `MAXVALUE`
-- 3/3 rows
-
-The partition definition must be present in the initial target `CREATE TABLE`.
-No manual target-side `ALTER` is part of the test.
-
-Partitions are integrated into the existing Object Migration Results category as
-`Partitions`. They are not rendered as a separate UI panel. The Migration
-Timeline `Create Partitions` phase reports the actual number processed; detailed
-structure remains available in report JSON.
-
----
-
-# Step 7 — Task 11: Specific MySQL Data Types Testing
-
-Task 11 verifies MySQL-specific data types and their values.
-
-The dedicated fixture:
-
-```text
-tbl_datatype_test
-```
-
-contains 31 columns.
-
-### Datatypes covered
-
-- `TINYINT`, `TINYINT(1)`, `SMALLINT`, `MEDIUMINT`, `INT UNSIGNED`, `BIGINT`, `YEAR`
-- `DECIMAL(10,2)`, `NUMERIC(12,4)`
-- `FLOAT`, `DOUBLE`
-- `CHAR(5)`, `VARCHAR(255)`, `TEXT`, `MEDIUMTEXT`, `LONGTEXT`
-- `BINARY(8)`, `VARBINARY(32)`, `BLOB`, `MEDIUMBLOB`, `LONGBLOB`
-- `DATE`, `TIME`, `DATETIME(6)`, `TIMESTAMP(6)`
-- `BOOLEAN` / `BOOL`
-- `JSON`
-- `ENUM('new','active','closed')`
-- `SET('email','sms','push')`
-
-Run:
-
-```powershell
-python -m migration_platform `
-  --config config/mysql_local_test.yaml `
-  --mode full `
-  --no-live-ui
-```
-
-### Source definition
-
-```sql
-SELECT
-    COLUMN_NAME,
-    DATA_TYPE,
-    COLUMN_TYPE,
-    IS_NULLABLE,
-    COLUMN_DEFAULT
-FROM INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA = 'mysql_migration_source'
-  AND TABLE_NAME = 'tbl_datatype_test'
-ORDER BY ORDINAL_POSITION;
-```
-
-### Target definition
-
-```sql
-SHOW COLUMNS FROM mysql_migration_target.tbl_datatype_test;
-```
-
-All 31 definitions must be compared with source.
-
-### Value verification
-
-Use `SELECT` and `HEX()`:
-
-```sql
-SELECT
-    id,
-    json_col,
-    enum_col,
-    set_col,
-    HEX(binary_col),
-    HEX(varbinary_col),
-    HEX(blob_col)
-FROM mysql_migration_target.tbl_datatype_test;
-```
-
-Also compare numeric, date/time and boolean values.
-
-Expected checks include:
-
-- ENUM value such as `active`
-- SET representation such as `email,sms`
-- JSON document preservation
-- binary/LOB values through `HEX()`
-- exact DECIMAL/NUMERIC precision and scale
-- FLOAT/DOUBLE values
-- `DATETIME(6)` / `TIMESTAMP(6)` fractional seconds
-- unsigned integer values
-- BOOLEAN/BOOL represented by MySQL as `TINYINT(1)`
-
-## SET migration issue and fix
-
-Initial migration failed with:
-
-```text
-Python type set cannot be converted
-```
-
-Root cause: MySQL SET values were returned as Python `set` / `frozenset`.
-
-The fix in `core/connectors/mysql.py`:
-
-```text
-_normalize_mysql_set_value()
-```
-
-converts MySQL SET collections to MySQL-compatible comma-separated text while
-preserving declared member order.
-
-The fix applies only to MySQL-source SET values and does not alter ENUM, JSON,
-binary/LOB or unrelated values.
-
-Automated coverage includes:
-
-```text
-tests/unit/test_mysql_datatypes.py
-tests/unit/test_cross_engine_type_safety.py
-```
-
-Do not use datatype migration success alone as evidence; compare definitions
-and values.
-
----
-
-# Step 8 — Users and Direct Permissions
-
-MySQL security migration uses the common user and grant APIs. Configure user
-accounts with `migration.security_users` or select them at runtime. Authentication
-secrets are not migrated. Global permissions require explicit user selection
-and are limited to supported direct privileges.
-
-For normal interactive PowerShell runs, select security principals at runtime
-rather than storing identities in YAML. Repeat each option as needed:
-
-```powershell
-python -m migration_platform --config config/mysql_local_test.yaml --mode full `
-  --security-user security_test_user@%
-```
-
-Without `--security-user`, the connector discovers unlocked, non-system
-accounts. The browser dashboard displays Users and Direct Permissions progress
-and results.
-
-### Stored object DEFINER policy
-
-Before creating MySQL routines, triggers, or Events, the migration snapshots
-the source accounts named by their `DEFINER` clauses and creates only those
-accounts required by these objects. It does not recreate the target connection
-account when that exact account is already in use. Other selected users remain
-in the normal Security phase.
-
-The exact source `DEFINER` is retained only when its account is available on
-the target and the migration identity has `SET_ANY_DEFINER` or a server's
-legacy equivalent. An object owned by the target connection identity needs no
-additional definer privilege. If another source identity cannot safely be
-preserved, DDL uses the target connection's `CURRENT_USER()` identity. The
-migration never grants `SUPER` or `SET_ANY_DEFINER`; in this fallback case the
-source `DEFINER` was not preserved.
-
-Current MySQL DMS grant scope is:
-
-- Explicit table grants.
-- Routine `EXECUTE` grants when `INFORMATION_SCHEMA.ROUTINE_PRIVILEGES` is
-  visible.
-
-The DMS does not currently migrate:
-
-- authentication/password state;
-- unsupported global privileges;
-- database/schema privileges;
-- column grants;
-- view grants;
-- trigger grants;
-- event grants.
-
-## Grant test matrix
-
-| Area | Status | Required result |
-|---|---|---|
-| Existing target grantee | SUPPORTED / TESTED | Direct `GRANT` requires target grantee |
-| Table-grant discovery | SUPPORTED / TESTED | `TABLE_PRIVILEGES` discovery preserves schema/grantee |
-| Target database mapping | SUPPORTED / TESTED | Source database maps to configured target |
-| Successful grant application | SUPPORTED / TESTED | Applied grant is recorded as applied/migrated |
-| Failed grant application | SUPPORTED / TESTED | Failure is rolled back and recorded as failed/skipped |
-| Routine `EXECUTE` | CONDITIONALLY SUPPORTED / TESTED | Requires visible `ROUTINE_PRIVILEGES` and existing grantee |
-| User accounts | SUPPORTED / CONDITIONAL | Unlocked user identities; no authentication secrets |
-| Selected global direct permissions | SUPPORTED / FILTERED | Allowlisted users and supported privilege subset only |
-| Database/schema/column/view/trigger/event grants | SUPPORTED / CONDITIONAL | Depends on metadata visibility and target support |
-
-## Metadata visibility boundary
-
-An empty `TABLE_PRIVILEGES` result is not evidence that the source account has
-no grants. Under the tested least-privilege identity, another account's grants
-may be hidden.
-
-Therefore:
-
-```text
-BLOCKED BY ENVIRONMENT / PRIVILEGE VISIBILITY
-```
-
-must be used when the source grant metadata cannot actually be observed.
-
-Do not grant broad system access merely to manufacture a PASS.
-
-## Controlled live grant test
-
-1. Administrator creates a disposable visible source grant.
-2. Same grantee is pre-created on target.
-3. Confirm source metadata is visible to the migration identity.
-4. Run migration.
-5. Verify mapped target grant metadata as administrator.
-6. Connect as grantee and test one allowed and one ungranted operation.
-7. Remove only disposable test objects/accounts/grants.
-
----
-
-# Step 9 — Target Schema Reconciliation
-
-When an existing target table has an incompatible supported structure, test with:
+A clean target does not require reconciliation. Enable this only for a dedicated test involving an incompatible existing target table:
 
 ```yaml
 migration:
   reconcile_target_schema: true
 ```
 
-The MySQL reconciliation path:
+The implementation contains a guarded MySQL reconciliation path and verifies staged partition metadata before replacement. This is not a claim of general reconciliation for every possible schema difference. Use a disposable target and consult [MYSQL_LIMITATIONS.md](MYSQL_LIMITATIONS.md).
 
-- compares source/target structural signatures;
-- stages a source-derived replacement;
-- verifies the resulting structure;
-- atomically swaps the replacement with the existing table;
-- retains the old target table as a temporary `__dms_backup_*` object while the
-  migration is still in progress;
-- removes the backup only after migration, data load, object phases and
-  validation succeed.
+## Step 1 — Prepare / Reset the MySQL Test Databases
 
-If an inbound FK references an unmanaged object outside the migration set,
-safe reconciliation can be blocked and must be reported clearly.
+Connect to each server and confirm the version, endpoint, and database. Use the MySQL client installed in your environment:
 
----
-
-# Step 10 — End-to-End Validation
-
-Final Local → Local validation should cover:
-
-- object existence;
-- table/column metadata;
-- row counts;
-- data values;
-- PK / UK / FK / CHECK;
-- defaults;
-- AUTO_INCREMENT;
-- generated columns;
-- indexes;
-- comments;
-- partitions;
-- views;
-- functions;
-- procedures;
-- triggers;
-- events;
-- supported grants;
-- report/object outcomes.
-
-Latest successful Local → Local evidence:
-
-```text
-Run ID: 84e6100202584c8cbaf2a52b64276fa2
-Mode: FULL
-Tables: 11
-Rows: 44/44
-Failed: 0
-Errors: 0
-Status: SUCCESS
+```powershell
+mysql -h <host> -P 3306 -u <user> -p
 ```
 
-Always record the actual run ID and actual verification output in the audit.
+```sql
+SELECT VERSION(), @@hostname, DATABASE();
+SHOW DATABASES;
+SHOW DATABASES LIKE '<test_database>';
+SHOW VARIABLES LIKE 'log_bin';
+SHOW VARIABLES LIKE 'log_bin_trust_function_creators';
+```
 
----
+There is no checked-in MySQL fixture reset script. Prepare dedicated test databases using the environment's approved process. For a clean comparison, start with a clean target; FULL migration does not remove unrelated target-only objects. Run destructive reset/drop operations only against databases confirmed to be disposable test databases.
 
-# Step 11 — Unit / Integration Testing
+If `log_bin=ON` and `log_bin_trust_function_creators=OFF`, function or trigger creation can fail with MySQL Error 1419, subject to account privileges. An authorized administrator may choose to set `SET PERSIST log_bin_trust_function_creators = ON;`. The migration platform does not change this setting or require users to obtain `SUPER` as a default workaround. If the prerequisite is unavailable, record the affected object as environment-blocked.
 
-Run:
+## Step 2 — Populate the Source
+
+Use a prepared test database or a dedicated representative fixture. No reusable MySQL fixture SQL bundle is checked in. For a focused test, use only the objects relevant to the scenario.
+
+Where applicable, the audited MySQL object set includes:
+
+- Tables, columns, representative MySQL data types, and rows
+- Primary keys, UNIQUE and CHECK constraints, defaults, foreign keys (including tested cross-database references)
+- `AUTO_INCREMENT`, generated columns, secondary/composite indexes, and partitions
+- Views, functions, procedures, triggers, and events
+- Table and column comments
+- Supported grants/security principals, where metadata is visible and the target privileges allow it
+
+The audit exercised representative numeric, character/text, binary, temporal, JSON, ENUM, and SET data. The list is representative, not exhaustive. The connector normalizes MySQL SET values returned as collections; focused coverage is in `tests/unit/test_mysql_datatypes.py`.
+
+## Step 3 — Verify the Source
+
+Connect to the source database. These MySQL metadata queries establish the baseline; compare exact row counts for representative tables before migration.
+
+### Tables
+
+```sql
+SHOW TABLES;
+```
+
+Confirm the expected base tables are present. To distinguish base tables from views:
+
+```sql
+SELECT TABLE_NAME, TABLE_TYPE
+FROM information_schema.tables
+WHERE TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_TYPE, TABLE_NAME;
+```
+
+### Columns / data types
+
+```sql
+SELECT TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, COLUMN_TYPE,
+       IS_NULLABLE, COLUMN_DEFAULT, EXTRA, GENERATION_EXPRESSION, COLUMN_COMMENT
+FROM information_schema.columns
+WHERE TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
+```
+
+Confirm types, nullability, defaults, `AUTO_INCREMENT`, generated expressions, and comments for the fixture.
+
+### Row counts
+
+`information_schema.tables.TABLE_ROWS` can be approximate for some engines. Use `COUNT(*)` for exact per-table baselines:
+
+```sql
+SELECT COUNT(*) AS row_count FROM `<table_name>`;
+```
+
+### Indexes
+
+```sql
+SHOW INDEX FROM `<table_name>`;
+```
+
+Or inventory all indexes:
+
+```sql
+SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, INDEX_TYPE
+FROM information_schema.statistics
+WHERE TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX;
+```
+
+Confirm key columns and their order, uniqueness, and index type.
+
+### Constraints
+
+```sql
+SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE
+FROM information_schema.table_constraints
+WHERE CONSTRAINT_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME, CONSTRAINT_TYPE, CONSTRAINT_NAME;
+```
+
+### Foreign keys
+
+```sql
+SELECT TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA,
+       REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+FROM information_schema.key_column_usage
+WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL
+ORDER BY TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION;
+```
+
+Check `REFERENCED_TABLE_SCHEMA` as well as the referenced table, especially for cross-database FK cases.
+
+### Views
+
+```sql
+SHOW FULL TABLES WHERE Table_type = 'VIEW';
+SHOW CREATE VIEW `<view_name>`;
+```
+
+### Functions / procedures
+
+```sql
+SHOW FUNCTION STATUS WHERE Db = DATABASE();
+SHOW PROCEDURE STATUS WHERE Db = DATABASE();
+SHOW CREATE FUNCTION `<function_name>`;
+SHOW CREATE PROCEDURE `<procedure_name>`;
+```
+
+Run only the applicable `SHOW CREATE` statement for objects present.
+
+### Triggers
+
+```sql
+SHOW TRIGGERS FROM `<database_name>`;
+SHOW CREATE TRIGGER `<trigger_name>`;
+```
+
+### Events
+
+```sql
+SHOW EVENTS FROM `<database_name>`;
+SHOW CREATE EVENT `<event_name>`;
+SHOW VARIABLES LIKE 'event_scheduler';
+```
+
+Event definition metadata and scheduler-driven runtime are separate checks.
+
+### Partitions
+
+```sql
+SELECT TABLE_NAME, PARTITION_NAME, PARTITION_METHOD, PARTITION_EXPRESSION,
+       PARTITION_DESCRIPTION, PARTITION_ORDINAL_POSITION
+FROM information_schema.partitions
+WHERE TABLE_SCHEMA = DATABASE() AND PARTITION_NAME IS NOT NULL
+ORDER BY TABLE_NAME, PARTITION_ORDINAL_POSITION;
+```
+
+### Comments
+
+Table and column comments are included in the columns query above. Table comments can also be inspected with:
+
+```sql
+SELECT TABLE_NAME, TABLE_COMMENT
+FROM information_schema.tables
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE';
+```
+
+### Grants / security
+
+```sql
+SHOW GRANTS;
+```
+
+This shows the current account. Grant discovery for other accounts depends on metadata visibility. User/security migration does not copy account passwords or authentication secrets.
+
+## Step 4 — Run the Migration
+
+Set the source and target secrets from the selected config, then run from the repository root.
+
+Local → Local (use your reviewed local-only config):
+
+```powershell
+python -m migration_platform --config <local-to-local-config>.yaml --mode full --no-live-ui
+```
+
+Local → Azure:
+
+```powershell
+python -m migration_platform --config config/mysql_onpremise_cloud_test.yaml --mode full --no-live-ui
+```
+
+Azure → Local:
+
+```powershell
+python -m migration_platform --config config/mysql_local_test.yaml --mode full --no-live-ui
+```
+
+The CLI prints the run ID and status. Reports are written under `reports/`; an audit JSONL may be present under `logs/` for the run.
+
+## Step 5 — Verify the Migration Result
+
+Record run ID, direction, final status, table/row counts, failed objects, errors, and success percentage from the CLI/report. Review `reports/<run_id>.json` and `reports/<run_id>.html` and `logs/<run_id>.jsonl` if generated. Compare target findings with the source baseline from Step 3.
+
+### 5a. Structural Verification
+
+Repeat the applicable Step 3 metadata checks on the target. Use `SHOW CREATE TABLE` for full DDL and confirm:
+
+```sql
+SHOW CREATE TABLE `<table_name>`;
+```
+
+Check columns/defaults, PK/UNIQUE/CHECK/FK constraints, indexes, `AUTO_INCREMENT`, generated expressions, views, routines, triggers, events, partitions, comments, and grants only where the source fixture includes them. For partitions, compare `SHOW CREATE TABLE` and `information_schema.partitions` for method, expression, ordered partition names, boundaries, and data placement. Do not manually add target partitions to manufacture a match.
+
+For routines/triggers, compare `DEFINER` in `SHOW CREATE` with the configured/observed target behavior. In MySQL→MySQL runs the CLI configures preservation of the source definer by default; account existence and privileges still affect whether stored-object creation/runtime succeeds. Do not claim this succeeds for every account/server combination.
+
+### 5b. Data Validation
+
+For each migrated table, repeat exact `COUNT(*)` on source and target. Compare with the report's source, migrated, and failed row counts. Check representative values with a stable primary-key order:
+
+```sql
+SELECT * FROM `<table_name>` ORDER BY `<primary_key>` LIMIT 10;
+```
+
+For generated columns, compare the generation expression and computed values; the loader excludes generated values from ordinary inserts so MySQL calculates them. MySQL SET values are normalized by the connector; datatype tests cover this behavior.
+
+### 5c. Functional / Object Validation
+
+Run behavior checks only against a dedicated test fixture with safe test arguments:
+
+- Query a migrated view and compare its result with the source.
+- Call a representative function in a `SELECT`; invoke a procedure with `CALL` and verify its intended result/effect.
+- Apply controlled DML for a trigger and inspect its expected side effect.
+- Confirm generated columns recalculate from base-column changes.
+- Check partition definitions and partitioned-table data; live audit coverage is for tested scenarios, not every partition strategy.
+- Inspect event definition/status. Runtime depends on Event Scheduler, timing, definer, and privileges. Azure audit evidence records scheduler `OFF`, so Azure automatic event execution was not verified.
+- Use `SHOW GRANTS` and visible privilege metadata for grant checks. If the account cannot see grant metadata, classify the check as **Environment Blocked / Privilege Visibility**, not a pass or unsupported.
+
+### 5d. Negative / Error Tests
+
+Use disposable fixture data only. Record the attempted object and observed MySQL error; do not run negative writes against production/shared databases.
+
+- Duplicate a value protected by a known UNIQUE constraint; expect MySQL to reject it.
+- Insert an invalid CHECK value or child FK reference; expect constraint rejection.
+- Exercise a target-object failure in a test scope and inspect per-object failures/reporting. The orchestrator isolates object errors by default; `migration.stop_on_error: true` changes the failure policy.
+- Re-run a migration only when the target/data state is understood; report success alone does not prove there are no pre-existing target-only objects.
+
+**Cross-engine type safety:** for cross-engine paths, a missing target type mapping raises `UnmappedTypeError`; the target must not silently receive source-native MySQL DDL. Same-engine MySQL retains native type behavior where implemented. This is a safety behavior, not proof every type mapping is available.
+
+## Step 6 — Run Unit Tests
+
+Run from the repository root:
 
 ```powershell
 python -m pytest tests/unit -q
 ```
 
-Record the actual result from the current branch/run; do not hard-code an old
-test count into the guide.
+Focused MySQL connector coverage:
 
-Integration tests may be run when the required environment is available:
+```powershell
+python -m pytest tests/unit/test_mysql_datatypes.py tests/unit/test_mysql_definer.py tests/unit/test_mysql_events.py -q
+```
+
+Record the actual result from the current branch; do not reuse a historical test count.
+
+## Step 7 — Run Integration Tests
+
+Run when the integration database/container prerequisites are available:
 
 ```powershell
 python -m pytest tests/integration -q -x
 ```
 
-If a test is blocked before migration logic executes, record it as an
-environment blocker rather than a migration failure.
+The project marks integration tests with `integration: integration tests requiring real database containers`; this command runs the integration directory without a marker filter. If execution stops before migration logic due to authentication, missing database, network/firewall, service, or environment configuration, record an environment blocker rather than an implementation failure.
 
----
+## Troubleshooting
 
-# Cloud / Azure MySQL Testing
+### Connection / Authentication
 
-Use the same migration code path. Change only connection values, secret
-references and TLS settings as required by the cloud environment.
+**Problem:** connection timeout or access denied.  
+**Check:** host/port 3306, server availability, firewall, TLS, selected database, secret variable spelling, and host-scoped account grants.  
+**Next:** correct the environment/config and retry; do not classify a pre-migration connection failure as an object migration result.
 
-Required Azure evidence includes:
+### Error 1419
 
-- TLS/authentication;
-- source/target connectivity;
-- target database privileges;
-- supported DDL/object checks;
-- datatype verification;
-- partition verification;
-- routine/trigger policy behavior;
-- Event Scheduler behavior;
-- grant metadata visibility.
+**Problem:** function/trigger creation is rejected under binary logging.  
+**Check:** `SHOW VARIABLES LIKE 'log_bin';` and `SHOW VARIABLES LIKE 'log_bin_trust_function_creators';`, plus target privileges.  
+**Next:** request the approved administrator configuration if appropriate. The platform does not change server-global settings; do not seek `SUPER` as a default workaround. Otherwise report the object as blocked/environment-dependent.
 
-Targeted Local → Azure testing is recorded in
-[MYSQL_LOCAL_TO_AZURE_AUDIT.md](MYSQL_LOCAL_TO_AZURE_AUDIT.md). Do not infer
-unrecorded Azure runtime coverage from Local → Local results.
+### SET datatype issue
 
-Do not classify Azure support as verified until an actual Azure migration and
-target inspection have occurred.
+**Problem:** SET values fail or differ.  
+**Check:** source/target `COLUMN_TYPE`, values, and the report; run `tests/unit/test_mysql_datatypes.py`.  
+**Next:** retain the exact failing value as a focused case. The connector contains SET normalization, but do not infer all datatype variants from it.
 
----
+### View still references source
 
-# Troubleshooting
+**Problem:** migrated view points at the old database.  
+**Check:** `SHOW CREATE VIEW` on source and target and verify which referenced objects are in migration scope.  
+**Next:** references to migrated objects are rewritten; arbitrary external database references are outside that rewrite boundary and need separate handling.
 
-## `Error 1419` during function/trigger creation
+### Partition structure missing
 
-Check:
+**Problem:** target definition or partition metadata differs.  
+**Check:** `SHOW CREATE TABLE` plus `information_schema.partitions`; verify reconciliation setting and target state.  
+**Next:** use a clean target or run the dedicated `reconcile_target_schema: true` scenario; do not manually add partitions as a workaround.
 
-```sql
-SHOW VARIABLES LIKE 'log_bin';
-SHOW VARIABLES LIKE 'log_bin_trust_function_creators';
-```
+### Grant metadata not visible
 
-If required, ask a MySQL administrator to apply:
+**Problem:** expected grant is absent from migration inventory.  
+**Check:** `SHOW GRANTS` and metadata visibility for the migration identity.  
+**Next:** use approved privileges or classify the check as **Environment Blocked / Privilege Visibility**. Do not grant broad system-schema access merely to force a pass.
 
-```sql
-SET PERSIST log_bin_trust_function_creators = ON;
-```
+### Target-only objects
 
-Do not grant `SUPER` to the migration account solely for this test.
+**Problem:** target contains objects absent from source.  
+**Check:** whether they predated the run and whether they belong to the migration scope.  
+**Next:** FULL migration does not delete unrelated target-only objects; clean only a dedicated target through its approved reset procedure.
 
-## `Python type set cannot be converted`
+### Foreign key / dependency failure
 
-Verify that the source column is MySQL `SET` and that
-`_normalize_mysql_set_value()` is present in `core/connectors/mysql.py`.
+**Problem:** FK creation or data load fails.  
+**Check:** source FK metadata including `REFERENCED_TABLE_SCHEMA`, referenced table availability, and report errors.  
+**Next:** ensure dependencies are in scope and available on target; record complex/circular dependency patterns as not verified unless separately exercised.
 
-## View still references source database
+## Adding Local → Azure MySQL Testing
 
-Run:
+1. Use `config/mysql_onpremise_cloud_test.yaml`; verify source/target endpoints and database names.
+2. Set `SECRET_mysql_source_pass` and `SECRET_mysql_target_pass` as above.
+3. Confirm TLS, outbound access to port 3306, and Azure firewall allow-listing.
+4. Run:
 
-```sql
-SHOW CREATE VIEW mysql_migration_target.customer_order_summary;
-```
+   ```powershell
+   python -m migration_platform --config config/mysql_onpremise_cloud_test.yaml --mode full --no-live-ui
+   ```
+5. Verify target objects/data and report. Record the run in [MYSQL_LOCAL_TO_AZURE_AUDIT.md](MYSQL_LOCAL_TO_AZURE_AUDIT.md), keeping metadata and runtime claims separate.
 
-Migrated dependencies should reference the target database, not the source
-database.
+Repository evidence records Local → Azure run `9f15eae2f1a84933a7ffe9746b828932`: 6 tables, 6,340 source rows, 6,340 migrated, 0 failed, 100%. Azure event scheduler was observed OFF; automatic event runtime was not verified. This evidence applies to that run and dataset.
 
-## Partition structure is missing
+## Adding Azure MySQL → Local Testing
 
-Check both:
+1. Use `config/mysql_local_test.yaml`; verify Azure source and local target settings.
+2. Set both secret environment variables and confirm Azure TLS/network access.
+3. Run:
 
-```sql
-SHOW CREATE TABLE mysql_migration_target.tbl_partition_test;
-```
+   ```powershell
+   python -m migration_platform --config config/mysql_local_test.yaml --mode full --no-live-ui
+   ```
+4. Verify target structure/data and record the result in the direction-appropriate audit documentation.
 
-and the `INFORMATION_SCHEMA.PARTITIONS` query above.
+The audit records Azure → Local run `fb374e4480d84894b22d5917807b507f`: 13 tables, 45 source rows, 45 migrated, 0 failed, 100%. Keep it separate from Local → Azure and Local → Local evidence.
 
-Do not manually add partitions as a test workaround.
+## Reference
 
-## Grant discovery returns no rows
-
-Check:
-
-```sql
-SELECT CURRENT_USER();
-SELECT USER();
-```
-
-Determine whether the migration identity can actually see the source grant
-metadata. If not, record the grant test as environment/privilege visibility
-blocked.
-
-## Target-only object remains
-
-FULL migration does not automatically delete unmanaged target-only objects.
-Remove test-only target objects when a clean target is required.
-
----
-
-# Reference
-
-- MySQL object support matrix:
-  `docs/mysql/MYSQL_OBJECT_SUPPORT_MATRIX.md`
-- MySQL limitations:
-  `docs/mysql/MYSQL_LIMITATIONS.md`
-- MySQL local audit:
-  `docs/mysql/MYSQL_LOCAL_AUDIT_FINAL.md`
-- MySQL migration configuration:
-  `config/mysql_local_test.yaml`
-- MySQL connector:
-  `core/connectors/mysql.py`
-- Unit tests:
-  `tests/unit/`
-- Integration tests:
-  `tests/integration/`
+- [MySQL E2E Runbook](MYSQL_E2E_RUNBOOK.md)
+- [MySQL Local Audit](MYSQL_LOCAL_AUDIT.md)
+- [MySQL Local → Azure Audit](MYSQL_LOCAL_TO_AZURE_AUDIT.md)
+- [MySQL Object Support Matrix](MYSQL_OBJECT_SUPPORT_MATRIX.md)
+- [MySQL Limitations](MYSQL_LIMITATIONS.md)
+- [MySQL Migration Flow](MYSQL_MIGRATION_FLOW.md)
