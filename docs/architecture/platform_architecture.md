@@ -264,6 +264,35 @@ These are the boundaries the object-module split enforces. Violating them is the
 
 Verified exceptions to the objects rule (documented in the modules themselves): MySQL's `objects/table.py` imports `_mysql_partition_clause` from `objects/partition.py`; MSSQL's `objects/partition.py` imports `_column_ddl` from `objects/table.py`; PostgreSQL's `objects/security.py` uses `objects/sequence.owned_sequences()`.
 
+### 4.2 Versioning and release markers
+
+The project uses four distinct versioning artifacts. They are deliberately separate so that
+each answers a different question.
+
+| Artifact | Answers | Authority |
+|---|---|---|
+| `pyproject.toml` `[project] version` | What version is this? | **Single source of truth.** Edited by hand. |
+| Git commit SHA | What exact code state is this? | Immutable, content-addressed. |
+| Git tag `vX.Y.Z` | Which release is this? | Immutable, human-readable. Created only from `main`. |
+| `CHANGELOG.md` | What changed, and why? | Human-readable release history. |
+
+Rules:
+
+- `migration_platform.__version__` is **not** a second hardcoded constant. It resolves at
+  import time via `importlib.metadata.version("migration-platform")`, so it can never drift
+  from `pyproject.toml`. Consequently `__version__` is only defined when the package is
+  installed (editable or wheel) — importing the package from a bare source checkout that has
+  never been installed raises `PackageNotFoundError`.
+- A release is prepared by bumping `version` in `pyproject.toml` and adding a matching
+  `CHANGELOG.md` entry. The tag is applied afterwards to the resulting commit, so the tag
+  always names a commit whose `pyproject.toml` carries the matching version.
+- Because of that ordering, verify `importlib.metadata.version("migration-platform")`
+  matches the intended release version **before** tagging. A tag is never moved or
+  overwritten; corrections ship as a new patch version.
+
+The changelog itself is the record of changes. This section documents only the mechanism
+and deliberately does not restate release contents.
+
 ---
 
 ## 5. Common / Base Layer

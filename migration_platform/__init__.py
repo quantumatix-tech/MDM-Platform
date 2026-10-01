@@ -1,3 +1,5 @@
+from importlib.metadata import version
+
 from core.connectors import (
     SourceConnector,
     TargetConnector,
@@ -26,7 +28,10 @@ from core.alerting import (
 )
 from core.status_server import StatusServer
 
+__version__ = version("migration-platform")
+
 __all__ = [
+    "__version__",
     "SourceConnector",
     "TargetConnector",
     "CDCEngine",
