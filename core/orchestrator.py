@@ -162,6 +162,52 @@ class MigrationOrchestrator:
             result["phases"]["extensions"] = ext_results
             self._update_status("extensions", 6, all_errors)
 
+            # ---------- MySQL DEFINER account prerequisites ----------
+            # Snapshot scheduled events before table/data work: MySQL flips a
+            # preserved one-time event to DISABLED once it fires, so a late
+            # rediscovery cannot represent migration-start state.
+            source_events: list[Any] = []
+            source_routines: list[Any] = []
+            source_triggers: list[Any] = []
+            mysql_user_results: dict[str, str] = {}
+            mysql_definer_dependency = (
+                self._config.get("source", {}).get("engine") == "mysql"
+                and self._config.get("target", {}).get("engine") == "mysql"
+            )
+            if mysql_definer_dependency:
+                from core.connectors.mysql import _mysql_definer_identity
+
+                source_events = list(self._source.list_events())
+                source_routines = list(self._source.list_functions())
+                source_triggers = list(self._source.get_all_triggers())
+
+                # MySQL stored objects may refer to source accounts in their
+                # DEFINER clause. Create those accounts before any dependent
+                # routine, trigger, or event can create an orphan DEFINER ref.
+                required_definers = {
+                    identity
+                    for identity in (
+                        _mysql_definer_identity(getattr(obj, "ddl", ""))
+                        for obj in [*source_routines, *source_triggers, *source_events]
+                    )
+                    if identity is not None
+                }
+                for user in self._source.list_users():
+                    host = getattr(user, "host", None)
+                    if (user.name, host) not in required_definers:
+                        continue
+                    label = f"{user.name}@{host}" if host is not None else user.name
+                    try:
+                        if host is None:
+                            self._target.create_user_if_not_exists(user.name)
+                        else:
+                            self._target.create_user_if_not_exists(user.name, host)
+                        mysql_user_results[f"USER {label}"] = "created"
+                    except Exception as exc:
+                        mysql_user_results[f"USER {label}"] = f"failed: {exc}"
+                        all_errors.append(f"CREATE USER {label}: {exc}")
+                result["phases"]["security_users_pre_objects"] = mysql_user_results
+                self._update_status("security_users_pre_objects", 4, all_errors)
             # ---------- Phase 2: Schemas ----------
             schema_results: dict[str, str] = {}
             try:
@@ -281,6 +327,31 @@ class MigrationOrchestrator:
             self._update_status("create_partitions", 17, all_errors)
 
             # ---------- Phase 5: Migrate Data ----------
+            # Fresh targets have no triggers yet (they are created later in
+            # Phase 15).  On a rerun the target triggers would otherwise record
+            # migration DML as application activity.  Suspension is connector
+            # specific and limited to the source trigger definitions.
+            if not source_triggers:
+                source_triggers = list(self._source.get_all_triggers())
+            suspended_triggers = self._target.suspend_triggers_for_data_load(source_triggers)
+            result["phases"]["trigger_data_load_handling"] = {
+                "suspended": [t.name for t in suspended_triggers],
+                "strategy": (
+                    "drop-and-recreate-after-data-load"
+                    if suspended_triggers
+                    else "fresh-target-no-triggers"
+                ),
+            }
+            # Full mode is replacement synchronisation, not an incremental
+            # upsert.  Clear every migrated target table before loading so
+            # target-only rows (including rows from past trigger side effects)
+            # cannot survive a successful run.  Connectors that do not define
+            # replacement semantics retain the historical upsert-only behaviour.
+            cleared_objects = self._target.clear_objects_for_full_sync(list(all_schemas))
+            result["phases"]["full_target_sync"] = {
+                "strategy": "clear-before-load",
+                "cleared": cleared_objects,
+            }
             schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
             total_rows = self._estimate_total_rows(objects, schema_map)
             processed_rows = 0
@@ -344,6 +415,25 @@ class MigrationOrchestrator:
                     all_errors.append(str(exc))
             result["phases"]["apply_constraints"] = constraint_results
             self._update_status("apply_constraints", 60, all_errors)
+
+            # ---------- MySQL AUTO_INCREMENT synchronisation ----------
+            # MySQL AUTO_INCREMENT is table-bound rather than a standalone
+            # sequence, so advance it once explicit source IDs have been loaded.
+            # Only engines that populate Column.auto_increment reach this path;
+            # every other connector leaves the flag False.
+            auto_increment_results: dict[str, str] = {}
+            for obj_name, schema in all_schemas.items():
+                for column in schema.columns:
+                    if not getattr(column, "auto_increment", False):
+                        continue
+                    try:
+                        self._target.sync_auto_increment(obj_name, column.name)
+                        auto_increment_results[f"{obj_name}.{column.name}"] = "synchronized"
+                    except Exception as exc:
+                        auto_increment_results[f"{obj_name}.{column.name}"] = f"error: {exc}"
+                        all_errors.append(str(exc))
+            if auto_increment_results:
+                result["phases"]["auto_increment"] = auto_increment_results
 
             # ---------- Phase 9: Sequence Ownership ----------
             seq_owner_results: dict[str, str] = {}
@@ -417,6 +507,9 @@ class MigrationOrchestrator:
                     except Exception as exc:
                         view_results[view.name] = f"error: {exc}"
                         all_errors.append(str(exc))
+                        # Track the failure so the run status cannot report
+                        # success while the object is missing on the target.
+                        failed_objects.add(view.name)
             except Exception as exc:
                 view_results["_error"] = str(exc)
             result["phases"]["views"] = view_results
@@ -493,6 +586,20 @@ class MigrationOrchestrator:
             result["phases"]["triggers"] = trigger_results
             self._update_status("triggers", 85, all_errors)
 
+            # ---------- Phase 15.5: Events (MySQL/MariaDB) ----------
+            if source_events:
+                event_results: dict[str, str] = {}
+                for event in source_events:
+                    try:
+                        self._target.create_event(event)
+                        event_results[event.name] = "created"
+                    except Exception as exc:
+                        event_results[event.name] = (
+                            str(exc) if "BLOCKED" in str(exc).upper() else f"error: {exc}"
+                        )
+                        all_errors.append(str(exc))
+                result["phases"]["events"] = event_results
+
             # ---------- Phase 16: Comments ----------
             comment_results: dict[str, str] = {}
             try:
@@ -514,31 +621,45 @@ class MigrationOrchestrator:
 
             # ---------- Phase: Users, Roles & Role Memberships (Step 14) ----------
             security_results: dict[str, str] = {}
+            # MySQL has no database-role object model, so the shared role path
+            # must not be driven for a MySQL source.
+            source_has_roles = self._config.get("source", {}).get("engine") != "mysql"
             try:
-                for role in self._source.list_roles():
-                    try:
-                        self._target.create_role_if_not_exists(role.name)
-                        security_results[f"role:{role.name}"] = "created"
-                    except Exception as exc:
-                        security_results[f"role:{role.name}"] = f"skipped: {exc}"
+                if source_has_roles:
+                    for role in self._source.list_roles():
+                        try:
+                            self._target.create_role_if_not_exists(role.name)
+                            security_results[f"role:{role.name}"] = "created"
+                        except Exception as exc:
+                            security_results[f"role:{role.name}"] = f"skipped: {exc}"
                 for user in self._source.list_users():
+                    host = getattr(user, "host", None)
+                    label = f"{user.name}@{host}" if host is not None else user.name
+                    if f"USER {label}" in mysql_user_results:
+                        # Already created ahead of object DDL for its DEFINER ref.
+                        security_results[f"user:{label}"] = mysql_user_results[f"USER {label}"]
+                        continue
                     try:
-                        self._target.create_user_if_not_exists(user.name)
-                        security_results[f"user:{user.name}"] = "created"
+                        if host is None:
+                            self._target.create_user_if_not_exists(user.name)
+                        else:
+                            self._target.create_user_if_not_exists(user.name, host)
+                        security_results[f"user:{label}"] = "created"
                     except Exception as exc:
-                        security_results[f"user:{user.name}"] = f"skipped: {exc}"
-                for membership in self._source.list_role_memberships():
-                    try:
-                        self._target.create_role_membership(
-                            membership.member_name, membership.role_name
-                        )
-                        security_results[
-                            f"membership:{membership.member_name}->{membership.role_name}"
-                        ] = "created"
-                    except Exception as exc:
-                        security_results[
-                            f"membership:{membership.member_name}->{membership.role_name}"
-                        ] = f"skipped: {exc}"
+                        security_results[f"user:{label}"] = f"skipped: {exc}"
+                if source_has_roles:
+                    for membership in self._source.list_role_memberships():
+                        try:
+                            self._target.create_role_membership(
+                                membership.member_name, membership.role_name
+                            )
+                            security_results[
+                                f"membership:{membership.member_name}->{membership.role_name}"
+                            ] = "created"
+                        except Exception as exc:
+                            security_results[
+                                f"membership:{membership.member_name}->{membership.role_name}"
+                            ] = f"skipped: {exc}"
             except Exception as exc:
                 security_results["_error"] = str(exc)
             result["phases"]["security"] = security_results

@@ -61,7 +61,7 @@ def test_source_get_schema_matches_columns_and_pk():
         [],
         [("id", "int", "NO", None, 10, 0), ("name", "nvarchar", "NO", 50, None, None)],
         [],
-        [("id",)],
+        [("id", "PK_sales_orders")],
         [],
         [],  # check constraints (empty)
         [],  # default constraints (empty)
@@ -81,6 +81,7 @@ def test_source_get_schema_matches_columns_and_pk():
     assert schema.columns[1].name == "name"
     assert schema.columns[1].source_type == "nvarchar"
     assert schema.primary_key == ["id"]
+    assert schema.primary_key_name == "PK_sales_orders"
 
 
 def test_target_create_table_emits_matching_ddl():
@@ -131,7 +132,7 @@ def test_source_get_schema_extracts_foreign_keys():
         [],
         [("id", "int", "NO", None, 10, 0)],
         [],
-        [("id",)],
+        [("id", "PK_sales_orders")],
         [("fk_orders_cust", "customer_id", "id", "sales", "customers", 1)],
         [],  # check constraints (empty)
         [],  # default constraints (empty)
@@ -178,7 +179,7 @@ def test_source_get_schema_identity_and_computed():
         [],
         [("id", "int", "NO", None, 10, 0), ("computed_col", "int", "YES", None, None, None)],
         [],
-        [("id",)],
+        [("id", "PK_sales_orders")],
         [],
         [],  # check constraints (empty)
         [],  # default constraints (empty)
@@ -227,7 +228,7 @@ def test_source_get_schema_discovers_indexes():
         [("id", "int", "NO", None, 10, 0)],
         [("IX_name", 0, 0, 1, 1, 0, False, "name", None),
          ("IX_name", 0, 0, 1, 2, 1, True, "status", None)],
-        [("id",)],
+        [("id", "PK_sales_orders")],
         [],
         [],  # check constraints (empty)
         [],  # default constraints (empty)
@@ -431,7 +432,7 @@ def test_source_get_schema_resolves_udt_columns():
         [("code", "sales", "order_code_t")],
         [("code", "int", "NO", None, 10, 0)],
         [],
-        [("code",)],
+        [("code", "PK_sales_orders")],
         [],
         [],  # check constraints (empty)
         [],  # default constraints (empty)

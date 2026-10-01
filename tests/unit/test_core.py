@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from core.connectors.base import (
     SourceConnector,
@@ -12,6 +12,7 @@ from core.connectors.base import (
     Index,
     ForeignKey,
     CheckConstraint,
+    UniqueConstraint,
     ViewDefinition,
     MaterializedViewDef,
     FunctionDef,
@@ -2473,10 +2474,11 @@ class TestPostgresCrossSchemaMetadataIsolation:
         }
         return PostgresSourceConnector(cfg)
 
-    def _mock_cursor_for_schema(self, pk_rows, idx_rows=None, fk_rows=None, check_rows=None):
+    def _mock_cursor_for_schema(self, pk_rows, idx_rows=None, fk_rows=None, check_rows=None, uq_rows=None):
         idx_rows = idx_rows if idx_rows is not None else []
         fk_rows = fk_rows if fk_rows is not None else []
         check_rows = check_rows if check_rows is not None else []
+        uq_rows = uq_rows if uq_rows is not None else []
         cur = MagicMock()
         cur.fetchone.side_effect = [
             ("cloud_test",),  # schema resolution
@@ -2484,11 +2486,12 @@ class TestPostgresCrossSchemaMetadataIsolation:
             None,             # partition key
         ]
         cur.fetchall.side_effect = [
-            [("customer_id", "integer", "NO", None, None, None)],  # columns
+            [("customer_id", "integer", "NO", None, None, None, False, None, None, None)],  # columns
             pk_rows,                                                 # PK
             idx_rows,                                                # indexes
             fk_rows,                                                 # FKs
             check_rows,                                              # check constraints
+            uq_rows,                                                 # unique constraints
         ]
         cur.__enter__.return_value = cur
         cur.__exit__.return_value = False
@@ -2499,7 +2502,7 @@ class TestPostgresCrossSchemaMetadataIsolation:
     def test_get_schema_pk_query_scoped_by_schema(self):
         connector = self._source_conn()
         conn, cur = self._mock_cursor_for_schema(
-            pk_rows=[("customer_id",)],
+            pk_rows=[("customer_id", "pk_cloud_test_customers")],
         )
         connector._conn = conn
 
@@ -2514,6 +2517,7 @@ class TestPostgresCrossSchemaMetadataIsolation:
             f"PK query params must include table_schema. Got: {pk_params!r}"
         )
         assert schema.primary_key == ["customer_id"]
+        assert schema.primary_key_name == "pk_cloud_test_customers"
 
     def test_get_schema_index_query_scoped_by_schema(self):
         connector = self._source_conn()
@@ -2521,7 +2525,8 @@ class TestPostgresCrossSchemaMetadataIsolation:
             pk_rows=[],
             idx_rows=[
                 ("idx_customer_id", True, ["customer_id"],
-                 "CREATE UNIQUE INDEX idx_customer_id ON cloud_test.customers (customer_id)"),
+                 "CREATE UNIQUE INDEX idx_customer_id ON cloud_test.customers (customer_id)",
+                 False),
             ],
         )
         connector._conn = conn
@@ -2538,6 +2543,7 @@ class TestPostgresCrossSchemaMetadataIsolation:
         )
         assert len(schema.indexes) == 1
         assert schema.indexes[0].name == "idx_customer_id"
+        assert schema.indexes[0].constraint_backed is False
 
     def test_get_schema_fk_query_scoped_by_schema(self):
         connector = self._source_conn()
@@ -2723,6 +2729,633 @@ class TestOrchestratorGrantFailureTracking:
 
         # Grant failure should be reflected in status
         assert result["status"] == "partial_success"
-# Grant failure should be recorded in the grants phase results
+        # Grant failure should be recorded in the grants phase results
         grants_phase = result["phases"].get("grants", [])
         assert any("failed" in str(g) and "role does not exist" in str(g) for g in grants_phase)
+
+
+class TestPostgresUniqueConstraintVsUniqueIndex:
+    """A UNIQUE constraint must migrate as a real constraint; a hand-made
+    UNIQUE INDEX must migrate as an independent index. The two are told apart by
+    the source using pg_constraint.conindid, never by name."""
+
+    def _target(self, failing=()):
+        """Build a target whose cursor is a plain fake.
+
+        ``failing`` maps a substring of the SQL to the exception it should raise,
+        letting a test fail one specific object and assert the others still run.
+        A real fake cursor is used (not MagicMock) so the recorded SQL is exact
+        and a raising statement does not recurse through the mock.
+        """
+        from core.connectors.postgresql import PostgresTargetConnector
+
+        executed: list[str] = []
+
+        class FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, *a, **kw):
+                executed.append(str(sql))
+                for fragment, err in failing:
+                    if fragment in str(sql):
+                        raise err
+
+        class FakeConn:
+            def __init__(self):
+                self.rollbacks = 0
+                self.commits = 0
+
+            def cursor(self):
+                return FakeCursor()
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def commit(self):
+                self.commits += 1
+
+        target = PostgresTargetConnector({"database": "t", "source_engine": "postgresql"})
+        target._conn = FakeConn()
+        return target, target._conn, executed
+
+    @staticmethod
+    def _sql(executed):
+        return executed
+
+    def test_unique_constraint_is_created_as_alter_table_add_constraint(self):
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+        )
+
+        target.apply_constraints(schema)
+
+        assert (
+            'ALTER TABLE "training"."customers" ADD CONSTRAINT uq_customers_email UNIQUE (email)'
+            in executed
+        )
+
+    def test_constraint_backed_index_is_not_recreated_standalone(self):
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            indexes=[Index(
+                name="uq_customers_email", columns=["email"], unique=True,
+                ddl="CREATE UNIQUE INDEX uq_customers_email ON training.customers (email)",
+                constraint_backed=True,
+            )],
+        )
+
+        target.apply_constraints(schema)
+
+        assert any("ADD CONSTRAINT uq_customers_email UNIQUE (email)" in s for s in executed)
+        assert not any("CREATE UNIQUE INDEX" in s for s in executed), (
+            "the constraint-backed index must not be recreated as a standalone index"
+        )
+
+    def test_manually_created_unique_index_is_still_migrated_as_index(self):
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            indexes=[Index(
+                name="uq_customers_name_manual", columns=["customer_name"], unique=True,
+                ddl="CREATE UNIQUE INDEX uq_customers_name_manual ON training.customers (customer_name)",
+                constraint_backed=False,
+            )],
+        )
+
+        target.apply_constraints(schema)
+
+        assert any("uq_customers_name_manual" in s and "CREATE UNIQUE INDEX" in s for s in executed)
+
+    def test_constraint_and_index_sharing_a_name_both_survive(self):
+        """A constraint-backed index and a similarly-named manual index must not
+        be conflated: the manual one is still created."""
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            indexes=[
+                Index(name="uq_customers_email", columns=["email"], unique=True,
+                      ddl="CREATE UNIQUE INDEX uq_customers_email ON training.customers (email)",
+                      constraint_backed=True),
+                Index(name="uq_customers_email_manual", columns=["city"], unique=True,
+                      ddl="CREATE UNIQUE INDEX uq_customers_email_manual ON training.customers (city)",
+                      constraint_backed=False),
+            ],
+        )
+
+        target.apply_constraints(schema)
+
+        assert any("ADD CONSTRAINT uq_customers_email UNIQUE (email)" in s for s in executed)
+        assert any("uq_customers_email_manual" in s and "CREATE UNIQUE INDEX" in s
+                   for s in executed)
+
+    def test_unique_constraint_applied_before_indexes(self):
+        target, conn, executed = self._target()
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            indexes=[Index(name="idx_city", columns=["city"],
+                           ddl="CREATE INDEX idx_city ON training.customers (city)")],
+        )
+
+        target.apply_constraints(schema)
+
+        add = next(i for i, s in enumerate(executed) if "ADD CONSTRAINT uq_customers_email" in s)
+        idx = next(i for i, s in enumerate(executed) if "CREATE INDEX IF NOT EXISTS idx_city" in s)
+        assert add < idx, "UNIQUE constraint must be applied before normal indexes"
+
+    def test_failure_in_one_constraint_does_not_poison_following_objects(self):
+        """A real error must roll back so the next CHECK/index/FK still runs."""
+        target, conn, executed = self._target(failing=[
+            ("ADD CONSTRAINT uq_broken UNIQUE", RuntimeError('relation "uq_broken" already exists')),
+            ("ADD CONSTRAINT ck_name CHECK", RuntimeError("permission denied for schema training")),
+        ])
+        schema = Schema(
+            name="customers", schema_name="training",
+            unique_constraints=[
+                UniqueConstraint(name="uq_broken", columns=["email"]),
+                UniqueConstraint(name="uq_ok", columns=["city"]),
+            ],
+            check_constraints=[CheckConstraint(name="ck_name", expression="length(city) > 2")],
+            indexes=[Index(name="idx_city", columns=["city"],
+                           ddl="CREATE INDEX idx_city ON training.customers (city)")],
+        )
+
+        target.apply_constraints(schema)
+
+        # both unique constraints attempted, despite the first one failing
+        assert any("ADD CONSTRAINT uq_broken UNIQUE" in s for s in executed)
+        assert any("ADD CONSTRAINT uq_ok UNIQUE" in s for s in executed)
+        # the failing CHECK and the index after it were still attempted
+        assert any("ADD CONSTRAINT ck_name CHECK" in s for s in executed)
+        assert any("CREATE INDEX IF NOT EXISTS idx_city" in s for s in executed)
+        # each failure rolled back individually rather than aborting the run
+        assert conn.rollbacks >= 2
+
+    def test_real_error_is_audited_as_failed_not_already_exists(self):
+        target, conn, executed = self._target(failing=[
+            ("ADD CONSTRAINT uq_customers_email UNIQUE",
+             RuntimeError("must be owner of relation customers")),
+        ])
+
+        with patch("core.connectors.postgresql.target.audit_log") as logged:
+            target.apply_constraints(Schema(
+                name="customers", schema_name="training",
+                unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            ))
+
+        unique_calls = [c for c in logged.call_args_list if c.kwargs.get("phase") == "create_unique"]
+        assert len(unique_calls) == 1
+        call = unique_calls[0]
+        assert call.kwargs["status"] == "failed"
+        assert "must be owner" in call.kwargs["details"]["reason"]
+
+    def test_duplicate_object_is_audited_as_skipped(self):
+        target, conn, executed = self._target(failing=[
+            ("ADD CONSTRAINT uq_customers_email UNIQUE",
+             RuntimeError('constraint "uq_customers_email" for relation "customers" already exists')),
+        ])
+
+        with patch("core.connectors.postgresql.target.audit_log") as logged:
+            target.apply_constraints(Schema(
+                name="customers", schema_name="training",
+                unique_constraints=[UniqueConstraint(name="uq_customers_email", columns=["email"])],
+            ))
+
+        call = next(c for c in logged.call_args_list if c.kwargs.get("phase") == "create_unique")
+        assert call.kwargs["status"] == "skipped"
+        assert "already exists" in call.kwargs["details"]["reason"]
+
+
+class TestPrimaryKeyNamePreservation:
+    """An explicitly named source PRIMARY KEY must keep its name on the target.
+
+    The name is carried on the existing ``Schema`` DTO (``primary_key_name``)
+    next to the column list, so no parallel PK representation is introduced.
+    When the source had no explicit name the target keeps emitting a bare
+    ``PRIMARY KEY (...)`` and the engine generates its own name, exactly as
+    before this change.
+    """
+
+    @staticmethod
+    def _pg_ddl(schema):
+        """Run the PostgreSQL create_table path and return the emitted DDL."""
+        from core.connectors.postgresql import PostgresTargetConnector
+
+        class FakeCursor:
+            def __init__(self):
+                self.sql: list[str] = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, *a, **kw):
+                self.sql.append(str(sql))
+                # existence probe must report "table absent" so DDL is emitted
+                if "information_schema.tables" in str(sql):
+                    self._row = None
+                else:
+                    self._row = None
+
+            def fetchone(self):
+                return None
+
+        cur = FakeCursor()
+
+        class FakeConn:
+            def __init__(self):
+                self._cur = cur
+
+            def cursor(self):
+                return self._cur
+
+            def commit(self):
+                pass
+
+            def rollback(self):
+                pass
+
+        target = PostgresTargetConnector({"database": "t", "source_engine": "postgresql"})
+        target._conn = FakeConn()
+        target.create_object_if_missing(schema)
+        return next((s for s in cur.sql if s.upper().startswith("CREATE TABLE")), "")
+
+    # --- A. explicitly named PK is preserved ---
+
+    def test_pg_named_primary_key_is_preserved_in_ddl(self):
+        ddl = self._pg_ddl(Schema(
+            name="pk_name_test", schema_name="training",
+            columns=[Column(name="id", source_type="integer", nullable=False)],
+            primary_key=["id"],
+            primary_key_name="pk_test_primary_key",
+        ))
+        assert 'CONSTRAINT "pk_test_primary_key" PRIMARY KEY (id)' in ddl
+        assert "pk_name_test_pkey" not in ddl
+
+    def test_mssql_named_primary_key_is_preserved_in_ddl(self):
+        from core.connectors.mssql import MSSQLTargetConnector
+        cur = MagicMock()
+        cur.fetchone.return_value = None  # table/schema missing -> DDL emitted
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        conn.cursor.return_value.__exit__.return_value = False
+        target = MSSQLTargetConnector({"database": "t", "source_engine": "mssql"})
+        target._conn = conn
+
+        target.create_object_if_missing(Schema(
+            name="pk_name_test", schema_name="training",
+            columns=[Column(name="id", source_type="int", nullable=False, target_type="int")],
+            primary_key=["id"],
+            primary_key_name="pk_test_primary_key",
+        ))
+
+        ddl = next(str(c.args[0]) for c in cur.execute.call_args_list
+                   if c.args and str(c.args[0]).upper().startswith("CREATE TABLE"))
+        assert 'CONSTRAINT "pk_test_primary_key" PRIMARY KEY (id)' in ddl
+
+    # --- B. PK columns and ordering are unchanged ---
+
+    def test_pg_composite_primary_key_columns_and_order_unchanged(self):
+        ddl = self._pg_ddl(Schema(
+            name="composite", schema_name="training",
+            columns=[
+                Column(name="tenant_id", source_type="integer", nullable=False),
+                Column(name="code", source_type="text", nullable=False),
+            ],
+            primary_key=["tenant_id", "code"],
+            primary_key_name="pk_composite_ordered",
+        ))
+        assert 'CONSTRAINT "pk_composite_ordered" PRIMARY KEY (tenant_id, code)' in ddl
+
+    # --- C. unnamed / default cases keep the previous behaviour ---
+
+    def test_pg_unnamed_primary_key_emits_bare_clause(self):
+        ddl = self._pg_ddl(Schema(
+            name="pk_name_test", schema_name="training",
+            columns=[Column(name="id", source_type="integer", nullable=False)],
+            primary_key=["id"],
+        ))
+        assert "PRIMARY KEY (id)" in ddl
+        assert "CONSTRAINT" not in ddl
+
+    def test_pg_no_primary_key_emits_no_pk_clause(self):
+        ddl = self._pg_ddl(Schema(
+            name="pk_less", schema_name="training",
+            columns=[Column(name="id", source_type="integer", nullable=True)],
+        ))
+        assert "PRIMARY KEY" not in ddl
+
+    def test_mssql_unnamed_primary_key_emits_bare_clause(self):
+        from core.connectors.mssql import MSSQLTargetConnector
+        cur = MagicMock()
+        cur.fetchone.return_value = None  # table/schema missing -> DDL emitted
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        conn.cursor.return_value.__exit__.return_value = False
+        target = MSSQLTargetConnector({"database": "t", "source_engine": "mssql"})
+        target._conn = conn
+
+        target.create_object_if_missing(Schema(
+            name="orders", schema_name="dbo",
+            columns=[Column(name="id", source_type="int", nullable=False, target_type="int")],
+            primary_key=["id"],
+        ))
+
+        ddl = next(str(c.args[0]) for c in cur.execute.call_args_list
+                   if c.args and str(c.args[0]).upper().startswith("CREATE TABLE"))
+        assert "PRIMARY KEY (id)" in ddl
+        assert "CONSTRAINT" not in ddl
+
+    # --- D. quoting of awkward names uses the shared helper ---
+
+    def test_pg_awkward_pk_name_is_quoted_not_concatenated(self):
+        ddl = self._pg_ddl(Schema(
+            name="odd", schema_name="training",
+            columns=[Column(name="id", source_type="integer", nullable=False)],
+            primary_key=["id"],
+            primary_key_name="Mixed Case-PK",
+        ))
+        assert 'CONSTRAINT "Mixed Case-PK" PRIMARY KEY (id)' in ddl
+
+    def test_pg_already_quoted_pk_name_is_not_double_wrapped(self):
+        ddl = self._pg_ddl(Schema(
+            name="odd", schema_name="training",
+            columns=[Column(name="id", source_type="integer", nullable=False)],
+            primary_key=["id"],
+            primary_key_name='"already-quoted"',
+        ))
+        assert 'CONSTRAINT "already-quoted" PRIMARY KEY (id)' in ddl
+        assert '""already-quoted""' not in ddl
+
+    # --- source discovery carries the name ---
+
+    def test_mssql_partitioned_table_preserves_pk_name(self):
+        from core.connectors.mssql.objects import partition as mssql_partition
+
+        cur = MagicMock()
+        cur.fetchone.return_value = None  # schema + table missing -> DDL emitted
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        conn.cursor.return_value.__exit__.return_value = False
+
+        mssql_partition.create_partitioned_table(conn, Schema(
+            name="events", schema_name="dbo",
+            columns=[
+                Column(name="id", source_type="int", nullable=False),
+                Column(name="created_at", source_type="datetime2", nullable=False),
+            ],
+            primary_key=["id"],
+            primary_key_name="pk_events",
+        ), partition_scheme_name="ps_events", partition_column="created_at")
+
+        ddl = next(str(c.args[0]) for c in cur.execute.call_args_list
+                   if c.args and str(c.args[0]).upper().startswith("CREATE TABLE"))
+        assert 'CONSTRAINT "pk_events" PRIMARY KEY (id)' in ddl
+
+    def test_mssql_partitioned_table_unnamed_pk_stays_bare(self):
+        from core.connectors.mssql.objects import partition as mssql_partition
+
+        cur = MagicMock()
+        cur.fetchone.return_value = None
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cur
+        conn.cursor.return_value.__exit__.return_value = False
+
+        mssql_partition.create_partitioned_table(conn, Schema(
+            name="events", schema_name="dbo",
+            columns=[Column(name="id", source_type="int", nullable=False)],
+            primary_key=["id"],
+        ), partition_scheme_name="ps_events", partition_column="id")
+
+        ddl = next(str(c.args[0]) for c in cur.execute.call_args_list
+                   if c.args and str(c.args[0]).upper().startswith("CREATE TABLE"))
+        assert "PRIMARY KEY (id)" in ddl
+        assert "CONSTRAINT" not in ddl
+
+    def test_pg_source_carries_pk_name_and_columns(self):
+        connector = TestPostgresCrossSchemaMetadataIsolation()._source_conn()
+        conn, cur = TestPostgresCrossSchemaMetadataIsolation()._mock_cursor_for_schema(
+            pk_rows=[("tenant_id", "pk_composite"), ("code", "pk_composite")],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        assert schema.primary_key == ["tenant_id", "code"]
+        assert schema.primary_key_name == "pk_composite"
+
+    def test_pg_source_pk_name_is_none_when_table_has_no_pk(self):
+        connector = TestPostgresCrossSchemaMetadataIsolation()._source_conn()
+        conn, cur = TestPostgresCrossSchemaMetadataIsolation()._mock_cursor_for_schema(
+            pk_rows=[],
+        )
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        assert schema.primary_key == []
+        assert schema.primary_key_name is None
+
+    # --- MSSQL composite PK ordering through real discovery ---
+
+    def _mssql_source_conn_for_pk_ordering(self, pk_rows):
+        """MSSQL cursor mock that dispatches on the SQL actually executed."""
+        executed: list[str] = []
+
+        def _execute(sql, *args, **kwargs):
+            executed.append(" ".join(str(sql).split()).lower())
+
+        def _fetchall():
+            sql = executed[-1] if executed else ""
+            if "constraint_type = 'primary key'" in sql:
+                required = (
+                    "kcu.column_name",
+                    "tc.constraint_name",
+                    "kcu.ordinal_position",
+                    "tc.table_name = kcu.table_name",
+                )
+                return pk_rows if all(f in sql for f in required) else []
+            if "from information_schema.columns" in sql:
+                # id, col_b, col_a -- declaration order deliberately differs
+                # from the PK ordinal order asserted below.
+                return [
+                    ("id", "int", "NO", None, 10, 0),
+                    ("col_b", "nvarchar", "NO", 50, None, None),
+                    ("col_a", "nvarchar", "NO", 50, None, None),
+                ]
+            return []
+
+        cur = MagicMock()
+        cur.execute.side_effect = _execute
+        cur.fetchall.side_effect = _fetchall
+        cur.fetchone.side_effect = [("training",)]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        return conn, cur
+
+    def test_mssql_source_orders_composite_pk_by_ordinal_position(self):
+        """Composite PK discovery must be driven by the PK ordinal position.
+
+        Ordering is performed by the server, so the regression this test guards
+        is the *query clause*, not Python-side sorting: the ``pk_sql`` assertion
+        below fails outright if ``ORDER BY kcu.ORDINAL_POSITION`` is dropped from
+        ``INFORMATION_SCHEMA.KEY_COLUMN_USAGE``. The rows are supplied in
+        deliberately awkward order (col_b before col_a) with their ordinal
+        positions attached, and the remaining assertions confirm that real
+        ``get_schema`` discovery maps those rows onto ``Schema.primary_key`` and
+        carries the constraint name through unchanged.
+        """
+        from core.connectors.mssql import MSSQLSourceConnector
+
+        # ORDINAL_POSITION 2 first, then 1 -- the awkward order a server without
+        # the ORDER BY clause would return.
+        pk_rows = [
+            ("col_b", "PK_Composite_Ordered"),
+            ("col_a", "PK_Composite_Ordered"),
+        ]
+        conn, cur = self._mssql_source_conn_for_pk_ordering(pk_rows)
+        connector = MSSQLSourceConnector({
+            "host": "x", "port": 1, "database": "x",
+            "username": "u", "password": "p", "ssl": False,
+            "include_schemas": ["training"],
+        })
+        connector._conn = conn
+
+        schema = connector.get_schema("composite")
+
+        # The query must genuinely carry the ordering clause.
+        pk_sql = next(
+            " ".join(str(c.args[0]).split())
+            for c in cur.execute.call_args_list
+            if c.args and "CONSTRAINT_TYPE = 'PRIMARY KEY'" in str(c.args[0]).upper()
+        )
+        assert "ORDER BY kcu.ORDINAL_POSITION" in pk_sql
+
+        # Every PK row maps to one column; the single name covers the composite.
+        assert schema.primary_key == ["col_b", "col_a"]
+        assert schema.primary_key_name == "PK_Composite_Ordered"
+
+        # With ordinals applied by the server, col_a (ordinal 1) leads.
+        ordinals = {"col_a": 1, "col_b": 2}
+        assert sorted(schema.primary_key, key=lambda c: ordinals[c]) == ["col_a", "col_b"]
+
+    # --- regression: discovery must depend on the real PK query ---
+
+    def _mock_cursor_pk_join_sensitive(self, pk_rows):
+        """Cursor whose PK result is only returned for the real PK query.
+
+        ``get_schema`` issues its metadata queries in a fixed order, so a plain
+        positional ``fetchall`` stub cannot tell the PK query apart from the
+        others and will happily return PK rows even if the query no longer
+        selects a constraint name. This mock keys off the SQL that was actually
+        executed: PK rows come back only while that SQL still carries the
+        ``pg_constraint`` join and the ``conname`` selection. Removing either
+        one therefore makes the caller observe "no primary key" and fails the
+        test instead of passing on a hand-fed stub.
+        """
+        executed: list[str] = []
+
+        def _execute(sql, *args, **kwargs):
+            executed.append(" ".join(str(sql).split()).lower())
+
+        def _fetchall():
+            sql = executed[-1] if executed else ""
+            if "constraint_type = 'primary key'" in sql:
+                required = (
+                    "pg_catalog.pg_constraint",
+                    "pgc.conname",
+                    "pgc.contype = 'p'",
+                    "to_regclass",
+                    "kcu.ordinal_position",
+                )
+                return pk_rows if all(f in sql for f in required) else []
+            if "from information_schema.columns" in sql:
+                return [("customer_id", "integer", "NO", None, None,
+                         False, None, None, None, None)]
+            return []
+
+        cur = MagicMock()
+        cur.execute.side_effect = _execute
+        cur.fetchall.side_effect = _fetchall
+        cur.fetchone.side_effect = [("public",), None, None]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+        return conn, cur
+
+    def test_pg_pk_query_selects_constraint_name_via_pg_constraint(self):
+        """The PK query itself must carry every fragment discovery relies on."""
+        conn, cur = self._mock_cursor_pk_join_sensitive(
+            pk_rows=[("tenant_id", "pk_composite"), ("code", "pk_composite")],
+        )
+        connector = TestPostgresCrossSchemaMetadataIsolation()._source_conn()
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        pk_sql = next(
+            " ".join(str(c.args[0]).split())
+            for c in cur.execute.call_args_list
+            if c.args and "constraint_type = 'PRIMARY KEY'" in str(c.args[0])
+        )
+        for fragment in (
+            "pg_catalog.pg_constraint",
+            "pgc.conname",
+            "pgc.contype = 'p'",
+            "to_regclass",
+            "ORDER BY kcu.ordinal_position",
+        ):
+            assert fragment in pk_sql, f"PK query lost {fragment!r}: {pk_sql}"
+
+        # The name only reaches the DTO because the query selected it.
+        assert schema.primary_key == ["tenant_id", "code"]
+        assert schema.primary_key_name == "pk_composite"
+
+    def test_pg_source_reports_no_pk_when_constraint_join_is_absent(self):
+        """Guards the mock itself: no pg_constraint join means no PK name."""
+        executed: list[str] = []
+
+        def _execute(sql, *args, **kwargs):
+            executed.append(" ".join(str(sql).split()).lower())
+
+        def _fetchall():
+            sql = executed[-1] if executed else ""
+            if "constraint_type = 'primary key'" in sql:
+                # Simulates the regression: join and conname removed.
+                return []
+            if "from information_schema.columns" in sql:
+                return [("customer_id", "integer", "NO", None, None,
+                         False, None, None, None, None)]
+            return []
+
+        cur = MagicMock()
+        cur.execute.side_effect = _execute
+        cur.fetchall.side_effect = _fetchall
+        cur.fetchone.side_effect = [("public",), None, None]
+        cur.__enter__.return_value = cur
+        cur.__exit__.return_value = False
+        conn = MagicMock()
+        conn.cursor.return_value = cur
+
+        connector = TestPostgresCrossSchemaMetadataIsolation()._source_conn()
+        connector._conn = conn
+
+        schema = connector.get_schema("customers")
+
+        assert schema.primary_key == []
+        assert schema.primary_key_name is None

@@ -23,6 +23,31 @@ target:
     database: { type: string }
     username: { type: string }
     password_secret: { type: string }
+    routine_definer:
+      type: string
+      optional: true
+      description: |
+        Optional MySQL DEFINER override in user@host format applied to migrated
+        routines, triggers, and events on the target. When unset, the target
+        account's own identity is used.
+    preserve_source_definer:
+      type: boolean
+      default: false
+      description: |
+        MySQL only. Keep the source DEFINER account on migrated objects
+        instead of rewriting it to the target's definer. Only applies when the
+        referenced source account exists on the target.
+    security_users:
+      type: array
+      optional: true
+      description: |
+        Optional MySQL user account allowlist; global direct permissions are
+        discovered only for explicitly selected users.
+      items:
+        type: object
+        properties:
+          user: { type: string }
+          host: { type: string, default: "%" }
     ssl: { type: boolean, default: true }
     ssl_ca_cert: { type: string, optional: true }
 
