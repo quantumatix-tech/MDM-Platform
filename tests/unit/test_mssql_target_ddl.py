@@ -565,6 +565,48 @@ def test_create_view_none_schema_defaults_to_dbo():
     assert "[dbo].[v_default]" in ddl
 
 
+def test_create_view_strips_newline_separated_create_view_prefix():
+    """Regression: INFORMATION_SCHEMA.VIEWS returns the definition with its
+    original CRLF line breaks, e.g. ``CREATE VIEW training.vw_x\\r\\nAS\\r\\nSELECT``.
+    Matching the separator as a literal " AS " misses it, the qualified name is
+    left in place, and SQL Server rejects the DDL with error 102
+    'Incorrect syntax near training'."""
+    target, cur = _build_target()
+    view = ViewDefinition(
+        name="vw_CustomerOrders",
+        schema_name="training",
+        definition=(
+            "CREATE VIEW training.vw_CustomerOrders\r\nAS\r\n"
+            "SELECT c.CustomerID, o.OrderID\r\n"
+            "FROM dbo.Customers AS c"
+        ),
+    )
+    target.create_view(view)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    ddl = next(s for s in executed if s.upper().startswith("CREATE OR ALTER VIEW"))
+    assert "[training].[vw_CustomerOrders]" in ddl
+    assert "vw_CustomerOrders\r\nAS" not in ddl
+    assert "vw_CustomerOrders AS" not in ddl
+    assert ddl.endswith("SELECT c.CustomerID, o.OrderID\r\nFROM dbo.Customers AS c")
+
+
+def test_create_view_does_not_strip_as_inside_identifier():
+    """A view whose name contains 'AS' as a substring must not be truncated."""
+    target, cur = _build_target()
+    view = ViewDefinition(
+        name="vw_OrderASAP",
+        schema_name="dbo",
+        definition="CREATE VIEW dbo.vw_OrderASAP AS SELECT 1 AS n",
+    )
+    target.create_view(view)
+
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    ddl = next(s for s in executed if s.upper().startswith("CREATE OR ALTER VIEW"))
+    assert "[dbo].[vw_OrderASAP]" in ddl
+    assert ddl.endswith("SELECT 1 AS n")
+
+
 def test_create_view_strips_full_create_view_prefix():
     """Regression: list_views returns definitions that include the full
     'CREATE VIEW schema.name AS' prefix from INFORMATION_SCHEMA.VIEWS.

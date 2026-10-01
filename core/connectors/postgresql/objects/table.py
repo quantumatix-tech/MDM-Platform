@@ -158,6 +158,21 @@ def create_table(conn: Any, schema: Schema) -> None:
                     col_defs.append(
                         f"{col.name} {col_type} GENERATED ALWAYS AS ({col.generated}) STORED"
                     )
+                elif col.is_identity:
+                    # GENERATED ALWAYS/BY DEFAULT AS IDENTITY
+                    kind = col.identity_kind if col.identity_kind in ("ALWAYS", "BY DEFAULT") else "BY DEFAULT"
+                    seed = col.identity_seed
+                    inc = col.identity_increment
+                    opts = []
+                    if seed is not None:
+                        opts.append(f"START WITH {seed}")
+                    if inc is not None:
+                        opts.append(f"INCREMENT BY {inc}")
+                    opt_str = f" ({' '.join(opts)})" if opts else ""
+                    null_str = "NOT NULL"  # identity columns are implicitly NOT NULL in PG
+                    col_defs.append(
+                        f"{col.name} {col_type} GENERATED {kind} AS IDENTITY{opt_str} {null_str}"
+                    )
                 else:
                     null_str = "NULL" if col.nullable else "NOT NULL"
                     default_str = f" DEFAULT {col.default}" if col.default else ""

@@ -6,6 +6,7 @@ an explicit *conn* parameter so that neither ``MSSQLSourceConnector`` nor
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from core.connectors.base import (
@@ -111,9 +112,13 @@ def create_view(conn: Any, view: ViewDefinition) -> None:
             definition = view.definition
             if definition.upper().startswith("CREATE VIEW"):
                 definition = definition[len("CREATE VIEW"):].lstrip()
-                as_idx = definition.upper().find(" AS ")
-                if as_idx >= 0:
-                    definition = definition[as_idx + 4:].lstrip()
+                # SQL Server returns the definition with its original line
+                # breaks (``name\r\nAS\r\nSELECT``), so the separator cannot be
+                # matched as a literal " AS ".  Require surrounding whitespace to
+                # avoid matching inside an identifier such as ``vw_OrderASAP``.
+                as_match = re.search(r"\s+AS\s+", definition, re.IGNORECASE)
+                if as_match:
+                    definition = definition[as_match.end():].lstrip()
             cur.execute(
                 f"CREATE OR ALTER VIEW {view_qname} AS {definition}"
             )

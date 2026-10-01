@@ -48,7 +48,7 @@ def discover_sequences(conn: Any, schemas: tuple[str, ...]) -> list[SequenceDef]
             "  ("
             "    SELECT n.nspname || '.' || pc.relname || '.' || a.attname "
             "    FROM pg_class sc "
-            "    JOIN pg_depend d ON d.objid = sc.oid AND d.deptype = 'a' "
+            "    JOIN pg_depend d ON d.objid = sc.oid AND d.deptype IN ('a', 'i', 'n') "
             "    JOIN pg_class pc ON pc.oid = d.refobjid "
             "    JOIN pg_namespace n ON pc.relnamespace = n.oid "
             "    JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
@@ -93,7 +93,7 @@ def owned_sequences(
             "  n.nspname || '.' || pc.relname || '.' || a.attname AS owned_by "
             "FROM pg_sequences s "
             "JOIN pg_class sc ON sc.relname = s.sequencename AND sc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schemaname) "
-            "JOIN pg_depend d ON d.objid = sc.oid AND d.deptype = 'a' "
+            "JOIN pg_depend d ON d.objid = sc.oid AND d.deptype IN ('a', 'i', 'n') "
             "JOIN pg_class pc ON pc.oid = d.refobjid "
             "JOIN pg_namespace n ON pc.relnamespace = n.oid "
             "JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid "
@@ -107,7 +107,7 @@ def owned_sequences(
                 parts = owned_by.split(".")
                 if len(parts) == 3:
                     owned[(parts[0], parts[1], parts[2])] = (seq_schema, seq_name)
-    return owned
+        return owned
 
 
 # ============================================================================
@@ -154,16 +154,9 @@ def advance_sequence(
 ) -> None:
     """After data load: advance the sequence to max(column) so the next INSERT gets the right value.
 
-    The sequence name is passed via a ``%s`` placeholder (psycopg casts it to
-    regclass automatically), which safely handles quoted names like
-    ``'public."Order-id_seq"'`` without raw f-string injection.
-
-    When the owning column lives in a non-public schema, the table reference in
-    the MAX() query is qualified with the schema taken from ``owned_by``
-    (``schema.table.column``). This qualifies explicitly for *every* schema
-    including ``public`` — the caller supplies a fully-qualified sequence name,
-    so the pairing is resolved from ownership rather than assumed from
-    ``search_path``.
+    Uses pg_get_serial_sequence to resolve the correct sequence for the column,
+    which handles both standalone sequences and identity columns (which may have
+    auto-generated sequence names with numeric suffixes).
     """
     validate_identifier(column, "column")
     table_qname = table
@@ -175,18 +168,29 @@ def advance_sequence(
                 table_qname = f"{quote_identifier(table_schema)}.{quote_identifier(table)}"
     with conn.cursor() as cur:
         try:
+            # Resolve the correct sequence for the column using pg_get_serial_sequence.
+            # This handles identity columns whose internal sequence may have a
+            # different name than the standalone sequence (e.g., suffix _1).
+            cur.execute(
+                "SELECT pg_get_serial_sequence(%s, %s)",
+                (f"{table_qname}", column),
+            )
+            actual_seq = cur.fetchone()[0]
+            if not actual_seq:
+                # Fallback to provided sequence name if pg_get_serial_sequence fails
+                actual_seq = seq_name
             cur.execute(
                 f"SELECT setval(%s::regclass, "
                 f"COALESCE((SELECT MAX({column}) FROM {table_qname}), 0) + 1, false)",
-                (seq_name,),
+                (actual_seq,),
             )
             conn.commit()
             audit_log(phase="advance_sequence", status="advanced",
-                      details={"sequence": seq_name, "table": table, "column": column})
+                      details={"sequence": actual_seq, "table": table, "column": column})
         except Exception as exc:
             conn.rollback()
             audit_log(phase="advance_sequence", status="skipped",
-                      details={"sequence": seq_name, "reason": str(exc)})
+                      details={"sequence": actual_seq if 'actual_seq' in locals() else seq_name, "reason": str(exc)})
 
 
 def sync_sequence(

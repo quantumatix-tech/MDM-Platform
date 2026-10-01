@@ -507,6 +507,9 @@ class MigrationOrchestrator:
                     except Exception as exc:
                         view_results[view.name] = f"error: {exc}"
                         all_errors.append(str(exc))
+                        # Track the failure so the run status cannot report
+                        # success while the object is missing on the target.
+                        failed_objects.add(view.name)
             except Exception as exc:
                 view_results["_error"] = str(exc)
             result["phases"]["views"] = view_results
