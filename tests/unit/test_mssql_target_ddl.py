@@ -874,7 +874,6 @@ def test_create_synonym_rolls_back_and_reraises_on_failure():
             raise RuntimeError("permission denied")
     cur.execute.side_effect = execute_side_effect
     cur.fetchone.return_value = None  # synonym doesn't exist
-    
     syn = SynonymDef(
         name="syn_bad",
         schema_name="dbo",
@@ -1268,9 +1267,9 @@ def test_create_partitioned_table_fresh_target_bug():
 def test_source_list_partition_functions():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("pf_sales_date", "RANGE", True, datetime(2024, 1, 1), 1),
-        ("pf_sales_date", "RANGE", True, datetime(2025, 1, 1), 2),
-        ("pf_sales_date", "RANGE", True, datetime(2026, 1, 1), 3),
+        ("pf_sales_date", "RANGE", True, datetime(2024, 1, 1), 1, "datetime2", None, None, None),
+        ("pf_sales_date", "RANGE", True, datetime(2025, 1, 1), 2, "datetime2", None, None, None),
+        ("pf_sales_date", "RANGE", True, datetime(2026, 1, 1), 3, "datetime2", None, None, None),
     ]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -2783,6 +2782,77 @@ def test_get_schema_discovers_default_constraints():
     status_dc = next(dc for dc in schema.default_constraints if dc.name == "DF_sales_orders_status")
     assert status_dc.column == "status"
     assert status_dc.definition == "('NEW')"
+
+
+def test_get_schema_discovers_unique_constraints_separated_from_indexes():
+    """Unique constraint-backed indexes must be discovered as UniqueConstraint
+    objects, not as regular indexes."""
+    from core.connectors.mssql import MSSQLSourceConnector
+    src = MSSQLSourceConnector({"database": "mssql_migration_test", "source_engine": "mssql"})
+    mock_cur = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cur
+    mock_conn.cursor.return_value.__exit__.return_value = False
+    src._conn = mock_conn
+
+    mock_cur.fetchone.return_value = ("sales",)
+    mock_cur.fetchall.side_effect = [
+        [],  # identity metadata
+        [],  # UDT columns
+        [],  # columns
+        [  # indexes — one regular idx, one unique-constraint-backed idx
+            ("IX_orders_customer", True, False, False, 1, False, False, "customer_id", None),
+            ("UQ_orders_email", True, False, True, 1, False, False, "email", None),
+        ],
+        [],  # primary key
+        [],  # foreign keys
+        [],  # check constraints
+        [],  # default constraints
+    ]
+    schema = src.get_schema("orders")
+    assert len(schema.unique_constraints) == 1
+    assert schema.unique_constraints[0].name == "UQ_orders_email"
+    assert schema.unique_constraints[0].columns == ["email"]
+    assert len(schema.indexes) == 1
+    assert schema.indexes[0].name == "IX_orders_customer"
+
+
+def test_apply_constraints_creates_unique_constraint():
+    """apply_constraints must emit ALTER TABLE ... ADD CONSTRAINT ... UNIQUE."""
+    from core.connectors.base import UniqueConstraint
+    target, cur = _build_target_with_constraints()
+    schema = Schema(
+        name="customers", schema_name="training", columns=[], primary_key=[],
+        unique_constraints=[
+            UniqueConstraint(name="UQ_Customers_Email", columns=["Email"]),
+        ],
+    )
+    target.apply_constraints(schema)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+    uq_sql = next(s for s in executed if "UQ_Customers_Email" in s)
+    assert "ADD CONSTRAINT" in uq_sql.upper()
+    assert "UNIQUE" in uq_sql.upper()
+    assert "Email" in uq_sql
+    assert target._conn.commit.called
+
+
+def test_apply_constraints_skips_existing_unique():
+    """Unique constraints already present on the target must be skipped."""
+    from core.connectors.base import UniqueConstraint
+    target, cur = _build_target_with_constraints()
+
+    def _fetchall():
+        return [("UQ_Customers_Email",)]
+    cur.fetchall.side_effect = _fetchall
+    schema = Schema(
+        name="customers", schema_name="training", columns=[], primary_key=[],
+        unique_constraints=[
+            UniqueConstraint(name="UQ_Customers_Email", columns=["Email"]),
+        ],
+    )
+    target.apply_constraints(schema)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list]
+    assert not any("UQ_Customers_Email" in s and "ADD CONSTRAINT" in s.upper() for s in executed)
 
 
 

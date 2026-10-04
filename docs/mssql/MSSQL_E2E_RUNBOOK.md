@@ -583,6 +583,55 @@ Final status: SUCCESS
 
 ---
 
+## Phase E — Full End-to-End Pipeline
+
+The `run_full_e2e.py` orchestrator chains all phases (A -> B -> C1 -> C2 -> D) into a single command and produces a consolidated JSON report.
+
+### Prerequisites
+
+- SQL Server running on `localhost,1533` (named instance `DMSQL`).
+- `sa` credentials set via environment variables:
+
+```powershell
+$env:SECRET_mssql_e2e_source_pass = "<sa-password>"
+$env:SECRET_mssql_e2e_target_pass = "<sa-password>"
+```
+
+### Run Command
+
+```powershell
+python tests/e2e/mssql/run_full_e2e.py --clean
+```
+
+Flags:
+
+- `--clean` — reset both E2E databases (`MigrationE2E_MSSQL_Source`, `MigrationE2E_MSSQL_Target`) before starting.
+- `--report-only` — skip all phases; consolidate existing per-phase reports from disk.
+
+### Phase Sequence
+
+| Phase | Description | Checks |
+|---|---|---|
+| A | DB reset + fixture load (15 SQL scripts) | 16 |
+| B | Source structural validation | 72 |
+| C1 | Target reset + pre-migration validation | 12 |
+| C2 | Real migration via `MigrationOrchestrator` | 7 |
+| D | Target structural + S/T comparison + functional | 105 |
+
+### Safety Guards
+
+- Only databases matching `^MigrationE2E_MSSQL_.+$` may be dropped or reset.
+- The following databases are permanently protected and can never be touched: `master`, `model`, `msdb`, `tempdb`, `MigrationSource_MSSQL`, `MigrationTarget_MSSQL`.
+
+### Exit Codes
+
+- `0` — all phases passed, consolidated report written.
+- `1` — at least one phase failed; the runner stops at the first failed phase and exits non-zero.
+
+### Report Output
+
+`tests/e2e/mssql/reports/e2e_consolidated_report.json`
+
 ## Reference
 
 - Object support matrix: `docs/mssql/MSSQL_OBJECT_SUPPORT_MATRIX.md`
