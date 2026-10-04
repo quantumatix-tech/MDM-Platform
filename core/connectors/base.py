@@ -150,6 +150,7 @@ class PartitionDef:
     name: str
     parent_table: str
     bound: str          # e.g. "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')"
+    schema: str = "public"
 
 
 @dataclass
@@ -200,6 +201,7 @@ class TypeDef:
     name: str
     kind: str           # 'enum', 'domain', 'composite'
     ddl: str            # complete CREATE DDL — ready to execute
+    schema: str = "public"
 
 
 @dataclass
