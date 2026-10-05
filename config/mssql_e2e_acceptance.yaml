@@ -1,0 +1,94 @@
+# E2E Acceptance Demo Configuration — MSSQL
+#
+# Used by the REAL MIGRATION acceptance workflow (Mode 2):
+#
+#   1. Setup:   python tests/e2e/mssql/run_setup.py --config config/mssql_e2e_acceptance.yaml
+#   2. Migrate: python -m migration_platform --config config/mssql_e2e_acceptance.yaml --mode full
+#   3. Validate: python tests/e2e/mssql/run_validation.py --config config/mssql_e2e_acceptance.yaml
+#
+# Passwords are resolved at runtime from environment variables via the
+# platform's SECRET_<name> convention (see core/secrets/env.py).
+#
+# Required environment variables:
+#   SECRET_mssql_e2e_source_pass  — sa password for source SQL Server
+#   SECRET_mssql_e2e_target_pass  — sa password for target SQL Server
+
+source:
+  engine: mssql
+  connection:
+    host: localhost
+    port: 1533
+    database: MigrationE2E_MSSQL_Source
+    username: sa
+    password_secret: mssql_e2e_source_pass
+    ssl: false
+
+target:
+  engine: mssql
+  connection:
+    host: localhost
+    port: 1533
+    database: MigrationE2E_MSSQL_Target
+    username: sa
+    password_secret: mssql_e2e_target_pass
+    ssl: false
+    source_engine: mssql
+
+migration:
+  mode: full
+  batch_size: 1000
+  include_schemas:
+    - training
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO
+
+# E2E-specific settings consumed by the acceptance setup/validation runners.
+e2e:
+  engine: mssql
+  schema: training
+  fixture_path: tests/e2e/mssql/fixtures
+  source_database: MigrationE2E_MSSQL_Source
+  target_database: MigrationE2E_MSSQL_Target
+
+  # Safety: only databases whose name matches this regex may be dropped/created.
+  safe_db_pattern: "^MigrationE2E_MSSQL_.+$"
+
+  cleanup:
+    mode: on_success   # always | on_success | never
+
+  security:
+    enabled: true
+
+  functional:
+    enabled: true
+
+  expected:
+    schemas:
+      - training
+    tables:
+      - training.Customers
+      - training.Products
+      - training.Orders
+      - training.OrderDetails
+      - training.OrderAudit
+      - training.PK_Name_Test
+      - training.PartitionedOrders
+    row_counts:
+      training.Customers: 5
+      training.Products: 5
+      training.Orders: 5
+      training.OrderDetails: 8
+      training.OrderAudit: 5
+      training.PK_Name_Test: 2
+      training.PartitionedOrders: 3

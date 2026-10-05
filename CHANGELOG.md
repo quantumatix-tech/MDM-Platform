@@ -44,6 +44,27 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - The 4 pre-existing unit test failures and the existing Ruff backlog are
   unchanged by this work.
 
+## [0.2.1] - 2026-10-04
+
+### Added
+
+- **Acceptance E2E workflow (Mode 2).** New setup → external migration → validation
+  flow for real product/acceptance testing, coexisting with the existing automated
+  regression E2E (Mode 1). Supports MSSQL, PostgreSQL, and MySQL.
+  - `tests/e2e/acceptance/` — shared utilities (`E2EConfig`, config loader,
+    report writer, phase/count formatters).
+  - Per-engine `run_setup.py` and `run_validation.py` runners under
+    `tests/e2e/{mssql,postgresql,mysql}/`.
+  - `tests/e2e/acceptance_clean.py` — shared cleanup runner for all engines.
+  - Demo configs: `config/{mssql,postgresql,mysql}_e2e_acceptance.yaml`.
+  - `docs/e2e_validation/ACCEPTANCE_RUNBOOK.md` — full workflow documentation.
+  - `tests/unit/test_e2e_acceptance.py` — 28 unit tests for the shared module.
+
+### Changed
+
+- Replaced duplicate `_fmt_phase` helpers in per-engine validation runners with the
+  shared `fmt_phase` from `tests/e2e/acceptance/`.
+
 ## [0.2.0] - 2026-10-01
 
 First tagged release. Contains the completed platform architecture transition.

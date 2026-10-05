@@ -1,0 +1,97 @@
+# E2E Acceptance Demo Configuration — PostgreSQL
+#
+# Used by the REAL MIGRATION acceptance workflow (Mode 2):
+#
+#   1. Setup:   python tests/e2e/postgresql/run_setup.py --config config/postgresql_e2e_acceptance.yaml
+#   2. Migrate: python -m migration_platform --config config/postgresql_e2e_acceptance.yaml --mode full
+#   3. Validate: python tests/e2e/postgresql/run_validation.py --config config/postgresql_e2e_acceptance.yaml
+#
+# Passwords are resolved at runtime from environment variables via the
+# platform's SECRET_<name> convention (see core/secrets/env.py).
+#
+# Required environment variables:
+#   SECRET_postgresql_e2e_source_pass  — postgres password for source DB
+#   SECRET_postgresql_e2e_target_pass  — postgres password for target DB
+#
+# For local dev without passwords, omit the env vars and the PostgreSQL
+# instance will use trust authentication.
+
+source:
+  engine: postgresql
+  connection:
+    host: 127.0.0.1
+    port: 55432
+    database: MigrationE2E_PostgreSQL_Source
+    username: postgres
+    password_secret: postgresql_e2e_source_pass
+    ssl: false
+
+target:
+  engine: postgresql
+  connection:
+    host: 127.0.0.1
+    port: 55432
+    database: MigrationE2E_PostgreSQL_Target
+    username: postgres
+    password_secret: postgresql_e2e_target_pass
+    ssl: false
+    source_engine: postgresql
+
+migration:
+  mode: full
+  batch_size: 1000
+  include_schemas:
+    - training
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO
+
+# E2E-specific settings consumed by the acceptance setup/validation runners.
+e2e:
+  engine: postgresql
+  schema: training
+  fixture_path: tests/e2e/postgresql/fixtures
+  source_database: MigrationE2E_PostgreSQL_Source
+  target_database: MigrationE2E_PostgreSQL_Target
+
+  # Safety: only databases whose name matches this regex may be dropped/created.
+  safe_db_pattern: "^MigrationE2E_PostgreSQL_.+$"
+
+  cleanup:
+    mode: on_success   # always | on_success | never
+
+  security:
+    enabled: true
+
+  functional:
+    enabled: true
+
+  expected:
+    schemas:
+      - training
+    tables:
+      - training.customers
+      - training.products
+      - training.orders
+      - training.orderdetails
+      - training.orderaudit
+      - training.pk_name_test
+      - training.partitionedorders
+    row_counts:
+      training.customers: 5
+      training.products: 5
+      training.orders: 5
+      training.orderdetails: 8
+      training.orderaudit: 5
+      training.pk_name_test: 2
+      training.partitionedorders: 3
