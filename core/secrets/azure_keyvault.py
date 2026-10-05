@@ -10,6 +10,8 @@ logger = logging.getLogger("migration_platform.secrets")
 
 class AzureKeyVaultProvider(SecretProvider):
     def __init__(self, vault_url: str, credential: Any = None) -> None:
+        if not vault_url:
+            raise ValueError("Azure Key Vault URL is required")
         self._vault_url = vault_url
         self._credential = credential
         self._client: Any = None
@@ -37,5 +39,25 @@ class AzureKeyVaultProvider(SecretProvider):
             raise RuntimeError(
                 f"Cannot resolve secret '{name}': Azure Key Vault SDK not available"
             )
-        retrieved = client.get_secret(name)
+        try:
+            retrieved = client.get_secret(name)
+        except Exception as exc:
+            error_type = type(exc).__name__
+            status_code = getattr(exc, "status_code", None)
+            if error_type == "ResourceNotFoundError":
+                message = f"Azure Key Vault secret '{name}' was not found."
+            elif error_type in {"ClientAuthenticationError", "CredentialUnavailableError"}:
+                message = f"Azure authentication failed while retrieving secret '{name}'."
+            elif status_code == 403 or error_type == "ForbiddenError":
+                message = (
+                    f"Azure Key Vault denied access to secret '{name}'; "
+                    "verify the identity has secret get permission."
+                )
+            else:
+                message = (
+                    f"Failed to retrieve secret '{name}' from Azure Key Vault; "
+                    "verify the vault URL, network access, and secret name."
+                )
+            logger.error("%s (%s)", message, error_type)
+            raise RuntimeError(message) from None
         return retrieved.value

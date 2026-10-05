@@ -48,7 +48,23 @@ class MigrationOrchestrator:
         )
         self._field_mappings = config.get("migration", {}).get("field_mappings", [])
         self._notifier = create_notifier(config.get("alerting", {}))
-        self._secret_resolver = create_secret_provider(config)
+        source_provider = config.get("source", {}).get("secret_provider")
+        target_provider = config.get("target", {}).get("secret_provider")
+        self._secret_resolver = (
+            create_secret_provider(config)
+            if source_provider is None or target_provider is None
+            else None
+        )
+        self._source_secret_resolver = (
+            create_secret_provider(config, source_provider)
+            if source_provider is not None
+            else self._secret_resolver
+        )
+        self._target_secret_resolver = (
+            create_secret_provider(config, target_provider)
+            if target_provider is not None
+            else self._secret_resolver
+        )
         self._status = status_server
 
     def _resolve_secrets(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -72,6 +88,76 @@ class MigrationOrchestrator:
             except Exception:
                 pass
         return total
+
+    @staticmethod
+    def _order_data_load_objects(
+        schemas: dict[str, Any], object_order: list[str] | None = None
+    ) -> list[str]:
+        """Order the current data-load objects using their Schema FK metadata.
+
+        This is intentionally scoped to data loading: table creation and the
+        later constraint/object phases retain their existing ordering. The
+        discovery order is the stable tie-breaker for unrelated tables.
+        """
+        order = list(object_order) if object_order is not None else list(schemas)
+        order = [name for name in order if name in schemas]
+        order.extend(name for name in schemas if name not in order)
+        positions = {name: index for index, name in enumerate(order)}
+
+        qualified_names: dict[tuple[str, str], str] = {}
+        names_by_table: dict[str, list[str]] = {}
+        for name, schema in schemas.items():
+            table_name = getattr(schema, "name", name).casefold()
+            schema_name = getattr(schema, "schema_name", None)
+            names_by_table.setdefault(table_name, []).append(name)
+            if schema_name:
+                qualified_names[(schema_name.casefold(), table_name)] = name
+
+        dependencies: dict[str, set[str]] = {name: set() for name in order}
+        dependents: dict[str, set[str]] = {name: set() for name in order}
+        for child, schema in schemas.items():
+            child_schema = getattr(schema, "schema_name", None)
+            for foreign_key in getattr(schema, "foreign_keys", ()) or ():
+                referenced_table = getattr(foreign_key, "ref_table", None)
+                if not referenced_table:
+                    continue
+                referenced_schema = getattr(foreign_key, "ref_schema", None) or child_schema
+                parent = None
+                if referenced_schema:
+                    parent = qualified_names.get(
+                        (referenced_schema.casefold(), referenced_table.casefold())
+                    )
+                if parent is None:
+                    candidates = names_by_table.get(referenced_table.casefold(), [])
+                    if len(candidates) == 1:
+                        parent = candidates[0]
+                if parent is not None:
+                    dependencies[child].add(parent)
+                    dependents[parent].add(child)
+
+        ready = [name for name in order if not dependencies[name]]
+        result: list[str] = []
+        while ready:
+            current = ready.pop(0)
+            result.append(current)
+            for dependent in sorted(dependents[current], key=positions.__getitem__):
+                dependencies[dependent].discard(current)
+                if not dependencies[dependent] and dependent not in result and dependent not in ready:
+                    insertion_point = next(
+                        (i for i, candidate in enumerate(ready)
+                         if positions[candidate] > positions[dependent]),
+                        len(ready),
+                    )
+                    ready.insert(insertion_point, dependent)
+
+        if len(result) != len(order):
+            blocked = [name for name in order if name not in result]
+            raise ValueError(
+                "Foreign-key dependency cycle prevents safe data loading; affected "
+                f"objects (including dependents blocked by the cycle): {', '.join(blocked)}. "
+                "Resolve or defer the cyclic constraints before retrying."
+            )
+        return result
 
     def _record_object_failure(
         self,
@@ -124,8 +210,16 @@ class MigrationOrchestrator:
 
         try:
             # ---------- Connect ----------
-            self._resolve_connector_secrets(self._source, self._config.get("source", {}))
-            self._resolve_connector_secrets(self._target, self._config.get("target", {}))
+            self._resolve_connector_secrets(
+                self._source,
+                self._config.get("source", {}),
+                self._source_secret_resolver,
+            )
+            self._resolve_connector_secrets(
+                self._target,
+                self._config.get("target", {}),
+                self._target_secret_resolver,
+            )
             self._apply_schema_scope(self._source)
             self._source.connect()
             self._target.connect()
@@ -347,6 +441,8 @@ class MigrationOrchestrator:
             # target-only rows (including rows from past trigger side effects)
             # cannot survive a successful run.  Connectors that do not define
             # replacement semantics retain the historical upsert-only behaviour.
+            data_load_order = self._order_data_load_objects(all_schemas, objects)
+            result["phases"]["data_load_order"] = data_load_order
             cleared_objects = self._target.clear_objects_for_full_sync(list(all_schemas))
             result["phases"]["full_target_sync"] = {
                 "strategy": "clear-before-load",
@@ -355,7 +451,8 @@ class MigrationOrchestrator:
             schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
             total_rows = self._estimate_total_rows(objects, schema_map)
             processed_rows = 0
-            for idx, (obj_name, schema) in enumerate(all_schemas.items(), start=1):
+            for idx, obj_name in enumerate(data_load_order, start=1):
+                schema = all_schemas[obj_name]
                 upsert_result = UpsertResult()
                 count: int | None = None
                 try:
@@ -717,6 +814,11 @@ class MigrationOrchestrator:
             self._update_status("failed", 0, all_errors + [str(exc)])
             if self._notifier is not None:
                 self._notifier.notify({"phase": "run_full", "status": "failed", "details": {"error": str(exc)}})
+        finally:
+            try:
+                self._source.close()
+            finally:
+                self._target.close()
 
         end_time = time.time()
         audit_log(phase="run_full", status="completed", details={
@@ -725,13 +827,19 @@ class MigrationOrchestrator:
         })
         return result
 
-    def _resolve_connector_secrets(self, connector: Any, config: dict[str, Any]) -> None:
-        if self._secret_resolver is None:
+    def _resolve_connector_secrets(
+        self,
+        connector: Any,
+        config: dict[str, Any],
+        resolver: Any = None,
+    ) -> None:
+        resolver = resolver or self._secret_resolver
+        if resolver is None:
             return
         # password_secret lives under config["connection"], not at the top-level config
         connection_config = config.get("connection", config)
         if "password_secret" in connection_config:
-            connector._config["password"] = self._secret_resolver.resolve(connection_config["password_secret"])
+            connector._config["password"] = resolver.resolve(connection_config["password_secret"])
 
     def _apply_schema_scope(self, source: Any) -> None:
         """
@@ -962,8 +1070,16 @@ class MigrationOrchestrator:
             # Fix #4: resolve secrets on the connector objects FIRST so that
             # self._source._config["password"] is populated before we read it
             # back for the CDC engine connection below.
-            self._resolve_connector_secrets(self._source, self._config.get("source", {}))
-            self._resolve_connector_secrets(self._target, self._config.get("target", {}))
+            self._resolve_connector_secrets(
+                self._source,
+                self._config.get("source", {}),
+                self._source_secret_resolver,
+            )
+            self._resolve_connector_secrets(
+                self._target,
+                self._config.get("target", {}),
+                self._target_secret_resolver,
+            )
             self._apply_schema_scope(self._source)
             self._source.connect()
             self._target.connect()
@@ -1100,7 +1216,9 @@ class MigrationOrchestrator:
             schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
             total_rows = self._estimate_total_rows(objects, schema_map)
             processed_rows = 0
-            for idx, obj_name in enumerate(objects, start=1):
+            data_load_order = self._order_data_load_objects(all_schemas, objects)
+            result["phases"]["data_load_order"] = data_load_order
+            for idx, obj_name in enumerate(data_load_order, start=1):
                 schema = all_schemas[obj_name]
                 count = self._source.get_object_count(obj_name, schema.schema_name if hasattr(schema, "schema_name") else None)
                 rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)

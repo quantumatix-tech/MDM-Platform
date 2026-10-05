@@ -14,6 +14,7 @@ from core.connectors.base import (
     TargetConnector,
     Schema,
     Column,
+    ForeignKey,
     UpsertResult,
     ViewDefinition,
     FunctionDef,
@@ -176,6 +177,123 @@ def test_partitioned_table_excluded_from_create_tables_incremental():
     # Verify create_partitioned_table WAS called for partitioned_table
     partitioned_calls = [call.args[0].name for call in target.create_partitioned_table.call_args_list]
     assert "partitioned_table" in partitioned_calls, "Partitioned table should be created in create_partitions phase"
+
+
+def test_full_migration_loads_data_in_schema_dependency_order():
+    orchestrator, source, target = _orchestrator_for_order_test()
+    objects = ["child", "independent", "parent"]
+    schemas = {
+        "child": Schema(
+            name="child",
+            schema_name="dbo",
+            columns=[Column(name="id", source_type="int")],
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_child_parent",
+                    columns=["parent_id"],
+                    ref_table="parent",
+                    ref_columns=["id"],
+                    ref_schema="dbo",
+                )
+            ],
+        ),
+        "independent": _schema("independent"),
+        "parent": _schema("parent"),
+    }
+    source.list_objects.return_value = objects
+    source.get_schema.side_effect = lambda name, **kw: schemas[name]
+
+    result = orchestrator.run_full()
+
+    loaded = [call.args[0] for call in target.upsert_batch.call_args_list]
+    assert loaded == ["independent", "parent", "child"]
+    assert result["phases"]["data_load_order"] == loaded
+
+
+def test_full_migration_reports_fk_cycle_before_clearing_or_loading_data():
+    orchestrator, source, target = _orchestrator_for_order_test()
+    objects = ["A", "B"]
+    schemas = {
+        "A": Schema(
+            name="A",
+            schema_name="dbo",
+            foreign_keys=[ForeignKey("fk_A_B", ["b_id"], "B", ["id"], "dbo")],
+        ),
+        "B": Schema(
+            name="B",
+            schema_name="dbo",
+            foreign_keys=[ForeignKey("fk_B_A", ["a_id"], "A", ["id"], "dbo")],
+        ),
+    }
+    source.list_objects.return_value = objects
+    source.get_schema.side_effect = lambda name, **kw: schemas[name]
+
+    result = orchestrator.run_full()
+
+    assert result["status"] == "failed"
+    assert "dependency cycle" in result["error"]
+    target.clear_objects_for_full_sync.assert_not_called()
+    target.upsert_batch.assert_not_called()
+
+
+def test_data_load_order_handles_chains_and_multiple_parents():
+    schemas = {
+        "leaf": Schema(
+            name="leaf",
+            schema_name="dbo",
+            foreign_keys=[
+                ForeignKey("fk_leaf_middle", ["middle_id"], "middle", ["id"], "dbo"),
+                ForeignKey("fk_leaf_other", ["other_id"], "other", ["id"], "dbo"),
+            ],
+        ),
+        "middle": Schema(
+            name="middle",
+            schema_name="dbo",
+            foreign_keys=[ForeignKey("fk_middle_root", ["root_id"], "root", ["id"], "dbo")],
+        ),
+        "root": _schema("root"),
+        "other": _schema("other"),
+    }
+
+    order = MigrationOrchestrator._order_data_load_objects(
+        schemas, ["leaf", "middle", "other", "root"]
+    )
+
+    assert order.index("root") < order.index("middle") < order.index("leaf")
+    assert order.index("other") < order.index("leaf")
+
+
+def test_data_load_order_preserves_order_without_fks_and_for_unrelated_objects():
+    no_fks = {name: _schema(name) for name in ["z", "a", "m"]}
+    assert MigrationOrchestrator._order_data_load_objects(no_fks) == ["z", "a", "m"]
+
+    schemas = {"A": _schema("A"), "B": _schema("B"), "C": Schema(
+        name="C",
+        schema_name="dbo",
+        foreign_keys=[ForeignKey("fk_C_A", ["a_id"], "A", ["id"], "dbo")],
+    )}
+    assert MigrationOrchestrator._order_data_load_objects(schemas) == ["A", "B", "C"]
+
+
+def test_data_load_order_uses_schema_qualified_reference_when_names_repeat():
+    schemas = {
+        "child": Schema(
+            name="child",
+            schema_name="child_schema",
+            foreign_keys=[
+                ForeignKey("fk_child_parent", ["parent_id"], "parent", ["id"], "target_schema")
+            ],
+        ),
+        "target_parent": Schema(name="parent", schema_name="target_schema"),
+        "other_parent": Schema(name="parent", schema_name="other_schema"),
+    }
+
+    order = MigrationOrchestrator._order_data_load_objects(
+        schemas, ["child", "target_parent", "other_parent"]
+    )
+
+    assert order.index("target_parent") < order.index("child")
+    assert order.index("child") < order.index("other_parent")
 
 
 def test_phase_order_schemas_before_tables():

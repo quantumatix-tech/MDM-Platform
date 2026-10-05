@@ -4,6 +4,11 @@ source:
   engine:
     type: string
     enum: [postgresql, mysql, mongodb, mssql]
+  secret_provider:
+    type: string
+    optional: true
+    enum: [env, aws_secrets_manager, gcp_secret_manager, hashicorp_vault, local_encrypted_file, azure_keyvault]
+    description: Overrides secrets.provider for the source connection only.
   connection:
     host: { type: string }
     port: { type: integer }
@@ -17,6 +22,11 @@ target:
   engine:
     type: string
     enum: [postgresql, mysql, mongodb, mssql, cosmos_mongo]
+  secret_provider:
+    type: string
+    optional: true
+    enum: [env, aws_secrets_manager, gcp_secret_manager, hashicorp_vault, local_encrypted_file, azure_keyvault]
+    description: Overrides secrets.provider for the target connection only.
   connection:
     host: { type: string }
     port: { type: integer }
@@ -124,8 +134,15 @@ secrets:
     token: { type: string }
     mount_point: { type: string, default: secret }
   local_encrypted_file:
-    file: { type: string, default: secrets.enc }
-    key_source: { type: string, enum: [env, keyring], default: env }
+    file:
+      type: string
+      optional: true
+      description: Defaults to the platform Local Store path; set explicitly for a custom store.
+    key_source:
+      type: string
+      enum: [env, keyring]
+      optional: true
+      description: Defaults to keyring on Windows and env on other platforms.
     key_env_var: { type: string, default: MIGRATION_SECRETS_KEY }
     keyring_service: { type: string, default: migration-platform/secrets-key }
     auto_create: { type: boolean, default: false }
