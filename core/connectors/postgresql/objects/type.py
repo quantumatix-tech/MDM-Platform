@@ -11,8 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.audit_logger import audit_log
-from core.connectors.base import TypeDef
-
+from core.connectors.base import TypeDef, quote_identifier
 
 # ============================================================================
 # SOURCE-SIDE TYPE OPERATIONS
@@ -30,24 +29,25 @@ def discover_types(conn: Any, schemas: tuple[str, ...]) -> list[TypeDef]:
     with conn.cursor() as cur:
         # ENUMs
         cur.execute(
-            "SELECT t.typname, "
+            "SELECT n.nspname, t.typname, "
             "  array_agg(e.enumlabel ORDER BY e.enumsortorder) AS labels "
             "FROM pg_type t "
             "JOIN pg_enum e ON t.oid = e.enumtypid "
             "JOIN pg_namespace n ON t.typnamespace = n.oid "
             "WHERE n.nspname = ANY(%s) "
-            "GROUP BY t.typname ORDER BY t.typname",
+            "GROUP BY n.nspname, t.typname ORDER BY n.nspname, t.typname",
             (list(schemas),),
         )
         for row in cur.fetchall():
-            type_name, labels = row
+            schema, type_name, labels = row
             labels_sql = ", ".join(f"'{lbl}'" for lbl in labels)
-            ddl = f"CREATE TYPE {type_name} AS ENUM ({labels_sql})"
-            types.append(TypeDef(name=type_name, kind="enum", ddl=ddl))
+            qualified = f"{quote_identifier(schema)}.{quote_identifier(type_name)}"
+            ddl = f"CREATE TYPE {qualified} AS ENUM ({labels_sql})"
+            types.append(TypeDef(name=type_name, kind="enum", ddl=ddl, schema=schema))
 
         # DOMAINs
         cur.execute(
-            "SELECT t.typname, "
+            "SELECT n.nspname, t.typname, "
             "  pg_catalog.format_type(t.typbasetype, t.typtypmod) AS base, "
             "  pg_catalog.pg_get_expr(t.typdefaultbin, 0) AS dflt, "
             "  t.typnotnull, "
@@ -57,23 +57,24 @@ def discover_types(conn: Any, schemas: tuple[str, ...]) -> list[TypeDef]:
             "FROM pg_type t "
             "JOIN pg_namespace n ON t.typnamespace = n.oid "
             "WHERE t.typtype = 'd' AND n.nspname = ANY(%s) "
-            "ORDER BY t.typname",
+            "ORDER BY n.nspname, t.typname",
             (list(schemas),),
         )
         for row in cur.fetchall():
-            type_name, base, dflt, notnull, checks = row
-            ddl = f"CREATE DOMAIN {type_name} AS {base}"
+            schema, type_name, base, dflt, notnull, checks = row
+            qualified = f"{quote_identifier(schema)}.{quote_identifier(type_name)}"
+            ddl = f"CREATE DOMAIN {qualified} AS {base}"
             if dflt:
                 ddl += f" DEFAULT {dflt}"
             if notnull:
                 ddl += " NOT NULL"
             if checks:
                 ddl += f" {checks}"
-            types.append(TypeDef(name=type_name, kind="domain", ddl=ddl))
+            types.append(TypeDef(name=type_name, kind="domain", ddl=ddl, schema=schema))
 
         # COMPOSITE types
         cur.execute(
-            "SELECT t.typname, "
+            "SELECT n.nspname, t.typname, "
             "  string_agg(a.attname || ' ' || pg_catalog.format_type(a.atttypid, a.atttypmod), "
             "    ', ' ORDER BY a.attnum) AS cols "
             "FROM pg_type t "
@@ -82,13 +83,14 @@ def discover_types(conn: Any, schemas: tuple[str, ...]) -> list[TypeDef]:
             "JOIN pg_namespace n ON t.typnamespace = n.oid "
             "WHERE t.typtype = 'c' AND n.nspname = ANY(%s) "
             "  AND c.relkind = 'c' "
-            "GROUP BY t.typname ORDER BY t.typname",
+            "GROUP BY n.nspname, t.typname ORDER BY n.nspname, t.typname",
             (list(schemas),),
         )
         for row in cur.fetchall():
-            type_name, cols = row
-            ddl = f"CREATE TYPE {type_name} AS ({cols})"
-            types.append(TypeDef(name=type_name, kind="composite", ddl=ddl))
+            schema, type_name, cols = row
+            qualified = f"{quote_identifier(schema)}.{quote_identifier(type_name)}"
+            ddl = f"CREATE TYPE {qualified} AS ({cols})"
+            types.append(TypeDef(name=type_name, kind="composite", ddl=ddl, schema=schema))
 
     return types
 
@@ -100,25 +102,24 @@ def discover_types(conn: Any, schemas: tuple[str, ...]) -> list[TypeDef]:
 def create_type(conn: Any, type_def: TypeDef) -> None:
     """Create a user-defined type on the target, skipping if already present.
 
-    Known limitation (pre-existing, deliberately unchanged): the existence
-    probe only checks the ``public`` schema, so a same-named type in another
-    schema is not detected and the CREATE will fail. That failure is audited
-    as "skipped" rather than raised, so the migration continues.
+    Checks for existence in the type's own schema (``type_def.schema``) and
+    generates schema-qualified DDL, so types defined in non-``public`` schemas
+    (e.g. ``training``) are created in the correct location.
     """
+    schema = type_def.schema or "public"
     with conn.cursor() as cur:
         try:
-            # Check if type already exists
             cur.execute(
                 "SELECT 1 FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid "
-                "WHERE t.typname = %s AND n.nspname = 'public'",
-                (type_def.name,),
+                "WHERE t.typname = %s AND n.nspname = %s",
+                (type_def.name, schema),
             )
             if cur.fetchone() is not None:
                 return
             cur.execute(type_def.ddl)
             conn.commit()
             audit_log(phase="create_type", status="created",
-                      details={"type": type_def.name, "kind": type_def.kind})
+                      details={"type": type_def.name, "kind": type_def.kind, "schema": schema})
         except Exception as exc:
             conn.rollback()
             audit_log(phase="create_type", status="skipped",

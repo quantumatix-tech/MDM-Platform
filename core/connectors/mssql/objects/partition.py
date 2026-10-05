@@ -32,21 +32,21 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
+from core.audit_logger import audit_log
 from core.connectors.base import (
     Schema,
     quote_identifier,
     validate_identifier,
 )
 from core.connectors.mssql._models import (
+    PartitionedTableDef,
     PartitionFunctionDef,
     PartitionSchemeDef,
-    PartitionedTableDef,
+    _mssql_column_type,
     _qualify,
     _resolve_mssql_schemas,
 )
 from core.connectors.mssql.objects.table import _column_ddl
-from core.audit_logger import audit_log
-
 
 # ---------------------------------------------------------------------------
 # 1. SOURCE-SIDE PARTITION OPERATIONS
@@ -64,21 +64,32 @@ def list_partition_functions(conn: Any) -> list[PartitionFunctionDef]:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT pf.name, pf.type_desc, pf.boundary_value_on_right, "
-            "prv.value, prv.boundary_id "
+            "prv.value, prv.boundary_id, "
+            "tp.name AS param_type, pp.max_length, pp.precision, pp.scale "
             "FROM sys.partition_functions pf "
             "LEFT JOIN sys.partition_range_values prv "
             "  ON prv.function_id = pf.function_id "
+            "LEFT JOIN sys.partition_parameters pp "
+            "  ON pp.function_id = pf.function_id "
+            "LEFT JOIN sys.types tp ON tp.user_type_id = pp.user_type_id "
             "ORDER BY pf.name, prv.boundary_id",
         )
         pf_map: dict = {}
         for row in cur.fetchall():
-            pf_name, type_desc, bvr, value, boundary_id = row
+            (
+                pf_name, _type_desc, bvr, value, _boundary_id,
+                param_type, max_length, precision, scale,
+            ) = row
             if pf_name not in pf_map:
                 range_desc = "RANGE RIGHT" if bvr else "RANGE LEFT"
+                data_type = _mssql_column_type(
+                    (param_type or "datetime2"),
+                    max_length, precision, scale,
+                )
                 pf_map[pf_name] = PartitionFunctionDef(
                     name=pf_name,
                     schema_name="dbo",
-                    data_type="datetime2",
+                    data_type=data_type,
                     boundaries=[],
                     range_desc=range_desc,
                 )
@@ -157,6 +168,7 @@ def get_partitioned_tables(
                 "LEFT JOIN sys.index_columns ic "
                 "  ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
                 "  AND ic.is_included_column = 0 "
+                "  AND ic.partition_ordinal > 0 "
                 "LEFT JOIN sys.columns c ON c.object_id = t.object_id "
                 "  AND c.column_id = ic.column_id "
                 f"WHERE s.name IN ({placeholders}) "
@@ -179,6 +191,7 @@ def get_partitioned_tables(
                 "LEFT JOIN sys.index_columns ic "
                 "  ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
                 "  AND ic.is_included_column = 0 "
+                "  AND ic.partition_ordinal > 0 "
                 "LEFT JOIN sys.columns c ON c.object_id = t.object_id "
                 "  AND c.column_id = ic.column_id "
                 "WHERE s.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') "

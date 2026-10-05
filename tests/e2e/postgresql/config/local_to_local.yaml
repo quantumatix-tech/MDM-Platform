@@ -1,0 +1,91 @@
+# PostgreSQL E2E Migration Validation — Local to Local Configuration
+#
+# This config drives BOTH the E2E test framework AND the real Migration Platform.
+# Passwords are resolved at runtime from environment variables via the
+# platform's SECRET_<name> convention (see core/secrets/env.py).
+#
+# Required environment variables for local_to_local:
+#   SECRET_postgresql_e2e_source_pass  — postgres password for the source server
+#   SECRET_postgresql_e2e_target_pass  — postgres password for the target server
+#
+# Both may point to the same local instance; the secret keys are kept
+# separate so cloud or cross-instance runs can supply distinct values.
+
+source:
+  engine: postgresql
+  connection:
+    host: 127.0.0.1
+    port: 55432
+    database: MigrationE2E_PostgreSQL_Source
+    username: postgres
+    password_secret: postgresql_e2e_source_pass
+    ssl: false
+
+target:
+  engine: postgresql
+  connection:
+    host: 127.0.0.1
+    port: 55432
+    database: MigrationE2E_PostgreSQL_Target
+    username: postgres
+    password_secret: postgresql_e2e_target_pass
+    ssl: false
+    source_engine: postgresql
+
+migration:
+  mode: full
+  batch_size: 1000
+  include_schemas:
+    - training
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO
+
+# E2E-specific settings consumed by the E2E test runner.
+e2e:
+  schema: training
+  fixture_path: fixtures
+  source_database: MigrationE2E_PostgreSQL_Source
+  target_database: MigrationE2E_PostgreSQL_Target
+
+  # Safety: only databases whose name matches this regex may be dropped/created.
+  safe_db_pattern: "^MigrationE2E_PostgreSQL_.+$"
+
+  cleanup:
+    mode: on_success   # always | on_success | never
+
+  security:
+    enabled: true
+
+  functional:
+    enabled: true
+
+  expected:
+    schemas:
+      - training
+    tables:
+      - training.customers
+      - training.products
+      - training.orders
+      - training.orderdetails
+      - training.orderaudit
+      - training.pk_name_test
+      - training.partitionedorders
+    row_counts:
+      training.customers: 5
+      training.products: 5
+      training.orders: 5
+      training.orderdetails: 8
+      training.orderaudit: 5
+      training.pk_name_test: 2
+      training.partitionedorders: 3

@@ -48,6 +48,7 @@ from core.connectors.base import (
     SynonymDef,
     TriggerDef,
     TypeDef,
+    UniqueConstraint,
     UserDef,
     ViewDefinition,
     validate_identifier,
@@ -224,8 +225,10 @@ class MSSQLSourceConnector(SourceConnector):
 
             # --- Indexes (excludes PK constraint indexes;
             #     PKs are handled inline in create_object_if_missing.
-            #     UNIQUE constraint indexes are discovered here and applied
-            #     via apply_constraints to avoid dropping them.) ---
+            #     UNIQUE constraint-backed indexes are separated into
+            #     unique_constraints and excluded from the indexes list
+            #     so they are created via apply_constraints as proper
+            #     CONSTRAINT objects, matching source semantics.) ---
             cur.execute(
                 "SELECT i.name, i.is_unique, i.is_primary_key, i.is_unique_constraint, "
                 "ic.key_ordinal, ic.is_included_column, ic.is_descending_key, "
@@ -243,9 +246,19 @@ class MSSQLSourceConnector(SourceConnector):
             )
             _idx_groups: dict = {}
             _idx_filter: dict = {}
+            _uc_groups: dict = {}
             for row in cur.fetchall():
-                idx_name, is_unique, _pk, _uq, key_ord, is_incl, is_desc, col_name, filter_def = row
+                (idx_name, is_unique, _pk, is_uq, key_ord,
+                 is_incl, is_desc, col_name, filter_def) = row
                 if idx_name is None:
+                    continue
+                # Unique constraint-backed indexes are handled separately as
+                # UniqueConstraint objects, not as standalone indexes.
+                if is_uq:
+                    if idx_name not in _uc_groups:
+                        _uc_groups[idx_name] = {"columns": []}
+                    if not is_incl:
+                        _uc_groups[idx_name]["columns"].append(col_name)
                     continue
                 if idx_name not in _idx_groups:
                     _idx_groups[idx_name] = {
@@ -378,6 +391,11 @@ class MSSQLSourceConnector(SourceConnector):
                 for r in cur.fetchall()
             ]
 
+            unique_constraints = [
+                UniqueConstraint(name=uc_name, columns=entry["columns"])
+                for uc_name, entry in _uc_groups.items()
+            ]
+
         return Schema(
             name=object_name,
             schema_name=schema_name,
@@ -388,6 +406,7 @@ class MSSQLSourceConnector(SourceConnector):
             foreign_keys=foreign_keys,
             check_constraints=check_constraints,
             default_constraints=default_constraints,
+            unique_constraints=unique_constraints,
         )
 
     def list_views(self) -> list[ViewDefinition]:

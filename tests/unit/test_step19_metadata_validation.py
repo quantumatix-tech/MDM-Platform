@@ -226,8 +226,8 @@ def test_source_get_schema_discovers_indexes():
         [("id", 0, None, None, 0, None)],
         [],
         [("id", "int", "NO", None, 10, 0)],
-        [("IX_name", 0, 0, 1, 1, 0, False, "name", None),
-         ("IX_name", 0, 0, 1, 2, 1, True, "status", None)],
+        [("IX_name", 0, 0, 0, 1, 0, False, "name", None),
+         ("IX_name", 0, 0, 0, 2, 1, True, "status", None)],
         [("id", "PK_sales_orders")],
         [],
         [],  # check constraints (empty)
@@ -465,8 +465,8 @@ def test_source_list_partition_functions_matches():
     from datetime import datetime
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("pf_dates", "RANGE", True, datetime(2024, 1, 1), 1),
-        ("pf_dates", "RANGE", True, datetime(2025, 1, 1), 2),
+        ("pf_dates", "RANGE", True, datetime(2024, 1, 1), 1, "datetime2", None, None, None),
+        ("pf_dates", "RANGE", True, datetime(2025, 1, 1), 2, "datetime2", None, None, None),
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur

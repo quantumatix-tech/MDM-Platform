@@ -155,15 +155,15 @@ class MSSQLTargetConnector(TargetConnector):
         yield from _mssql_table.export_table_data(self._conn, object_name, schema_name)
 
     def apply_constraints(self, schema: "Schema") -> None:
-        """Apply indexes, foreign keys, CHECK and DEFAULT constraints.
+        """Apply indexes, unique constraints, foreign keys, CHECK and DEFAULT constraints.
 
         Intentionally retained in ``target.py`` as a single combined
-        constraint layer. The four families are applied in dependency
-        order — indexes, then foreign keys, then CHECK, then DEFAULT —
-        because each stage can depend on the objects created by the
-        previous one.
+        constraint layer. The five families are applied in dependency
+        order — indexes, then unique constraints, then foreign keys, then
+        CHECK, then DEFAULT — because each stage can depend on the objects
+        created by the previous one.
 
-        All four families share the same shape: probe for an existing
+        All five families share the same shape: probe for an existing
         object, skip with an audit entry when present, otherwise execute,
         commit and audit, rolling back and auditing on failure. Splitting
         them into separate modules would duplicate that scaffolding and
@@ -171,7 +171,7 @@ class MSSQLTargetConnector(TargetConnector):
 
         This is the target-side counterpart of
         ``MSSQLSourceConnector.get_schema()``, which discovers the same
-        four families in the same order.
+        five families in the same order.
         """
         validate_identifier(schema.name, "table")
         schema_name = schema.schema_name or "dbo"
@@ -193,6 +193,44 @@ class MSSQLTargetConnector(TargetConnector):
                     audit_log(
                         phase="create_index", status="skipped",
                         details={"index": idx.name, "reason": str(exc)},
+                    )
+
+            # --- Unique Constraints (idempotent) ---
+            existing_uqs = set()
+            try:
+                cur.execute(
+                    "SELECT i.name FROM sys.indexes i "
+                    "WHERE i.object_id = OBJECT_ID(?) AND i.is_unique_constraint = 1",
+                    (table_qname,),
+                )
+                existing_uqs = {row[0] for row in cur.fetchall()}
+            except Exception:
+                pass
+            for uq in schema.unique_constraints:
+                if uq.name in existing_uqs:
+                    audit_log(
+                        phase="create_unique", status="skipped",
+                        details={"unique": uq.name, "reason": "already exists"},
+                    )
+                    continue
+                col_list = ", ".join(quote_identifier(c) for c in uq.columns)
+                try:
+                    cur.execute(
+                        f"ALTER TABLE {table_qname} "
+                        f"ADD CONSTRAINT {quote_identifier(uq.name)} "
+                        f"UNIQUE ({col_list})"
+                    )
+                    self._conn.commit()
+                    audit_log(
+                        phase="create_unique", status="created",
+                        details={"table": schema.name, "unique": uq.name,
+                                 "columns": uq.columns},
+                    )
+                except Exception as exc:
+                    self._conn.rollback()
+                    audit_log(
+                        phase="create_unique", status="skipped",
+                        details={"unique": uq.name, "reason": str(exc)},
                     )
 
             # --- Foreign Keys (cross-schema aware, idempotent) ---

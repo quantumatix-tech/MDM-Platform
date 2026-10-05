@@ -12,6 +12,8 @@ Do not duplicate those documents here.
 - `core/connectors/base.py` — `SourceConnector`/`TargetConnector` base classes and `quote_identifier`
 - `migration_platform/` — CLI entry point (`__main__.py`, `__init__.py`); holds the version, read from installed metadata
 - `tests/unit/`, `tests/integration/` — test suites
+- `tests/e2e/<engine>/` — automated regression E2E (Mode 1): phased runners, setup, validation
+- `tests/e2e/acceptance/` — shared acceptance E2E utilities (Mode 2): `E2EConfig`, config loader, report writer
 - `config/` — YAML configs; `config/migration_config.schema.yaml` documents the shape
 - `docs/`, `docker/`, `scripts/`, `bootstrap.py` — documentation, image, tooling, dev setup
 
@@ -27,7 +29,7 @@ Do not duplicate those documents here.
   Use `quote_identifier` in `core/connectors/base.py` rather than manual quoting.
 - **Layering** — `core/*` must not import from `migration_platform/`. The reporting layer
   reads installed metadata directly for this reason.
-- **Tests** — the 0.2.0 baseline is 408 passing, 4 known failures
+- **Tests** — the 0.2.1 baseline is 755 passing, 4 known failures
   (`test_cross_engine_type_safety.py` ×2, `test_mysql_datatypes.py` ×2). Those four are
   pre-existing; do not delete or weaken them to force a green run. New failures are yours.
 - **MSSQL** — the system ODBC driver must be "ODBC Driver 18 for SQL Server"; it is an OS

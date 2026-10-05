@@ -1,0 +1,89 @@
+# MySQL E2E Migration Validation — Local to Local Configuration
+#
+# This config drives BOTH the E2E test framework AND the real Migration Platform.
+# Passwords are resolved at runtime from environment variables via the
+# platform's SECRET_<name> convention (see core/secrets/env.py).
+#
+# Required environment variables for local_to_local:
+#   SECRET_mysql_e2e_source_pass  — MySQL root password for the source server
+#   SECRET_mysql_e2e_target_pass  — MySQL root password for the target server
+#
+# Both may point to the same local instance; the secret keys are kept
+# separate so cloud or cross-instance runs can supply distinct values.
+
+source:
+  engine: mysql
+  connection:
+    host: 127.0.0.1
+    port: 33062
+    database: MigrationE2E_MySQL_Source
+    username: root
+    password_secret: mysql_e2e_source_pass
+    ssl: false
+
+target:
+  engine: mysql
+  connection:
+    host: 127.0.0.1
+    port: 33062
+    database: MigrationE2E_MySQL_Target
+    username: root
+    password_secret: mysql_e2e_target_pass
+    ssl: false
+    source_engine: mysql
+
+migration:
+  mode: full
+  batch_size: 1000
+  include_schemas: []
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO
+
+# E2E-specific settings consumed by the E2E test runner.
+e2e:
+  schema: ""
+  fixture_path: fixtures
+  source_database: MigrationE2E_MySQL_Source
+  target_database: MigrationE2E_MySQL_Target
+
+  # Safety: only databases whose name matches this regex may be dropped/created.
+  safe_db_pattern: "^MigrationE2E_MySQL_.+$"
+
+  cleanup:
+    mode: on_success   # always | on_success | never
+
+  security:
+    enabled: false
+
+  functional:
+    enabled: true
+
+  expected:
+    schemas: []
+    tables:
+      - customers
+      - products
+      - orders
+      - orderdetails
+      - orderaudit
+      - pk_name_test
+      - partitionedorders
+    row_counts:
+      customers: 5
+      products: 5
+      orders: 5
+      orderdetails: 8
+      orderaudit: 5
+      pk_name_test: 2
+      partitionedorders: 3
