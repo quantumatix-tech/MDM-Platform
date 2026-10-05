@@ -296,8 +296,8 @@ The platform looks for `SECRET_<name>` in the environment.
 
 **PowerShell:**
 ```powershell
-$env:SECRET_source_db_pass = "your_source_password"
-$env:SECRET_target_db_pass = "your_target_password"
+# Supply SECRET_source_db_pass and SECRET_target_db_pass through your
+# approved secret-injection mechanism before starting the migration.
 ```
 
 > [!CAUTION]
@@ -319,10 +319,55 @@ Uses `DefaultAzureCredential` (Azure CLI login, managed identity, service princi
 **Setup:**
 ```powershell
 az login
-az keyvault secret set --vault-name my-keyvault --name source-db-pass --value "your_password"
+az account show
+# Provision the value using your organization's approved Key Vault workflow.
+# To check existence without printing it, query metadata with --query "id" -o tsv.
 ```
 
 The secret name in Key Vault must match the `password_secret` value in your config.
+
+### Selecting providers independently for source and target
+
+The top-level `secrets.provider` remains the default for both database
+connections. Set `source.secret_provider` or `target.secret_provider` to
+override that default for one side. Provider settings remain under `secrets`.
+For example, Local Encrypted File (the local store) can supply the local MySQL
+source credential while Azure Key Vault supplies the Azure MySQL target
+credential:
+
+```yaml
+source:
+  engine: mysql
+  secret_provider: local_encrypted_file
+  connection:
+    host: 127.0.0.1
+    port: 3306
+    database: source_db
+    username: migration_user
+    password_secret: local_mysql_source
+
+target:
+  engine: mysql
+  secret_provider: azure_keyvault
+  connection:
+    host: target.mysql.database.azure.com
+    port: 3306
+    database: target_db
+    username: migration_user
+    password_secret: azure_mysql_target
+
+secrets:
+  provider: env  # backward-compatible default when an endpoint has no override
+  local_encrypted_file:
+    key_source: keyring
+    keyring_service: migration-platform/secrets-key
+  azure_keyvault:
+    url: https://my-keyvault.vault.azure.net/
+```
+
+`password_secret` is a reference name in the selected provider. The source
+and target overrides affect credential retrieval only; they do not change the
+database migration direction or connector settings.
 
 ---
 
@@ -335,10 +380,9 @@ secrets:
     region: us-east-1
 ```
 
-**Setup:**
-```bash
-aws secretsmanager create-secret --name source_db_pass --secret-string "your_password"
-```
+Configure the secret through your organization's approved AWS secret-provisioning process. Avoid
+passing its value as a command-line argument. See [Secret Management and Azure Key Vault Operations](azure_keyvault.md)
+for the provider-selection and secret-reference flow.
 
 ---
 
@@ -359,8 +403,8 @@ secrets:
 secrets:
   provider: hashicorp_vault
   hashicorp_vault:
-    url: https://vault.mycompany.com
-    token: s.my-vault-token
+    url: https://<vault-host>
+    token: <provide-through-approved-secret-configuration>
     mount_point: secret    # Default is "secret"
 ```
 
@@ -374,19 +418,38 @@ Stores secrets in a Fernet-encrypted file. Good for air-gapped environments.
 secrets:
   provider: local_encrypted_file
   local_encrypted_file:
-    file: secrets.enc
-    key_source: env                         # env or keyring
-    key_env_var: MIGRATION_SECRETS_KEY      # Holds the Fernet encryption key
-    auto_create: true                       # Create file if missing
+    key_source: keyring
+    keyring_service: migration-platform/secrets-key
+    auto_create: false
 ```
 
 **Setup:**
 ```powershell
-# 1. Generate a key (run once, save it!)
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python -m migration_platform.secrets_cli set mysql-source-password
+```
 
-# 2. Set the key
-$env:MIGRATION_SECRETS_KEY = "your-fernet-key-here"
+See [Secret Management and Azure Key Vault Operations](azure_keyvault.md) for the full Local Store/Azure
+workflow, provider matrix, security guidance, and troubleshooting.
+
+On Windows, the defaults are `%LOCALAPPDATA%\MigrationPlatform\secrets.enc` and the OS keyring
+(Windows Credential Manager). On non-Windows platforms, the defaults remain `./secrets.enc` and
+environment-key mode (`MIGRATION_SECRETS_KEY` must be set securely first). The command prompts twice
+with hidden input and never displays the secret value.
+
+The Local Store persists after PowerShell closes, so you do not need to run `set` before each migration.
+Use `set` again to add or update a secret. `list` shows names only; `verify` checks a value without
+displaying it, and `delete <name>` removes an entry after confirmation. The store is local to this
+machine and does not synchronize to other machines. See [RUNBOOK.md](RUNBOOK.md#local-encrypted-file-secret-store)
+for the full procedure and mixed Local Store/Azure Key Vault example. Never edit the encrypted file
+directly or commit it.
+
+Explicit `--file <path>` and `--key-source env|keyring` options remain available as advanced overrides.
+For environment-key mode, provide the same Fernet key securely to every process that reads the store.
+The separate `init` command remains available for administrators who want to create an empty store
+first. Do not print or commit the key.
+
+```powershell
+python -m migration_platform.secrets_cli --file <path> --key-source env set mysql-source-password
 ```
 
 ---
@@ -403,8 +466,8 @@ python -m migration_platform --config <path-to-config.yaml> --mode <mode>
 
 ```powershell
 # Step 1: Set passwords (use SECRET_ prefix!)
-$env:SECRET_source_db_pass = "root1234"
-$env:SECRET_target_db_pass = "Mohit@991"
+$env:SECRET_source_db_pass = "<source-password>"
+$env:SECRET_target_db_pass = "<target-password>"
 
 # Step 2: Run
 python -m migration_platform --config config/my_config.yaml --mode full
@@ -909,8 +972,7 @@ logging:
 
 **Run:**
 ```powershell
-$env:SECRET_source_pass = "password1"
-$env:SECRET_target_pass = "password2"
+# Ensure the configured SECRET_* values are securely injected into this process.
 python -m migration_platform --config config/local_pg.yaml --mode full
 ```
 
@@ -1089,8 +1151,7 @@ logging:
 
 **Run:**
 ```powershell
-$env:SECRET_prod_db_pass = "prod_password"
-$env:SECRET_standby_pass = "standby_password"
+# Ensure the configured SECRET_* values are securely injected into this process.
 python -m migration_platform --config config/cdc_sync.yaml --mode cdc-continuous
 ```
 
@@ -1154,8 +1215,7 @@ Secret 'source_db_pass' not found in environment (looked up as SECRET_source_db_
 
 **Fix:**
 ```powershell
-$env:SECRET_source_db_pass = "your_password"
-$env:SECRET_target_db_pass = "your_password"
+# Securely inject SECRET_source_db_pass and SECRET_target_db_pass, then retry.
 ```
 
 ---

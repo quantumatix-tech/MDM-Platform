@@ -44,6 +44,48 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - The 4 pre-existing unit test failures and the existing Ruff backlog are
   unchanged by this work.
 
+## [0.2.2] - 2026-10-05
+
+### Added
+
+- **Azure Key Vault secret provider.** Azure Key Vault can now be used as a
+  secret provider via `secrets.provider: azure_keyvault` and
+  `secrets.azure_keyvault.url`. Uses `DefaultAzureCredential` for
+  authentication (no credential values are stored in config). Requires the
+  `azure-identity` and `azure-keyvault-secrets` packages.
+- **Independent endpoint secret-provider selection.** `source.secret_provider`
+  and `target.secret_provider` override the global `secrets.provider` for their
+  endpoint only, enabling e.g. a local encrypted-file store for the source and
+  Azure Key Vault for the target. When omitted, the existing global provider
+  remains the backward-compatible default.
+- **Local Encrypted File provider enhancements.** Platform-aware defaults
+  (OS keyring on Windows, environment key elsewhere), atomic file writes with
+  `fsync`, `list_secrets`/`set_secret`/`delete_secret` CLI operations, and
+  sanitized error messages that never expose secret values.
+- **`migration_platform.secrets_cli`** — interactive CLI for managing the local
+  encrypted-file store (`set`, `list`, `verify`, `delete`, `init`).
+- **`docs/azure_keyvault.md`** — comprehensive Azure Key Vault setup,
+  configuration, troubleshooting, and security guidance.
+- **`tests/unit/test_secret_provider_selection.py`** — 7 tests covering
+  provider selection, backward compatibility, and error sanitization.
+- **`tests/unit/test_local_encrypted_file_cli.py`** — 10 tests covering local
+  store CRUD, encryption-key management, and CLI security.
+
+### Changed
+
+- Updated `docs/RUNBOOK.md`, `docs/USER_GUIDE.md`, and
+  `docs/architecture/platform_architecture.md` with Azure Key Vault and
+  independent-provider-selection guidance.
+- `config/mysql_local_test.yaml` updated to demonstrate mixed local-store +
+  Azure Key Vault provider usage.
+- `config/migration_config.schema.yaml` — added optional `secret_provider`
+  field to `source` and `target` sections.
+
+### Notes
+
+- The 4 pre-existing unit test failures (`test_cross_engine_type_safety.py` ×2,
+  `test_mysql_datatypes.py` ×2) are unchanged by this work.
+
 ## [0.2.1] - 2026-10-04
 
 ### Added

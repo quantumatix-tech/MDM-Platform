@@ -31,6 +31,7 @@ test-results/
 .env
 *.pem
 *.key
+secrets.enc
 
 # OS noise
 .DS_Store

@@ -48,7 +48,23 @@ class MigrationOrchestrator:
         )
         self._field_mappings = config.get("migration", {}).get("field_mappings", [])
         self._notifier = create_notifier(config.get("alerting", {}))
-        self._secret_resolver = create_secret_provider(config)
+        source_provider = config.get("source", {}).get("secret_provider")
+        target_provider = config.get("target", {}).get("secret_provider")
+        self._secret_resolver = (
+            create_secret_provider(config)
+            if source_provider is None or target_provider is None
+            else None
+        )
+        self._source_secret_resolver = (
+            create_secret_provider(config, source_provider)
+            if source_provider is not None
+            else self._secret_resolver
+        )
+        self._target_secret_resolver = (
+            create_secret_provider(config, target_provider)
+            if target_provider is not None
+            else self._secret_resolver
+        )
         self._status = status_server
 
     def _resolve_secrets(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -124,8 +140,16 @@ class MigrationOrchestrator:
 
         try:
             # ---------- Connect ----------
-            self._resolve_connector_secrets(self._source, self._config.get("source", {}))
-            self._resolve_connector_secrets(self._target, self._config.get("target", {}))
+            self._resolve_connector_secrets(
+                self._source,
+                self._config.get("source", {}),
+                self._source_secret_resolver,
+            )
+            self._resolve_connector_secrets(
+                self._target,
+                self._config.get("target", {}),
+                self._target_secret_resolver,
+            )
             self._apply_schema_scope(self._source)
             self._source.connect()
             self._target.connect()
@@ -725,13 +749,19 @@ class MigrationOrchestrator:
         })
         return result
 
-    def _resolve_connector_secrets(self, connector: Any, config: dict[str, Any]) -> None:
-        if self._secret_resolver is None:
+    def _resolve_connector_secrets(
+        self,
+        connector: Any,
+        config: dict[str, Any],
+        resolver: Any = None,
+    ) -> None:
+        resolver = resolver or self._secret_resolver
+        if resolver is None:
             return
         # password_secret lives under config["connection"], not at the top-level config
         connection_config = config.get("connection", config)
         if "password_secret" in connection_config:
-            connector._config["password"] = self._secret_resolver.resolve(connection_config["password_secret"])
+            connector._config["password"] = resolver.resolve(connection_config["password_secret"])
 
     def _apply_schema_scope(self, source: Any) -> None:
         """
@@ -962,8 +992,16 @@ class MigrationOrchestrator:
             # Fix #4: resolve secrets on the connector objects FIRST so that
             # self._source._config["password"] is populated before we read it
             # back for the CDC engine connection below.
-            self._resolve_connector_secrets(self._source, self._config.get("source", {}))
-            self._resolve_connector_secrets(self._target, self._config.get("target", {}))
+            self._resolve_connector_secrets(
+                self._source,
+                self._config.get("source", {}),
+                self._source_secret_resolver,
+            )
+            self._resolve_connector_secrets(
+                self._target,
+                self._config.get("target", {}),
+                self._target_secret_resolver,
+            )
             self._apply_schema_scope(self._source)
             self._source.connect()
             self._target.connect()
