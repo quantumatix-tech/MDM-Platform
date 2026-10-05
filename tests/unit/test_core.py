@@ -362,6 +362,8 @@ class TestOrchestratorConnects:
         assert result["status"] == "success"
         source.connect.assert_called()
         target.connect.assert_called()
+        source.close.assert_called_once()
+        target.close.assert_called_once()
 
 
 class TestPostgresToPostgresBaseline:

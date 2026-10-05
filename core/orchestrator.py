@@ -19,8 +19,8 @@ from core.connectors.base import (
     SourceConnector,
     TargetConnector,
     UpsertResult,
-    SynonymDef,
 )
+from core.dependency_order import order_data_load_objects
 from core.schema_mapping.registry import TypeMappingRegistry
 from core.secrets import create_secret_provider
 from core.status_server import StatusServer
@@ -327,20 +327,20 @@ class MigrationOrchestrator:
                     for pf in self._source.list_partition_functions():
                         try:
                             self._target.create_partition_function(pf)
-                            partition_results[pf.name] = f"partition function created"
+                            partition_results[pf.name] = "partition function created"
                         except Exception as exc:
                             partition_results[pf.name] = f"skipped: {exc}"
                     for ps in self._source.list_partition_schemes():
                         try:
                             self._target.create_partition_scheme(ps)
-                            partition_results[ps.name] = f"partition scheme created"
+                            partition_results[ps.name] = "partition scheme created"
                         except Exception as exc:
                             partition_results[ps.name] = f"skipped: {exc}"
                     for pt in self._source.get_partitioned_tables():
                         try:
                             schema = self._source.get_schema(pt.table_name)
                             self._target.create_partitioned_table(schema, pt.partition_scheme_name, pt.partition_column)
-                            partition_results[pt.table_name] = f"partitioned table created"
+                            partition_results[pt.table_name] = "partitioned table created"
                         except Exception as exc:
                             partition_results[pt.table_name] = f"skipped: {exc}"
                 except AttributeError:
@@ -371,15 +371,23 @@ class MigrationOrchestrator:
             # target-only rows (including rows from past trigger side effects)
             # cannot survive a successful run.  Connectors that do not define
             # replacement semantics retain the historical upsert-only behaviour.
+
+            # Determine FK-aware data load order BEFORE clearing/loading data
+            # so cycles are detected early and no data is modified.
+            schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
+            data_load_order = order_data_load_objects(all_schemas, objects)
+            result["phases"]["data_load_order"] = data_load_order
+
             cleared_objects = self._target.clear_objects_for_full_sync(list(all_schemas))
             result["phases"]["full_target_sync"] = {
                 "strategy": "clear-before-load",
                 "cleared": cleared_objects,
             }
-            schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
-            total_rows = self._estimate_total_rows(objects, schema_map)
+
+            total_rows = self._estimate_total_rows(data_load_order, schema_map)
             processed_rows = 0
-            for idx, (obj_name, schema) in enumerate(all_schemas.items(), start=1):
+            for idx, obj_name in enumerate(data_load_order, start=1):
+                schema = all_schemas[obj_name]
                 upsert_result = UpsertResult()
                 count: int | None = None
                 try:
@@ -741,6 +749,11 @@ class MigrationOrchestrator:
             self._update_status("failed", 0, all_errors + [str(exc)])
             if self._notifier is not None:
                 self._notifier.notify({"phase": "run_full", "status": "failed", "details": {"error": str(exc)}})
+        finally:
+            try:
+                self._source.close()
+            finally:
+                self._target.close()
 
         end_time = time.time()
         audit_log(phase="run_full", status="completed", details={
@@ -1111,20 +1124,20 @@ class MigrationOrchestrator:
                     for pf in self._source.list_partition_functions():
                         try:
                             self._target.create_partition_function(pf)
-                            partition_results[pf.name] = f"partition function created"
+                            partition_results[pf.name] = "partition function created"
                         except Exception as exc:
                             partition_results[pf.name] = f"skipped: {exc}"
                     for ps in self._source.list_partition_schemes():
                         try:
                             self._target.create_partition_scheme(ps)
-                            partition_results[ps.name] = f"partition scheme created"
+                            partition_results[ps.name] = "partition scheme created"
                         except Exception as exc:
                             partition_results[ps.name] = f"skipped: {exc}"
                     for pt in self._source.get_partitioned_tables():
                         try:
                             schema = self._source.get_schema(pt.table_name)
                             self._target.create_partitioned_table(schema, pt.partition_scheme_name, pt.partition_column)
-                            partition_results[pt.table_name] = f"partitioned table created"
+                            partition_results[pt.table_name] = "partitioned table created"
                         except Exception as exc:
                             partition_results[pt.table_name] = f"skipped: {exc}"
                 except AttributeError:
@@ -1136,9 +1149,14 @@ class MigrationOrchestrator:
 
             # ---- Phase 5: Initial Data Sync ----
             schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
-            total_rows = self._estimate_total_rows(objects, schema_map)
+
+            # Determine FK-aware data load order
+            data_load_order = order_data_load_objects(all_schemas, objects)
+            result["phases"]["data_load_order"] = data_load_order
+
+            total_rows = self._estimate_total_rows(data_load_order, schema_map)
             processed_rows = 0
-            for idx, obj_name in enumerate(objects, start=1):
+            for idx, obj_name in enumerate(data_load_order, start=1):
                 schema = all_schemas[obj_name]
                 count = self._source.get_object_count(obj_name, schema.schema_name if hasattr(schema, "schema_name") else None)
                 rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
@@ -1410,6 +1428,11 @@ class MigrationOrchestrator:
             self._update_status("failed", 0, [str(exc)])
             if self._notifier is not None:
                 self._notifier.notify({"phase": "run_cdc", "status": "failed", "details": {"error": str(exc)}})
+        finally:
+            try:
+                self._source.close()
+            finally:
+                self._target.close()
 
         end_time = time.time()
         audit_log(phase="run_cdc", status="completed", details={"status": result.get("status", "unknown"), "duration_s": round(end_time - start_time, 2)})
