@@ -9,9 +9,15 @@ from core.secrets.env import EnvSecretProvider
 logger = logging.getLogger(__name__)
 
 
-def create_secret_provider(config: dict[str, Any]) -> SecretResolver | None:
+def create_secret_provider(
+    config: dict[str, Any], provider_override: str | None = None
+) -> SecretResolver | None:
     secrets_config = config.get("secrets", {})
-    provider_type = secrets_config.get("provider", "env")
+    provider_type = (
+        provider_override
+        if provider_override is not None
+        else secrets_config.get("provider", "env")
+    )
 
     if provider_type == "env":
         return SecretResolver(EnvSecretProvider())
@@ -21,6 +27,8 @@ def create_secret_provider(config: dict[str, Any]) -> SecretResolver | None:
             from core.secrets.azure_keyvault import AzureKeyVaultProvider
 
             vault_url = secrets_config.get("azure_keyvault", {}).get("url", "")
+            if not vault_url:
+                raise ValueError("secrets.azure_keyvault.url is required")
             return SecretResolver(AzureKeyVaultProvider(vault_url))
         except Exception as exc:
             logger.error("Failed to construct AzureKeyVaultProvider: %s", exc)
@@ -70,8 +78,8 @@ def create_secret_provider(config: dict[str, Any]) -> SecretResolver | None:
             file_config = secrets_config.get("local_encrypted_file", {})
             return SecretResolver(
                 LocalEncryptedFileProvider(
-                    file_path=file_config.get("file", "secrets.enc"),
-                    key_source=file_config.get("key_source", "env"),
+                    file_path=file_config.get("file"),
+                    key_source=file_config.get("key_source"),
                     key_env_var=file_config.get("key_env_var", "MIGRATION_SECRETS_KEY"),
                     keyring_service=file_config.get("keyring_service", "migration-platform/secrets-key"),
                     auto_create=file_config.get("auto_create", False),

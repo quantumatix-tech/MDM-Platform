@@ -764,8 +764,8 @@ The orchestrator also reaches into connector internals in three places: `_resolv
 
 | Key | Purpose | Consumed by |
 |---|---|---|
-| `source` | `engine`, `connection{host,port,database,username,password_secret,ssl,ssl_ca_cert}` | connector construction |
-| `target` | as source, plus `routine_definer`, `preserve_source_definer`, `security_users[]`; `connection.source_engine` injected by `main()` | connector construction |
+| `source` | `engine`, `secret_provider` (optional override), `connection{host,port,database,username,password_secret,ssl,ssl_ca_cert}` | connector construction and credential resolution |
+| `target` | as source, plus `routine_definer`, `preserve_source_definer`, `security_users[]`; `connection.source_engine` injected by `main()` | connector construction and credential resolution |
 | `migration` | `mode`, `batch_size=1000`, `stop_on_error=false`, `include_schemas=["public"]`, `field_mappings[]`, `max_document_size_mb=2.0` | orchestrator |
 | `cdc` | `poll_interval=10`, `allow_source_service_restart=false` | `run_cdc` |
 | `retry` | 5 keys | **not read** — see [§19](#19-current-limitations--known-gaps) |
@@ -777,7 +777,9 @@ The orchestrator also reaches into connector internals in three places: `_resolv
 
 ### 11.3 Secret resolution
 
-`core/secrets/factory.py::create_secret_provider(config)` selects a provider and wraps it in `SecretResolver`.
+`core/secrets/factory.py::create_secret_provider(config, provider_override=None)` selects a provider and wraps it in `SecretResolver`. The optional `source.secret_provider` and `target.secret_provider` selectors independently override `secrets.provider`; when omitted, the existing global provider remains the backward-compatible default. Provider-specific settings remain under `secrets`.
+
+For example, `source.secret_provider: local_encrypted_file` and `target.secret_provider: azure_keyvault` resolve each endpoint's `connection.password_secret` through separate providers. This changes credential retrieval only; endpoint connector construction still receives the resolved password through the existing connection configuration path.
 
 | Provider | Class | Configuration |
 |---|---|---|
@@ -786,7 +788,7 @@ The orchestrator also reaches into connector internals in three places: `_resolv
 | `aws_secrets_manager` | `AWSSecretsManagerProvider` | `region` |
 | `gcp_secret_manager` | `GCPSecretManagerProvider` | `project_id` |
 | `hashicorp_vault` | `HashiCorpVaultProvider` | `url`, `token`, `mount_point` |
-| `local_encrypted_file` | `LocalEncryptedFileProvider` | `file_path`, `key_env_var`, … |
+| `local_encrypted_file` | `LocalEncryptedFileProvider` | optional `file` (platform default), `key_source`, `key_env_var`, … |
 
 > **Naming convention that catches everyone.** `EnvSecretProvider.get_secret()` looks up `f"SECRET_{name}"`. Config must therefore use the **bare** secret name:
 > ```yaml

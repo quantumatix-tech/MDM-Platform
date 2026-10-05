@@ -15,6 +15,9 @@
 
 ## Secret Providers
 
+For the full practical setup, troubleshooting, supported-provider matrix, and Local MySQL to Azure
+MySQL procedure, see [Secret Management and Azure Key Vault Operations](azure_keyvault.md).
+
 The platform is cloud-agnostic. Choose a secret provider via `secrets.provider` in config:
 
 | Provider | Config value | Cloud required | Notes |
@@ -23,7 +26,7 @@ The platform is cloud-agnostic. Choose a secret provider via `secrets.provider` 
 | AWS Secrets Manager | `aws_secrets_manager` | Yes (AWS) | Configure `secrets.aws_secrets_manager.region`. Requires `boto3`. |
 | GCP Secret Manager | `gcp_secret_manager` | Yes (GCP) | Configure `secrets.gcp_secret_manager.project_id`. Requires `google-cloud-secret-manager`. |
 | HashiCorp Vault | `hashicorp_vault` | No | Self-hosted or any cloud. Configure `url`, `token`, and optional `mount_point`. Requires `hvac`. Recommended for no-cloud environments. |
-| Local Encrypted File | `local_encrypted_file` | No | Zero-cloud fallback. Secrets stored in an AES-encrypted file. Decryption key from env var or OS keyring. Requires `cryptography` and optionally `keyring`. |
+| Local Encrypted File | `local_encrypted_file` | No | Zero-cloud fallback. Secrets stored in a Fernet-encrypted file. Requires `cryptography`; requires `keyring` for OS keyring mode. |
 | Azure Key Vault | `azure_keyvault` | Yes (Azure) | Configure `url` and optional `credential_secret_name`. |
 
 ### No-Cloud Secret Storage
@@ -33,25 +36,91 @@ For fully air-gapped or cloud-free environments, use **HashiCorp Vault** or **Lo
 - **HashiCorp Vault**: Run Vault on your own infrastructure (any OS, any cloud, or bare metal). The platform connects via HTTP and never touches a public cloud.
 - **Local Encrypted File**: Secrets are encrypted at rest with a Fernet key. The key is supplied via an environment variable or OS keyring and is never stored in the encrypted file. This works with zero network calls.
 
-### Local Encrypted File Setup
+## Local Encrypted File Secret Store
 
-Generate a key and store it:
+The Local Store keeps secret values encrypted in a file on this machine. ENV secrets are supplied to a
+process or shell session and are temporary; the Local Store persists after that session closes. When
+keyring mode is configured, the encryption key is stored in the machine's OS keyring (Windows Credential
+Manager on Windows). Developers normally set up the Local Store once per machine and reuse it for later
+migrations.
 
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-export MIGRATION_SECRETS_KEY="<generated-key>"
+### First-time setup
+
+Run from the repository root:
+
+```powershell
+python -m migration_platform.secrets_cli set mysql-source-password
 ```
 
-Create the encrypted secrets file:
+On Windows, this command uses the persistent file `%LOCALAPPDATA%\MigrationPlatform\secrets.enc` and
+the OS keyring (Windows Credential Manager). It creates and securely stores the encryption key if
+needed. On non-Windows platforms, the defaults remain `./secrets.enc` and environment-key mode using
+`MIGRATION_SECRETS_KEY`, which must already be set securely in the process environment.
 
-```bash
-python -c "
-from core.secrets.local_encrypted_file import LocalEncryptedFileProvider
-p = LocalEncryptedFileProvider(auto_create=True)
-"
+On first use, the command creates the store if needed, obtains the encryption key from the selected
+source, prompts twice with hidden input, and saves the value encrypted. The value is never accepted as a
+command-line argument or displayed. Future migrations can reuse the stored secret.
+
+### Manage secrets
+
+Add another secret or create/update an existing one with `set`:
+
+```powershell
+python -m migration_platform.secrets_cli set mysql-another-password
+python -m migration_platform.secrets_cli set mysql-source-password
 ```
 
-Add secrets by editing `secrets.enc` directly (it is an encrypted JSON blob) or by extending `LocalEncryptedFileProvider` with a CLI write helper.
+Multiple secret names can live in the same store. `list` displays names only; secret values are never
+shown. `verify` confirms that a named secret can be decrypted without displaying it. `delete` asks for
+confirmation before removal.
+
+```powershell
+python -m migration_platform.secrets_cli list
+python -m migration_platform.secrets_cli verify mysql-source-password
+python -m migration_platform.secrets_cli delete mysql-source-password
+```
+
+After first-time setup, closing PowerShell or Command Prompt does not delete the Local Store. You do not
+need to run `set` before each migration. Run it again only to add a secret, change a password, or
+intentionally replace a stored value. The store is local to one machine and does not synchronize to
+other machines; configure the store separately on each machine.
+
+### Mixed provider: Local MySQL to Azure MySQL
+
+Global `secrets.provider` is the default. Endpoint-specific `source.secret_provider` and
+`target.secret_provider` override that default for their endpoint. In this example, the source password
+comes from the Local Store and the target password comes from Azure Key Vault:
+
+```yaml
+source:
+  secret_provider: local_encrypted_file
+  connection:
+    password_secret: mysql-source-password
+
+target:
+  secret_provider: azure_keyvault
+  connection:
+    password_secret: mysql-target-password
+
+secrets:
+  provider: azure_keyvault
+  local_encrypted_file:
+    key_source: keyring
+    keyring_service: migration-platform/secrets-key
+    auto_create: false
+  azure_keyvault:
+    url: https://<vault-name>.vault.azure.net/
+```
+
+The endpoint overrides mean `source.secret_provider: local_encrypted_file` reads the source password
+from the Local Store, while `target.secret_provider: azure_keyvault` reads the target password from
+Azure Key Vault. Store names and paths are references/configuration only; never put password values in
+the YAML file.
+
+For explicit administration, `init` still creates an empty store and refuses to overwrite an existing
+file. `--file`, `--key-source`, `--key-env-var`, and `--keyring-service` remain available as advanced
+overrides. Explicit `--key-source env` and `--key-source keyring` continue to select those key sources.
+Do not edit the encrypted file directly, and do not commit it or the environment encryption key.
 
 ---
 
