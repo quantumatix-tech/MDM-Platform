@@ -44,6 +44,31 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - The 4 pre-existing unit test failures and the existing Ruff backlog are
   unchanged by this work.
 
+## [0.2.3] - 2026-10-05
+
+### Added
+
+- **FK-aware/dependency-ordered data loading.** Tables are now loaded in
+  topological order based on foreign key relationships, ensuring parent tables
+  are loaded before child tables across PostgreSQL, MySQL, and MSSQL.
+- **Topological ordering of FK dependencies.** New `core/dependency_order.py`
+  module with `build_dependency_graph()`, `topological_sort()`,
+  `order_data_load_objects()`, and `DependencyCycleError`.
+- **Deterministic ordering for independent objects.** Alphabetical tiebreaker
+  ensures consistent load order for unrelated tables.
+- **Cycle detection before data modification.** `DependencyCycleError` is
+  raised before `clear_objects_for_full_sync` is called, preventing partial
+  data loads in cyclic schemas.
+- **Support through existing `Schema.foreign_keys` metadata.** Works with
+  PostgreSQL, MySQL, and MSSQL connectors without schema changes.
+- **CDC initial-sync ordering.** CDC migrations now use the same dependency
+  ordering for initial data sync phase.
+
+### Notes
+
+- The 4 pre-existing unit test failures (`test_cross_engine_type_safety.py` ×2,
+  `test_mysql_datatypes.py` ×2) are unchanged by this work.
+
 ## [0.2.2] - 2026-10-05
 
 ### Added
