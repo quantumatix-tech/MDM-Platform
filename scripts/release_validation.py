@@ -15,10 +15,14 @@ checks are static and read only pyproject.toml, so they are machine-independent.
 Wheel output is written to a temporary directory, but building may still create
 gitignored build/ and migration_platform.egg-info/ directories in the working
 tree.
+
+Environment variables:
+    RELEASE_VALIDATION_MODE=1  Enable release-mode checks (dirty tree, tag validation)
 """
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -294,6 +298,178 @@ def check_changelog() -> bool:
     )
 
 
+def check_changelog_format() -> bool:
+    """CHANGELOG release section must follow Keep a Changelog format."""
+    version_txt = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]["version"]
+    changelog = REPO_ROOT / "CHANGELOG.md"
+    text = changelog.read_text(encoding="utf-8")
+
+    # Find the release section header (with or without date)
+    release_header_pattern = rf"## \[{re.escape(version_txt)}\](?: - \d{{4}}-\d{{2}}-\d{{2}})?"
+    match = re.search(release_header_pattern, text)
+    if not match:
+        return record("CHANGELOG release section exists", False, "section not found")
+
+    # Extract the release section content (until next ## [ or end of file)
+    lines = text.splitlines()
+    in_release_section = False
+    release_lines = []
+    header_line_idx = -1
+    for i, line in enumerate(lines):
+        if re.match(release_header_pattern, line.strip()):
+            in_release_section = True
+            header_line_idx = i
+            continue
+        if in_release_section:
+            if line.startswith("## [") and i != header_line_idx:
+                break
+            release_lines.append(line)
+
+    if not release_lines:
+        return record("CHANGELOG release section has content", False, "empty section")
+
+    release_content = "\n".join(release_lines).strip()
+
+    # Check for at least one category header (### Added, ### Changed, etc.)
+    category_headers = ["### Added", "### Changed", "### Fixed", "### Removed", "### Deprecated", "### Security", "### Notes"]
+    has_category = any(h in release_content for h in category_headers)
+
+    # Check for date in header (format: ## [X.Y.Z] - YYYY-MM-DD)
+    date_pattern = rf"## \[{re.escape(version_txt)}\] - \d{{4}}-\d{{2}}-\d{{2}}"
+    has_date = bool(re.search(date_pattern, text))
+
+    ok = record(
+        "CHANGELOG release section has category headers",
+        has_category,
+        f"found_category={has_category}",
+    )
+    record(
+        "CHANGELOG release section has date",
+        has_date,
+        f"found_date={has_date}",
+    )
+    record(
+        "CHANGELOG release section not empty",
+        bool(release_content),
+        f"content_length={len(release_content)}",
+    )
+    return ok and has_category and has_date
+
+
+def _get_current_tag() -> str | None:
+    """Get the current Git tag if HEAD is tagged, else None."""
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--exact-match"],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def check_git_tag_consistency() -> bool:
+    """If HEAD is tagged, the tag must match pyproject.toml version."""
+    if not os.environ.get("RELEASE_VALIDATION_MODE"):
+        return record("Git tag consistency", True, "skipped (not in release mode)")
+
+    declared = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]["version"]
+    expected_tag = f"v{declared}"
+    current_tag = _get_current_tag()
+
+    if current_tag is None:
+        return record(
+            "Git tag matches pyproject.toml version",
+            False,
+            "HEAD is not tagged; create annotated tag vX.Y.Z before release",
+        )
+
+    ok = record(
+        "Git tag matches pyproject.toml version",
+        current_tag == expected_tag,
+        f"current_tag={current_tag} expected={expected_tag}",
+    )
+
+    # Also verify tag points to current commit
+    if ok:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", f"{current_tag}^{{}}"],
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            tag_commit = result.stdout.strip()
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            head_commit = result.stdout.strip()
+            record(
+                "Git tag points to current commit",
+                tag_commit == head_commit,
+                f"tag_commit={tag_commit[:8]} head_commit={head_commit[:8]}",
+            )
+        except Exception as e:
+            record("Git tag points to current commit", False, f"error: {e}")
+
+    return ok
+
+
+def check_clean_working_tree() -> bool:
+    """In release mode, working tree must be clean (no uncommitted changes)."""
+    if not os.environ.get("RELEASE_VALIDATION_MODE"):
+        return record("Clean working tree", True, "skipped (not in release mode)")
+
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            cwd=REPO_ROOT,
+        )
+        changes = result.stdout.strip()
+        ok = record(
+            "Clean working tree",
+            not changes,
+            f"changes={changes[:200] if changes else 'none'}",
+        )
+        return ok
+    except Exception as e:
+        return record("Clean working tree", False, f"error: {e}")
+
+
+def check_cli_version_exact() -> bool:
+    """`python -m migration_platform --version` must match pyproject.toml exactly."""
+    declared = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]["version"]
+    expected = f"migration-platform {declared}"
+    proc = subprocess.run(
+        [sys.executable, "-m", "migration_platform", "--version"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    actual = proc.stdout.strip()
+    ok = record(
+        "CLI --version matches exactly",
+        proc.returncode == 0 and actual == expected,
+        f"expected={expected!r} actual={actual!r}",
+    )
+    return ok
+
+
 def check_unit_tests() -> bool:
     """Run the unit suite and compare against the recorded baseline."""
     proc = subprocess.run(
@@ -389,13 +565,16 @@ def main() -> int:
     declared_checks = [
         check_declared_version,
         check_runtime_version,
-        check_cli_version,
+        check_cli_version_exact,
         check_python_floor,
         check_package_discovery,
         check_dependency_metadata,
         check_imports,
         check_report_version,
         check_changelog,
+        check_changelog_format,
+        check_git_tag_consistency,
+        check_clean_working_tree,
         check_unit_tests,
         check_wheel_build,
     ]
