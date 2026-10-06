@@ -1,0 +1,233 @@
+compatibility_matrix:
+  application_version: "0.2.3"
+  recorded_at: "2026-10-06"
+  recorded_by: "migration-platform-team"
+  entries:
+    - engine: cosmosdb
+      source_version: "unspecified"
+      target_version: "unspecified"
+      source_deployment: cloud
+      target_deployment: cloud
+      flow: cloud_to_cloud
+      driver_version: "4.18.2"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "docs/architecture/platform_architecture.md:970  -  Cosmos DB (MongoDB API) not exercised live; azure-cosmos package declared but never imported"
+      known_limitations: ""
+    - engine: mongodb
+      source_version: "7.0"
+      target_version: "7.0"
+      source_deployment: cloud
+      target_deployment: local
+      flow: cloud_to_local
+      driver_version: "4.18.2"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "No MongoDB E2E run recorded in repository"
+      known_limitations: ""
+    - engine: mongodb
+      source_version: "7.0"
+      target_version: "7.0"
+      source_deployment: local
+      target_deployment: cloud
+      flow: local_to_cloud
+      driver_version: "4.18.2"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "No MongoDB E2E run recorded in repository"
+      known_limitations: ""
+    - engine: mongodb
+      source_version: "7.0"
+      target_version: "7.0"
+      source_deployment: local
+      target_deployment: local
+      flow: local_to_local
+      driver_version: "4.18.2"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "docs/architecture/platform_architecture.md:970  -  MongoDB/Cosmos have not been exercised against a live endpoint in this phase; container image mongo:7.0 exists"
+      known_limitations: ""
+    - engine: mssql
+      source_version: "2016"
+      target_version: "2016"
+      source_deployment: local
+      target_deployment: local
+      flow: local_to_local
+      driver_version: "5.3.0"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "Code uses CREATE OR ALTER requiring SQL Server 2016 SP1+ (core/connectors/mssql/objects/trigger.py:129, objects/function.py:86); no Migration Platform E2E run recorded for MSSQL 2016"
+      known_limitations: "Syntax compatibility only; no documented or tested Migration Platform support for MSSQL 2016"
+    - engine: mssql
+      source_version: "unspecified"
+      target_version: "unspecified"
+      source_deployment: cloud
+      target_deployment: cloud
+      flow: cloud_to_cloud
+      driver_version: "5.3.0"
+      python_version: "3.11"
+      status: SUPPORTED
+      validation_level: documented
+      evidence: "docs/mssql/MSSQL_E2E_RUNBOOK.md:400  -  Azure SQL -> LocalDB flow documented"
+      known_limitations: ""
+    - engine: mssql
+      source_version: "unspecified"
+      target_version: "unspecified"
+      source_deployment: cloud
+      target_deployment: local
+      flow: cloud_to_local
+      driver_version: "5.3.0"
+      python_version: "3.11"
+      status: TESTED
+      validation_level: e2e
+      evidence: "docs/mssql/MSSQL_CLOUD_AUDIT.md:276-332 - Cloud -> Local fresh target 9 tables, 40 rows, 100% success"
+      known_limitations: "Exact SQL Server version not recorded in audit"
+    - engine: mssql
+      source_version: "unspecified"
+      target_version: "unspecified"
+      source_deployment: local
+      target_deployment: cloud
+      flow: local_to_cloud
+      driver_version: "5.3.0"
+      python_version: "3.11"
+      status: TESTED
+      validation_level: e2e
+      evidence: "docs/mssql/MSSQL_CLOUD_AUDIT.md:120-161  -  Normal E2E 9 tables, 28 rows, 100% success to Azure SQL Database"
+      known_limitations: "Azure SQL limitation: sequence extended properties not supported (error 15600); exact SQL Server version not recorded"
+    - engine: mssql
+      source_version: "unspecified"
+      target_version: "unspecified"
+      source_deployment: local
+      target_deployment: local
+      flow: local_to_local
+      driver_version: "5.3.0"
+      python_version: "3.11"
+      status: TESTED
+      validation_level: e2e
+      evidence: "docs/mssql/MSSQL_LOCAL_AUDIT.md  -  9 tables, 28 rows, 20+ non-table objects, 100% success; engine version not recorded in audit"
+      known_limitations: "Exact SQL Server version not documented in audit; test container uses mcr.microsoft.com/mssql/server:2022-latest"
+    - engine: mysql
+      source_version: "8.0"
+      target_version: "8.0"
+      source_deployment: cloud
+      target_deployment: cloud
+      flow: cloud_to_cloud
+      driver_version: "26.7.0"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "No MySQL E2E run recorded anywhere in repository"
+      known_limitations: ""
+    - engine: mysql
+      source_version: "8.0"
+      target_version: "8.0"
+      source_deployment: cloud
+      target_deployment: local
+      flow: cloud_to_local
+      driver_version: "26.7.0"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "No MySQL E2E run recorded anywhere in repository"
+      known_limitations: ""
+    - engine: mysql
+      source_version: "8.0"
+      target_version: "8.0"
+      source_deployment: local
+      target_deployment: cloud
+      flow: local_to_cloud
+      driver_version: "26.7.0"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "No MySQL E2E run recorded anywhere in repository"
+      known_limitations: ""
+    - engine: mysql
+      source_version: "8.0"
+      target_version: "8.0"
+      source_deployment: local
+      target_deployment: local
+      flow: local_to_local
+      driver_version: "26.7.0"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "docs/architecture/platform_architecture.md:970  -  MySQL-to-MySQL has no recorded live local-to-local run; docker-compose.test.yml uses mysql:8.0"
+      known_limitations: ""
+    - engine: postgresql
+      source_version: "14"
+      target_version: "14"
+      source_deployment: local
+      target_deployment: local
+      flow: local_to_local
+      driver_version: "3.3.6"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "No recorded run in repository for PostgreSQL 14"
+      known_limitations: ""
+    - engine: postgresql
+      source_version: "15"
+      target_version: "15"
+      source_deployment: local
+      target_deployment: local
+      flow: local_to_local
+      driver_version: "3.3.6"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "CI and docker-compose.test.yml run PostgreSQL 15 but no audit recorded; CDC docs assume 17"
+      known_limitations: ""
+    - engine: postgresql
+      source_version: "16"
+      target_version: "17.4"
+      source_deployment: cloud
+      target_deployment: local
+      flow: cloud_to_local
+      driver_version: "3.3.6"
+      python_version: "3.11"
+      status: SUPPORTED
+      validation_level: documented
+      evidence: "docs/postgresql/POSTGRESQL_MIGRATION_FLOW.md  -  flow documented but no recorded run for this direction"
+      known_limitations: ""
+    - engine: postgresql
+      source_version: "17.4"
+      target_version: "16"
+      source_deployment: local
+      target_deployment: cloud
+      flow: local_to_cloud
+      driver_version: "3.3.6"
+      python_version: "3.11"
+      status: TESTED
+      validation_level: e2e
+      evidence: "docs/postgresql/POSTGRESQL_CLOUD_AUDIT.md:7,23,292  -  all objects migrated and verified to Azure PostgreSQL Flexible Server"
+      known_limitations: ""
+    - engine: postgresql
+      source_version: "17.4"
+      target_version: "17.4"
+      source_deployment: local
+      target_deployment: local
+      flow: local_to_local
+      driver_version: "3.3.6"
+      python_version: "3.11"
+      status: TESTED
+      validation_level: e2e
+      evidence: "docs/postgresql/POSTGRESQL_LOCAL_AUDIT_PHASE_1.md:5,36,338  -  8 tables, 37 rows, 20+ non-table objects, 100% success"
+      known_limitations: ""
+    - engine: postgresql
+      source_version: "18"
+      target_version: "18"
+      source_deployment: local
+      target_deployment: local
+      flow: local_to_local
+      driver_version: "3.3.6"
+      python_version: "3.11"
+      status: UNVERIFIED
+      validation_level: none
+      evidence: "No recorded run in repository for PostgreSQL 18"
+      known_limitations: ""

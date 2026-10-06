@@ -15,7 +15,6 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.release_validation import (
     _declared_floor,
-    _get_current_tag,
     _requirement_name,
 )
 
@@ -173,32 +172,103 @@ version = "1.0.0"
 class TestGitTagValidation:
     """Tests for Git tag consistency validation."""
 
-    def test_get_current_tag_on_tagged_commit(self):
+    def test_get_current_tag_on_tagged_commit(self, tmp_path):
         """Test _get_current_tag returns tag when on tagged commit."""
-        # We're currently on v0.2.3 tag
-        tag = _get_current_tag()
-        assert tag == "v0.2.3"
+        # Create a temp repo with a matching tag
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True, check=False)
+
+        pyproject_content = """
+[project]
+name = "test"
+version = "1.0.0"
+"""
+        (tmp_path / "pyproject.toml").write_text(pyproject_content)
+
+        subprocess.run(["git", "add", "pyproject.toml"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, capture_output=True, check=False)
+
+        # Tag with matching version
+        subprocess.run(["git", "tag", "-a", "v1.0.0", "-m", "Release v1.0.0"], cwd=tmp_path, capture_output=True, check=False)
+
+        import scripts.release_validation as rv
+        original_root = rv.REPO_ROOT
+        rv.REPO_ROOT = tmp_path
+
+        try:
+            tag = rv._get_current_tag()
+            assert tag == "v1.0.0"
+        finally:
+            rv.REPO_ROOT = original_root
+
+    def test_get_current_tag_returns_none_when_not_tagged(self, tmp_path):
+        """Test _get_current_tag returns None when HEAD is not tagged."""
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True, check=False)
+
+        pyproject_content = """
+[project]
+name = "test"
+version = "1.0.0"
+"""
+        (tmp_path / "pyproject.toml").write_text(pyproject_content)
+
+        subprocess.run(["git", "add", "pyproject.toml"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, capture_output=True, check=False)
+        # NO TAG
+
+        import scripts.release_validation as rv
+        original_root = rv.REPO_ROOT
+        rv.REPO_ROOT = tmp_path
+
+        try:
+            tag = rv._get_current_tag()
+            assert tag is None
+        finally:
+            rv.REPO_ROOT = original_root
 
     def test_git_tag_consistency_skipped_in_normal_mode(self):
         """Test git tag check is skipped when not in release mode."""
         import scripts.release_validation as rv
         rv._results.clear()
-        # Ensure env var is not set
         if "RELEASE_VALIDATION_MODE" in os.environ:
             del os.environ["RELEASE_VALIDATION_MODE"]
         result = rv.check_git_tag_consistency()
         assert result is True  # Skipped returns True
 
-    def test_git_tag_consistency_passes_when_matching(self):
+    def test_git_tag_consistency_passes_when_matching(self, tmp_path):
         """Test git tag check passes when tag matches version."""
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True, check=False)
+
+        pyproject_content = """
+[project]
+name = "test"
+version = "1.0.0"
+"""
+        (tmp_path / "pyproject.toml").write_text(pyproject_content)
+
+        subprocess.run(["git", "add", "pyproject.toml"], cwd=tmp_path, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, capture_output=True, check=False)
+
+        # Tag with matching version
+        subprocess.run(["git", "tag", "-a", "v1.0.0", "-m", "Release v1.0.0"], cwd=tmp_path, capture_output=True, check=False)
+
         import scripts.release_validation as rv
-        rv._results.clear()
-        os.environ["RELEASE_VALIDATION_MODE"] = "1"
+        original_root = rv.REPO_ROOT
+        rv.REPO_ROOT = tmp_path
+
         try:
+            rv._results.clear()
+            os.environ["RELEASE_VALIDATION_MODE"] = "1"
             result = rv.check_git_tag_consistency()
             assert result is True
         finally:
             del os.environ["RELEASE_VALIDATION_MODE"]
+            rv.REPO_ROOT = original_root
 
     def test_git_tag_consistency_fails_when_mismatched(self, tmp_path):
         """Test git tag check fails when tag doesn't match version."""
