@@ -82,6 +82,94 @@ class TestBug1NeverDropWithIncremental:
             assert "DROP" not in str(call)
 
 
+class TestMySQLTargetSchemaReconciliation:
+    @staticmethod
+    def _orchestrator(config):
+        source = MagicMock(spec=SourceConnector)
+        source.get_partitioned_tables = MagicMock(return_value=[])
+        target = MagicMock(spec=TargetConnector)
+        source.list_objects.return_value = ["customers"]
+        source.get_schema.return_value = Schema(
+            name="customers",
+            columns=[Column(name="name", source_type="VARCHAR(100)")],
+        )
+        source.get_object_count.return_value = 1
+        source.export_full.return_value = iter([{"name": "Alice"}])
+        source.list_users.return_value = []
+        source.list_roles.return_value = []
+        source.list_events.return_value = []
+        source.list_functions.return_value = []
+        source.get_all_triggers.return_value = []
+        target.upsert_batch.return_value = UpsertResult(success_count=1)
+        target.reconcile_mysql_table.return_value = "reconciled"
+        target.inspect_schema.return_value = None
+        target.apply_constraints.return_value = None
+        target.create_view.return_value = None
+        orchestrator = MigrationOrchestrator(source, target, config)
+        # Avoid unrelated optional discovery phases on generic mocks.
+        orchestrator.validate = MagicMock(return_value={"status": "success"})
+        return orchestrator, source, target
+
+    def test_full_mysql_migration_reconciles_existing_target_schema_when_enabled(self):
+        orchestrator, _, target = self._orchestrator({
+            "source": {"engine": "mysql"},
+            "target": {"engine": "mysql"},
+            "migration": {"reconcile_target_schema": True},
+        })
+
+        result = orchestrator.run_full()
+
+        target.reconcile_mysql_table.assert_called_once()
+        reconciled_schema, managed_tables = target.reconcile_mysql_table.call_args.args
+        assert reconciled_schema.columns[0].source_type == "VARCHAR(100)"
+        assert managed_tables == {"customers"}
+        target.create_object_if_missing.assert_not_called()
+        target.clear_objects_for_full_sync.assert_called_once_with(["customers"])
+        target.upsert_batch.assert_called_once()
+        target.finalize_schema_reconciliations.assert_not_called()
+        assert result["phases"]["schema_reconciliation"] == {"customers": "reconciled"}
+
+    def test_schema_reconciliation_is_not_called_when_disabled_or_on_other_engine(self):
+        for config in (
+            {"source": {"engine": "mysql"}, "target": {"engine": "mysql"}},
+            {
+                "source": {"engine": "mysql"},
+                "target": {"engine": "postgresql"},
+                "migration": {"reconcile_target_schema": True},
+            },
+        ):
+            orchestrator, _, target = self._orchestrator(config)
+
+            orchestrator.run_full()
+
+            target.reconcile_mysql_table.assert_not_called()
+            target.create_object_if_missing.assert_called_once()
+            target.finalize_schema_reconciliations.assert_not_called()
+
+    def test_full_reconciliation_reloads_only_source_managed_tables(self):
+        orchestrator, source, target = self._orchestrator({
+            "source": {"engine": "mysql"},
+            "target": {"engine": "mysql"},
+            "migration": {"reconcile_target_schema": True},
+        })
+        managed_tables = ["customers", "orders", "products"]
+        source.list_objects.return_value = managed_tables
+        source.get_schema.side_effect = lambda name: Schema(
+            name=name, columns=[Column(name="id", source_type="INT")]
+        )
+        source.export_full.side_effect = lambda name, schema_name=None: iter([{"id": name}])
+
+        orchestrator.run_full()
+
+        assert target.reconcile_mysql_table.call_count == len(managed_tables)
+        assert all(call.args[1] == set(managed_tables) for call in target.reconcile_mysql_table.call_args_list)
+        target.clear_objects_for_full_sync.assert_called_once_with(managed_tables)
+        assert [entry.args[0] for entry in source.export_full.call_args_list] == managed_tables
+        assert target.upsert_batch.call_count == len(managed_tables)
+        assert "manual_table" not in managed_tables
+        assert target.finalize_schema_reconciliations.call_count == 0
+
+
 class TestBug2StatusFromValidation:
     def test_status_not_hardcoded(self):
         source = MagicMock(spec=SourceConnector)

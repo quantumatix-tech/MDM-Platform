@@ -13,13 +13,13 @@ source:
 
 target:
   engine: mysql
-  secret_provider: azure_keyvault
+  secret_provider: local_encrypted_file
 
   connection:
-    host: mysql-mdm-migration-test.mysql.database.azure.com
+    host: 127.0.0.1
     port: 3306
-    database: mysql_migration_target
-    username: mysql_admin
+    database: dms_existing_target_local
+    username: mysql_test
     password_secret: mysql-target-password
     ssl: true
 
@@ -37,15 +37,11 @@ retry:
 
 
 secrets:
-  provider: azure_keyvault
-
+  provider: local_encrypted_file
   local_encrypted_file:
     key_source: keyring
     keyring_service: migration-platform/secrets-key
     auto_create: false
-
-  azure_keyvault:
-    url: https://mdm-migration-kv.vault.azure.net/
 
 
 alerting:

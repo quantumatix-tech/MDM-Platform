@@ -13,6 +13,7 @@ from core.connectors.mysql import (
     MySQLTargetConnector,
     _normalize_mysql_set_value,
 )
+from core.connectors.mysql.objects import table as mysql_table_ops
 
 
 def _target() -> tuple[MySQLTargetConnector, MagicMock, MagicMock]:
@@ -24,6 +25,260 @@ def _target() -> tuple[MySQLTargetConnector, MagicMock, MagicMock]:
     target = MySQLTargetConnector({"database": "target", "source_engine": "mysql"})
     target._conn = connection
     return target, cursor, connection
+
+
+def _reconciliation_connection(target_exists: bool = True):
+    cursor = MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.__exit__.return_value = False
+    cursor.fetchone.side_effect = [None, ("customers",) if target_exists else None]
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    return connection, cursor
+
+
+def test_reconcile_existing_table_replaces_without_backup(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=True)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    _prepare_reconciliation(monkeypatch, schema)
+    cursor.fetchall.return_value = []
+
+    result = mysql_table_ops.reconcile_mysql_table(
+        connection, {"database": "target", "source_engine": "mysql"},
+        schema, {"customers"},
+    )
+
+    sql = [call.args[0] for call in cursor.execute.call_args_list]
+    assert result == "reconciled"
+    assert any(statement == "DROP TABLE `customers`" for statement in sql)
+    assert any(statement.startswith("RENAME TABLE `__dms_stage_") and "TO `customers`" in statement for statement in sql)
+    assert not any("__dms_backup_" in statement for statement in sql)
+    create_ddl = next(statement for statement in sql if statement.startswith("CREATE TABLE `__dms_stage_"))
+    assert "`id` INT" in create_ddl
+    connection.commit.assert_called()
+
+
+def test_reconcile_missing_table_promotes_staged_without_backup(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=False)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    _prepare_reconciliation(monkeypatch, schema)
+    cursor.fetchall.return_value = []
+
+    result = mysql_table_ops.reconcile_mysql_table(
+        connection, {"database": "target", "source_engine": "mysql"},
+        schema, {"customers"},
+    )
+
+    sql = [call.args[0] for call in cursor.execute.call_args_list]
+    assert result == "reconciled"
+    assert "RENAME TABLE `__dms_stage_" in sql[-1]
+    assert "TO `customers`" in sql[-1]
+    assert all("RENAME TABLE `customers` TO" not in statement for statement in sql)
+    assert not any("__dms_backup_" in statement for statement in sql)
+    connection.commit.assert_called()
+
+
+def test_reconcile_error_still_rolls_back_and_cleans_staging(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=False)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    monkeypatch.setattr(mysql_table_ops, "_create_table", lambda *args: None)
+    monkeypatch.setattr(mysql_table_ops, "_schema", MagicMock(inspect_schema=MagicMock(side_effect=RuntimeError("inspect failed"))))
+
+    with pytest.raises(RuntimeError, match="inspect failed"):
+        mysql_table_ops.reconcile_mysql_table(
+            connection, {"database": "target", "source_engine": "mysql"},
+            schema, {"customers"},
+        )
+
+    connection.rollback.assert_called_once()
+    assert any(
+        call.args[0].startswith("DROP TABLE IF EXISTS `__dms_stage_")
+        for call in cursor.execute.call_args_list
+    )
+
+
+def _prepare_reconciliation(monkeypatch, schema):
+    monkeypatch.setattr(
+        mysql_table_ops._schema,
+        "inspect_schema",
+        lambda *args: Schema(name="staged", columns=[], partition_method=schema.partition_method,
+                             partition_expression=schema.partition_expression, partitions=schema.partitions),
+    )
+
+
+def test_reconcile_allows_managed_foreign_key_child_and_drops_its_fk(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=True)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    _prepare_reconciliation(monkeypatch, schema)
+    cursor.fetchall.return_value = [("orders", "fk_orders_customers")]
+
+    mysql_table_ops.reconcile_mysql_table(
+        connection, {"database": "target", "source_engine": "mysql"},
+        schema, {"customers", "orders"},
+    )
+
+    assert any(
+        call.args[0] == "ALTER TABLE `orders` DROP FOREIGN KEY `fk_orders_customers`"
+        for call in cursor.execute.call_args_list
+    )
+    assert any(call.args[0] == "DROP TABLE `customers`" for call in cursor.execute.call_args_list)
+    assert not any("__dms_backup_" in call.args[0] for call in cursor.execute.call_args_list)
+
+
+def test_reconcile_multiple_managed_tables_with_foreign_key_dependency(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=True)
+    customer_schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    order_schema = Schema(name="orders", columns=[Column(name="id", source_type="INT")])
+    _prepare_reconciliation(monkeypatch, customer_schema)
+    cursor.fetchall.side_effect = [[("orders", "fk_orders_customers")], []]
+    cursor.fetchone.side_effect = [None, ("customers",), None, ("orders",)]
+
+    for schema in (customer_schema, order_schema):
+        mysql_table_ops.reconcile_mysql_table(
+            connection, {"database": "target", "source_engine": "mysql"},
+            schema, {"customers", "orders"},
+        )
+
+    assert any(
+        call.args[0] == "ALTER TABLE `orders` DROP FOREIGN KEY `fk_orders_customers`"
+        for call in cursor.execute.call_args_list
+    )
+    assert sum(call.args[0].startswith("DROP TABLE `") for call in cursor.execute.call_args_list) == 2
+    assert not any("__dms_backup_" in call.args[0] for call in cursor.execute.call_args_list)
+
+
+def test_reconcile_preserves_target_only_manual_table(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=True)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    _prepare_reconciliation(monkeypatch, schema)
+    cursor.fetchall.return_value = []
+    mysql_table_ops.reconcile_mysql_table(
+        connection, {"database": "target", "source_engine": "mysql"}, schema, {"customers"}
+    )
+    assert not any("DROP TABLE `manual_table`" in call.args[0] for call in cursor.execute.call_args_list)
+
+
+def test_reconcile_success_promotes_stage_without_temporary_tables(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=True)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    _prepare_reconciliation(monkeypatch, schema)
+    cursor.fetchall.return_value = []
+
+    mysql_table_ops.reconcile_mysql_table(
+        connection, {"database": "target", "source_engine": "mysql"},
+        schema, {"customers"},
+    )
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert any(statement.startswith("RENAME TABLE") and "__dms_stage_" in statement and "TO `customers`" in statement for statement in statements)
+    assert any(statement.startswith("CREATE TABLE `__dms_stage_") for statement in statements)
+    assert not any("__dms_backup_" in statement for statement in statements)
+
+
+def test_reconcile_source_schema_replaces_different_and_extra_columns(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=True)
+    schema = Schema(name="customers", columns=[
+        Column(name="id", source_type="INT", nullable=False),
+        Column(name="email", source_type="VARCHAR(200)"),
+    ])
+    _prepare_reconciliation(monkeypatch, schema)
+    cursor.fetchall.return_value = []
+
+    mysql_table_ops.reconcile_mysql_table(
+        connection, {"database": "target", "source_engine": "mysql"}, schema, {"customers"}
+    )
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    create_ddl = next(statement for statement in statements if statement.startswith("CREATE TABLE `__dms_stage_"))
+    assert "`id` INT NOT NULL" in create_ddl
+    assert "`email` VARCHAR(200) NULL" in create_ddl
+    assert "legacy_column" not in create_ddl
+    assert "DROP TABLE `customers`" in statements
+    assert not any("__dms_backup_" in statement for statement in statements)
+
+
+def test_reconcile_does_not_overwrite_preexisting_stage_named_user_table(monkeypatch):
+    connection, cursor = _reconciliation_connection(target_exists=True)
+    schema = Schema(name="customers", columns=[Column(name="id", source_type="INT")])
+    _prepare_reconciliation(monkeypatch, schema)
+    cursor.fetchall.return_value = []
+    cursor.fetchone.side_effect = [("occupied_stage",), None, ("customers",)]
+
+    mysql_table_ops.reconcile_mysql_table(
+        connection, {"database": "target", "source_engine": "mysql"}, schema, {"customers"}
+    )
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert sum("FROM INFORMATION_SCHEMA.TABLES" in statement for statement in statements) == 3
+    assert not any("DROP TABLE IF EXISTS" in statement for statement in statements)
+    assert any(statement.startswith("RENAME TABLE `__dms_stage_") and "TO `customers`" in statement for statement in statements)
+
+
+def test_mysql_grant_sql_maps_database_and_table_to_target_database():
+    target, cursor, connection = _target()
+    target._config["database"] = "target_db"
+
+    target.apply_grant(GrantDef(
+        privileges="SELECT", object_type="DATABASE", object_name="source_db",
+        schema_name="source_db", grantee="reader", grantee_host="%",
+    ))
+    target.apply_grant(GrantDef(
+        privileges="SELECT", object_type="TABLE", object_name="source_db.customers",
+        schema_name="source_db", grantee="reader", grantee_host="%",
+    ))
+
+    statements = [call.args[0] for call in cursor.execute.call_args_list]
+    assert statements == [
+        "GRANT SELECT ON `target_db`.* TO `reader`@`%`",
+        "GRANT SELECT ON TABLE `target_db`.`customers` TO `reader`@`%`",
+    ]
+    assert all("source_db" not in statement for statement in statements)
+    assert connection.commit.call_count == 2
+
+
+def test_mysql_grant_failure_is_reported_as_partial_success_target_name():
+    from core.connectors.base import GrantDef, UpsertResult
+    from core.orchestrator import MigrationOrchestrator
+
+    source = MagicMock()
+    target = MagicMock(spec=MySQLTargetConnector)
+    source.get_partitioned_tables.return_value = []
+    source.list_objects.return_value = ["customers"]
+    source.get_schema.return_value = Schema(
+        name="customers", columns=[Column(name="id", source_type="INT")]
+    )
+    source.get_object_count.return_value = 1
+    source.export_full.return_value = iter([{"id": 1}])
+    source.list_users.return_value = []
+    source.list_roles.return_value = []
+    source.list_events.return_value = []
+    source.list_functions.return_value = []
+    source.get_all_triggers.return_value = []
+    source.list_grants.return_value = [GrantDef(
+        privileges="SELECT", object_type="DATABASE", object_name="source_db",
+        schema_name="source_db", grantee="mysql_test", grantee_host="%",
+    )]
+    target.upsert_batch.return_value = UpsertResult(success_count=1)
+    target.apply_grant.side_effect = RuntimeError(
+        "1044 (42000): Access denied for user to database 'target_db'"
+    )
+    target.inspect_schema.return_value = None
+    orchestrator = MigrationOrchestrator(source, target, {
+        "source": {"engine": "mysql"},
+        "target": {"engine": "mysql", "connection": {"database": "target_db"}},
+        "migration": {"stop_on_error": False},
+    })
+    orchestrator.validate = MagicMock(return_value={"status": "success"})
+
+    result = orchestrator.run_full()
+
+    assert result["status"] == "partial_success"
+    assert result["phases"]["grants"] == [
+        "GRANT ... ON target_db.* TO mysql_test: failed "
+        "(1044 (42000): Access denied for user to database 'target_db')"
+    ]
+    assert "source_db.source_db" not in str(result["phases"]["grants"])
+    target.apply_grant.assert_called_once()
 
 
 def test_mysql_set_value_uses_declared_member_order_for_target_insert():

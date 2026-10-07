@@ -350,6 +350,11 @@ class MigrationOrchestrator:
 
             # ---------- Phase 4: Create Tables ----------
             all_schemas: dict[str, Any] = {}
+            schema_reconciliation_enabled = (
+                self._config.get("migration", {}).get("reconcile_target_schema", False)
+                and self._config.get("target", {}).get("engine") == "mysql"
+            )
+            reconciliation_results: dict[str, str] = {}
             object_failures: list[dict[str, str]] = []
             failed_objects: set[str] = set()
             result["phases"]["object_failures"] = object_failures
@@ -362,7 +367,11 @@ class MigrationOrchestrator:
                         all_schemas[obj_name] = schema
                         continue
                     self._apply_field_mappings(schema)
-                    self._target.create_object_if_missing(schema)
+                    if schema_reconciliation_enabled:
+                        outcome = self._target.reconcile_mysql_table(schema, set(objects))
+                        reconciliation_results[obj_name] = outcome
+                    else:
+                        self._target.create_object_if_missing(schema)
                     all_schemas[obj_name] = schema
                 except Exception as exc:
                     failed_objects.add(obj_name)
@@ -380,6 +389,8 @@ class MigrationOrchestrator:
             result["phases"]["create_tables"] = (
                 "partial_success" if failed_objects else "success"
             )
+            if schema_reconciliation_enabled:
+                result["phases"]["schema_reconciliation"] = reconciliation_results
             self._update_status("create_tables", 16, all_errors)
 
             # ---------- Phase 4.5: Create Partition Children ----------
@@ -776,6 +787,15 @@ class MigrationOrchestrator:
                 for grant in grants:
                     if grant.object_type == "SCHEMA":
                         grant_key = f"{grant.object_name} TO {grant.grantee}"
+                    elif self._config.get("target", {}).get("engine") == "mysql":
+                        target_database = self._config.get("target", {}).get("connection", {}).get("database", "")
+                        if grant.object_type == "GLOBAL":
+                            target_object = "*.*"
+                        elif grant.object_type == "DATABASE":
+                            target_object = f"{target_database}.*"
+                        else:
+                            target_object = f"{target_database}.{grant.object_name.rsplit('.', 1)[-1]}"
+                        grant_key = f"{target_object} TO {grant.grantee}"
                     else:
                         grant_key = (
                             f"{grant.object_name} TO {grant.grantee}"

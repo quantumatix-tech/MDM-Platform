@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-import hashlib
+import uuid
 
 from core.connectors.base import (
     Schema,
@@ -96,16 +96,29 @@ def _create_table(cur: Any, config: dict[str, Any], schema: Schema, table_name: 
 
 
 def reconcile_mysql_table(conn: Any, config: dict[str, Any], schema: Schema,
-                          managed_tables: set[str], backups: list[str]) -> str:
-    """Stage and atomically swap a source-equivalent table, retaining backup until success."""
-    token = hashlib.sha1(schema.name.encode()).hexdigest()[:10]
-    staged = f"__dms_stage_{token}"
-    backup = f"__dms_backup_{token}"
-    validate_identifier(staged, "table"); validate_identifier(backup, "table")
+                          managed_tables: set[str]) -> str:
+    """Replace one managed table with source-derived DDL using a short-lived stage."""
+    staged = ""
+    stage_created = False
     with conn.cursor() as cur:
         try:
-            cur.execute(f"DROP TABLE IF EXISTS {_q(staged)}")
+            # Never overwrite a target-only object that happens to use the
+            # internal staging prefix. Allocate a fresh name after checking
+            # the catalog, then clean up only the stage created by this call.
+            for _ in range(10):
+                staged = f"__dms_stage_{uuid.uuid4().hex}"
+                validate_identifier(staged, "table")
+                cur.execute(
+                    "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                    "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                    (config["database"], staged),
+                )
+                if cur.fetchone() is None:
+                    break
+            else:
+                raise RuntimeError("could not allocate a unique MySQL reconciliation staging table")
             _create_table(cur, config, schema, staged)
+            stage_created = True
             conn.commit()
             staged_schema = _schema.inspect_schema(conn, config["database"], staged)
             if (
@@ -114,6 +127,11 @@ def reconcile_mysql_table(conn: Any, config: dict[str, Any], schema: Schema,
                 or [(p.name, p.description) for p in staged_schema.partitions] != [(p.name, p.description) for p in schema.partitions]
             ):
                 raise RuntimeError("staged table partition metadata does not match source")
+
+            # Check incoming references before dropping the managed target.
+            # Source-managed child tables can have their old FK removed here;
+            # the orchestrator reapplies source constraints after all managed
+            # tables have been replaced.
             cur.execute(
                 "SELECT TABLE_NAME,CONSTRAINT_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE "
                 "WHERE TABLE_SCHEMA=%s AND REFERENCED_TABLE_SCHEMA=%s AND REFERENCED_TABLE_NAME=%s "
@@ -121,38 +139,31 @@ def reconcile_mysql_table(conn: Any, config: dict[str, Any], schema: Schema,
                 (config["database"], config["database"], schema.name),
             )
             incoming = cur.fetchall()
-            external = [table for table, _ in incoming if table not in managed_tables]
-            if external:
-                raise RuntimeError(f"cannot safely reconcile {schema.name}: referenced by unmanaged target tables {external}")
             for child, constraint in incoming:
-                if child != schema.name:
+                if child != schema.name and child in managed_tables:
                     cur.execute(f"ALTER TABLE {_q(child)} DROP FOREIGN KEY {_q(constraint)}")
-            cur.execute(f"DROP TABLE IF EXISTS {_q(backup)}")
-            cur.execute(f"RENAME TABLE {_q(schema.name)} TO {_q(backup)}, {_q(staged)} TO {_q(schema.name)}")
+            cur.execute(
+                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                (config["database"], schema.name),
+            )
+            target_exists = cur.fetchone() is not None
+            if target_exists:
+                cur.execute(f"DROP TABLE {_q(schema.name)}")
+            cur.execute(f"RENAME TABLE {_q(staged)} TO {_q(schema.name)}")
+            stage_created = False
             conn.commit()
-            backups.append(backup)
-            audit_log(phase="reconcile_table", status="recreated", details={"table": schema.name, "backup": backup})
+            audit_log(phase="reconcile_table", status="recreated", details={"table": schema.name})
             return "reconciled"
         except Exception:
             conn.rollback()
-            try:
-                cur.execute(f"DROP TABLE IF EXISTS {_q(staged)}")
-                conn.commit()
-            except Exception:
-                conn.rollback()
+            if stage_created:
+                try:
+                    cur.execute(f"DROP TABLE IF EXISTS {_q(staged)}")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
             raise
-
-
-def finalize_schema_reconciliations(conn: Any, backups: list[str]) -> list[str]:
-    """Drop the retained backup tables once the run has succeeded."""
-    removed: list[str] = []
-    with conn.cursor() as cur:
-        for backup in backups:
-            cur.execute(f"DROP TABLE {_q(backup)}")
-            removed.append(backup)
-        conn.commit()
-    backups.clear()
-    return removed
 
 
 def sync_auto_increment(conn: Any, table: str, column: str) -> None:
