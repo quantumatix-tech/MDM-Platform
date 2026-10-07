@@ -20,8 +20,8 @@ class AzureKeyVaultProvider(SecretProvider):
         if self._client is not None:
             return self._client
         try:
-            from azure.keyvault.secrets import SecretClient
             from azure.identity import DefaultAzureCredential
+            from azure.keyvault.secrets import SecretClient
         except ImportError:
             logger.warning(
                 "azure-keyvault-secrets or azure-identity not installed; "

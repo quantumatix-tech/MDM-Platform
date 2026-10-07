@@ -1,7 +1,6 @@
 source:
   engine: mysql
   secret_provider: local_encrypted_file
-
   connection:
     host: 127.0.0.1
     port: 3306
@@ -10,11 +9,9 @@ source:
     password_secret: mysql-source-password
     ssl: true
 
-
 target:
   engine: mysql
   secret_provider: local_encrypted_file
-
   connection:
     host: 127.0.0.1
     port: 3306
@@ -23,18 +20,15 @@ target:
     password_secret: mysql-target-password
     ssl: true
 
-
 migration:
   mode: full
   batch_size: 1000
   reconcile_target_schema: true
 
-
 retry:
   max_retries: 3
   base_delay_seconds: 1.0
   max_delay_seconds: 30.0
-
 
 secrets:
   provider: local_encrypted_file
@@ -43,15 +37,12 @@ secrets:
     keyring_service: migration-platform/secrets-key
     auto_create: false
 
-
 alerting:
   notifier: none
-
 
 validation:
   mode: count
   sample_size: 1000
-
 
 logging:
   level: INFO

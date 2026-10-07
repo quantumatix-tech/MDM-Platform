@@ -466,8 +466,8 @@ python -m migration_platform --config <path-to-config.yaml> --mode <mode>
 
 ```powershell
 # Step 1: Set passwords (use SECRET_ prefix!)
-$env:SECRET_source_db_pass = "root1234"
-$env:SECRET_target_db_pass = "Mohit@991"
+$env:SECRET_source_db_pass = "<source-password>"
+$env:SECRET_target_db_pass = "<target-password>"
 
 # Step 2: Run
 python -m migration_platform --config config/my_config.yaml --mode full

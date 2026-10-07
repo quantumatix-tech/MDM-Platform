@@ -1,30 +1,21 @@
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 
 from core.connectors.base import (
-    SourceConnector,
-    TargetConnector,
-    Schema,
     Column,
     ForeignKey,
+    Schema,
+    SourceConnector,
+    TargetConnector,
     UpsertResult,
-    ViewDefinition,
-    FunctionDef,
-    SynonymDef,
-    TriggerDef,
-    CommentDef,
-    GrantDef,
-    RoleDef,
-    UserDef,
-    RoleMembershipDef,
 )
 from core.connectors.mssql import PartitionedTableDef
 from core.orchestrator import MigrationOrchestrator
@@ -146,17 +137,17 @@ def test_partitioned_table_excluded_from_create_tables_phase():
     Partitioned tables should NOT be created in Phase 4 (create_tables).
     They should be created in Phase 4.5 (create_partitions) via create_partitioned_table.
     """
-    orchestrator, source, target = _orchestrator_with_partitioned_table()
+    _orchestrator, _source, target = _orchestrator_with_partitioned_table()
 
-    result = orchestrator.run_full()
+    _orchestrator.run_full()
 
     # Verify create_object_if_missing was NOT called for partitioned_table
-    create_calls = [call.args[0].name for call in target.create_object_if_missing.call_args_list]
+    create_calls = [c.args[0].name for c in target.create_object_if_missing.call_args_list]
     assert "regular_table" in create_calls, "Regular table should be created in create_tables phase"
     assert "partitioned_table" not in create_calls, "Partitioned table should NOT be created in create_tables phase"
 
     # Verify create_partitioned_table WAS called for partitioned_table
-    partitioned_calls = [call.args[0].name for call in target.create_partitioned_table.call_args_list]
+    partitioned_calls = [c.args[0].name for c in target.create_partitioned_table.call_args_list]
     assert "partitioned_table" in partitioned_calls, "Partitioned table should be created in create_partitions phase"
 
 
@@ -165,140 +156,23 @@ def test_partitioned_table_excluded_from_create_tables_incremental():
     Partitioned tables should NOT be created in Phase 4 (create_tables) for run_cdc.
     They should be created in Phase 4.5 (create_partitions) via create_partitioned_table.
     """
-    orchestrator, source, target = _orchestrator_with_partitioned_table()
+    _orchestrator, _source, target = _orchestrator_with_partitioned_table()
 
-    result = orchestrator.run_cdc(max_iterations=1)
+    _orchestrator.run_cdc(max_iterations=1)
 
     # Verify create_object_if_missing was NOT called for partitioned_table
-    create_calls = [call.args[0].name for call in target.create_object_if_missing.call_args_list]
+    create_calls = [c.args[0].name for c in target.create_object_if_missing.call_args_list]
     assert "regular_table" in create_calls, "Regular table should be created in create_tables phase"
     assert "partitioned_table" not in create_calls, "Partitioned table should NOT be created in create_tables phase"
 
     # Verify create_partitioned_table WAS called for partitioned_table
-    partitioned_calls = [call.args[0].name for call in target.create_partitioned_table.call_args_list]
+    partitioned_calls = [c.args[0].name for c in target.create_partitioned_table.call_args_list]
     assert "partitioned_table" in partitioned_calls, "Partitioned table should be created in create_partitions phase"
-
-
-def test_full_migration_loads_data_in_schema_dependency_order():
-    orchestrator, source, target = _orchestrator_for_order_test()
-    objects = ["child", "independent", "parent"]
-    schemas = {
-        "child": Schema(
-            name="child",
-            schema_name="dbo",
-            columns=[Column(name="id", source_type="int")],
-            foreign_keys=[
-                ForeignKey(
-                    name="fk_child_parent",
-                    columns=["parent_id"],
-                    ref_table="parent",
-                    ref_columns=["id"],
-                    ref_schema="dbo",
-                )
-            ],
-        ),
-        "independent": _schema("independent"),
-        "parent": _schema("parent"),
-    }
-    source.list_objects.return_value = objects
-    source.get_schema.side_effect = lambda name, **kw: schemas[name]
-
-    result = orchestrator.run_full()
-
-    loaded = [call.args[0] for call in target.upsert_batch.call_args_list]
-    assert loaded == ["independent", "parent", "child"]
-    assert result["phases"]["data_load_order"] == loaded
-
-
-def test_full_migration_reports_fk_cycle_before_clearing_or_loading_data():
-    orchestrator, source, target = _orchestrator_for_order_test()
-    objects = ["A", "B"]
-    schemas = {
-        "A": Schema(
-            name="A",
-            schema_name="dbo",
-            foreign_keys=[ForeignKey("fk_A_B", ["b_id"], "B", ["id"], "dbo")],
-        ),
-        "B": Schema(
-            name="B",
-            schema_name="dbo",
-            foreign_keys=[ForeignKey("fk_B_A", ["a_id"], "A", ["id"], "dbo")],
-        ),
-    }
-    source.list_objects.return_value = objects
-    source.get_schema.side_effect = lambda name, **kw: schemas[name]
-
-    result = orchestrator.run_full()
-
-    assert result["status"] == "failed"
-    assert "dependency cycle" in result["error"]
-    target.clear_objects_for_full_sync.assert_not_called()
-    target.upsert_batch.assert_not_called()
-
-
-def test_data_load_order_handles_chains_and_multiple_parents():
-    schemas = {
-        "leaf": Schema(
-            name="leaf",
-            schema_name="dbo",
-            foreign_keys=[
-                ForeignKey("fk_leaf_middle", ["middle_id"], "middle", ["id"], "dbo"),
-                ForeignKey("fk_leaf_other", ["other_id"], "other", ["id"], "dbo"),
-            ],
-        ),
-        "middle": Schema(
-            name="middle",
-            schema_name="dbo",
-            foreign_keys=[ForeignKey("fk_middle_root", ["root_id"], "root", ["id"], "dbo")],
-        ),
-        "root": _schema("root"),
-        "other": _schema("other"),
-    }
-
-    order = MigrationOrchestrator._order_data_load_objects(
-        schemas, ["leaf", "middle", "other", "root"]
-    )
-
-    assert order.index("root") < order.index("middle") < order.index("leaf")
-    assert order.index("other") < order.index("leaf")
-
-
-def test_data_load_order_preserves_order_without_fks_and_for_unrelated_objects():
-    no_fks = {name: _schema(name) for name in ["z", "a", "m"]}
-    assert MigrationOrchestrator._order_data_load_objects(no_fks) == ["z", "a", "m"]
-
-    schemas = {"A": _schema("A"), "B": _schema("B"), "C": Schema(
-        name="C",
-        schema_name="dbo",
-        foreign_keys=[ForeignKey("fk_C_A", ["a_id"], "A", ["id"], "dbo")],
-    )}
-    assert MigrationOrchestrator._order_data_load_objects(schemas) == ["A", "B", "C"]
-
-
-def test_data_load_order_uses_schema_qualified_reference_when_names_repeat():
-    schemas = {
-        "child": Schema(
-            name="child",
-            schema_name="child_schema",
-            foreign_keys=[
-                ForeignKey("fk_child_parent", ["parent_id"], "parent", ["id"], "target_schema")
-            ],
-        ),
-        "target_parent": Schema(name="parent", schema_name="target_schema"),
-        "other_parent": Schema(name="parent", schema_name="other_schema"),
-    }
-
-    order = MigrationOrchestrator._order_data_load_objects(
-        schemas, ["child", "target_parent", "other_parent"]
-    )
-
-    assert order.index("target_parent") < order.index("child")
-    assert order.index("child") < order.index("other_parent")
 
 
 def test_phase_order_schemas_before_tables():
     """Schemas phase must execute before create_tables phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -310,7 +184,7 @@ def test_phase_order_schemas_before_tables():
 
 def test_phase_order_custom_types_before_tables():
     """Custom types (UDTs) phase must execute before create_tables phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -322,7 +196,7 @@ def test_phase_order_custom_types_before_tables():
 
 def test_phase_order_tables_before_constraints():
     """Create tables phase must execute before apply_constraints phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -334,7 +208,7 @@ def test_phase_order_tables_before_constraints():
 
 def test_phase_order_tables_before_data():
     """Create tables phase must execute before data migration phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -347,7 +221,7 @@ def test_phase_order_tables_before_data():
 
 def test_phase_order_tables_before_views():
     """Create tables phase must execute before views phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -359,7 +233,7 @@ def test_phase_order_tables_before_views():
 
 def test_phase_order_tables_before_functions():
     """Create tables phase must execute before functions phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -371,7 +245,7 @@ def test_phase_order_tables_before_functions():
 
 def test_phase_order_tables_before_synonyms():
     """Create tables phase must execute before synonyms phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -383,7 +257,7 @@ def test_phase_order_tables_before_synonyms():
 
 def test_phase_order_tables_before_triggers():
     """Create tables phase must execute before triggers phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -395,7 +269,7 @@ def test_phase_order_tables_before_triggers():
 
 def test_phase_order_tables_before_comments():
     """Create tables phase must execute before comments phase."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -407,7 +281,7 @@ def test_phase_order_tables_before_comments():
 
 def test_phase_order_schemas_objects_before_security_grants():
     """Schemas and tables must execute before security and grants phases."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -424,7 +298,7 @@ def test_phase_order_schemas_objects_before_security_grants():
 
 def test_full_phase_sequence_matches_dependency_graph():
     """Verify the complete phase sequence follows the expected dependency order."""
-    orchestrator, source, target = _orchestrator_for_order_test()
+    orchestrator, _source, _target = _orchestrator_for_order_test()
 
     result = orchestrator.run_full()
 
@@ -463,6 +337,219 @@ def test_full_phase_sequence_matches_dependency_graph():
             idx = phase_order.index(phase)
             assert idx > last_idx, f"Phase {phase} appears out of order (idx {idx} <= {last_idx})"
             last_idx = idx
+
+
+def test_full_migration_loads_data_in_schema_dependency_order():
+    orchestrator, source, target = _orchestrator_for_order_test()
+    objects = ["child", "independent", "parent"]
+    schemas = {
+        "child": Schema(
+            name="child",
+            schema_name="dbo",
+            columns=[Column(name="id", source_type="int")],
+            foreign_keys=[
+                ForeignKey(
+                    name="fk_child_parent",
+                    columns=["parent_id"],
+                    ref_table="parent",
+                    ref_columns=["id"],
+                    ref_schema="dbo",
+                )
+            ],
+        ),
+        "independent": _schema("independent"),
+        "parent": _schema("parent"),
+    }
+    source.list_objects.return_value = objects
+    source.get_schema.side_effect = lambda name, **kw: schemas[name]
+
+    result = orchestrator.run_full()
+
+    loaded = [c.args[0] for c in target.upsert_batch.call_args_list]
+    assert loaded == ["independent", "parent", "child"]
+    assert result["phases"]["data_load_order"] == loaded
+
+
+def test_full_migration_reports_fk_cycle_before_clearing_or_loading_data():
+    orchestrator, source, target = _orchestrator_for_order_test()
+    objects = ["A", "B"]
+    schemas = {
+        "A": Schema(
+            name="A",
+            schema_name="dbo",
+            foreign_keys=[ForeignKey("fk_A_B", ["b_id"], "B", ["id"], "dbo")],
+        ),
+        "B": Schema(
+            name="B",
+            schema_name="dbo",
+            foreign_keys=[ForeignKey("fk_B_A", ["a_id"], "A", ["id"], "dbo")],
+        ),
+    }
+    source.list_objects.return_value = objects
+    source.get_schema.side_effect = lambda name, **kw: schemas[name]
+
+    result = orchestrator.run_full()
+
+    assert result["status"] == "failed"
+    assert "dependency cycle" in result["error"].lower()
+    target.clear_objects_for_full_sync.assert_not_called()
+    target.upsert_batch.assert_not_called()
+
+
+def test_data_load_order_handles_chains_and_multiple_parents():
+    from core.dependency_order import order_data_load_objects
+    schemas = {
+        "leaf": Schema(
+            name="leaf",
+            schema_name="dbo",
+            foreign_keys=[
+                ForeignKey("fk_leaf_middle", ["middle_id"], "middle", ["id"], "dbo"),
+                ForeignKey("fk_leaf_other", ["other_id"], "other", ["id"], "dbo"),
+            ],
+        ),
+        "middle": Schema(
+            name="middle",
+            schema_name="dbo",
+            foreign_keys=[ForeignKey("fk_middle_root", ["root_id"], "root", ["id"], "dbo")],
+        ),
+        "root": _schema("root"),
+        "other": _schema("other"),
+    }
+
+    order = order_data_load_objects(schemas, ["leaf", "middle", "other", "root"])
+
+    assert order.index("root") < order.index("middle") < order.index("leaf")
+    assert order.index("other") < order.index("leaf")
+
+
+def test_data_load_order_preserves_order_without_fks_and_for_unrelated_objects():
+    from core.dependency_order import order_data_load_objects
+    no_fks = {name: _schema(name) for name in ["z", "a", "m"]}
+    assert order_data_load_objects(no_fks) == ["z", "a", "m"]
+
+    schemas = {"A": _schema("A"), "B": _schema("B"), "C": Schema(
+        name="C",
+        schema_name="dbo",
+        foreign_keys=[ForeignKey("fk_C_A", ["a_id"], "A", ["id"], "dbo")],
+    )}
+    assert order_data_load_objects(schemas) == ["A", "B", "C"]
+
+
+def test_data_load_order_uses_schema_qualified_reference_when_names_repeat():
+    from core.dependency_order import order_data_load_objects
+    schemas = {
+        "child": Schema(
+            name="child",
+            schema_name="child_schema",
+            foreign_keys=[
+                ForeignKey("fk_child_parent", ["parent_id"], "parent", ["id"], "target_schema")
+            ],
+        ),
+        "target_parent": Schema(name="parent", schema_name="target_schema"),
+        "other_parent": Schema(name="parent", schema_name="other_schema"),
+    }
+
+    order = order_data_load_objects(
+        schemas, ["child", "target_parent", "other_parent"]
+    )
+
+    assert order.index("target_parent") < order.index("child")
+    assert order.index("child") < order.index("other_parent")
+
+
+def test_data_load_order_ignores_missing_referenced_table():
+    """FK referencing a table not in the migration scope should not affect ordering."""
+    from core.dependency_order import order_data_load_objects
+    schemas = {
+        "child": Schema(
+            name="child",
+            schema_name="dbo",
+            foreign_keys=[
+                ForeignKey("fk_child_missing", ["parent_id"], "missing_table", ["id"], "dbo")
+            ],
+        ),
+        "other": _schema("other"),
+    }
+    # "missing_table" is not in schemas - should be ignored, not cause an error
+    order = order_data_load_objects(schemas, ["child", "other"])
+    # Both tables have no resolvable dependencies, so original order preserved
+    assert order == ["child", "other"]
+
+
+def test_data_load_order_self_referencing_table():
+    """Self-referencing FK (e.g., employee.manager_id -> employee.id) should not create cycle."""
+    from core.dependency_order import order_data_load_objects
+    schemas = {
+        "employee": Schema(
+            name="employee",
+            schema_name="dbo",
+            foreign_keys=[
+                ForeignKey("fk_emp_mgr", ["manager_id"], "employee", ["id"], "dbo")
+            ],
+        ),
+    }
+    order = order_data_load_objects(schemas, ["employee"])
+    # Self-reference is ignored for dependency ordering, so the table should be loadable
+    assert order == ["employee"]
+
+
+def test_data_load_order_multiple_independent_trees():
+    """Two independent parent->child trees should be loadable in any order relative to each other."""
+    from core.dependency_order import order_data_load_objects
+    schemas = {
+        "child1": Schema(name="child1", schema_name="dbo", foreign_keys=[ForeignKey("fk_c1_p1", ["p1_id"], "parent1", ["id"], "dbo")]),
+        "parent1": _schema("parent1"),
+        "child2": Schema(name="child2", schema_name="dbo", foreign_keys=[ForeignKey("fk_c2_p2", ["p2_id"], "parent2", ["id"], "dbo")]),
+        "parent2": _schema("parent2"),
+    }
+    # Order within each tree must be preserved, but trees can be interleaved
+    order = order_data_load_objects(schemas, ["child1", "parent1", "child2", "parent2"])
+    assert order.index("parent1") < order.index("child1")
+    assert order.index("parent2") < order.index("child2")
+
+
+def test_data_load_order_one_parent_multiple_children():
+    """One parent with multiple children - parent first, children in discovery order."""
+    from core.dependency_order import order_data_load_objects
+    schemas = {
+        "child_a": Schema(name="child_a", schema_name="dbo", foreign_keys=[ForeignKey("fk_ca_p", ["p_id"], "parent", ["id"], "dbo")]),
+        "child_b": Schema(name="child_b", schema_name="dbo", foreign_keys=[ForeignKey("fk_cb_p", ["p_id"], "parent", ["id"], "dbo")]),
+        "parent": _schema("parent"),
+    }
+    order = order_data_load_objects(schemas, ["child_a", "child_b", "parent"])
+    assert order.index("parent") < order.index("child_a")
+    assert order.index("parent") < order.index("child_b")
+    # Children should preserve discovery order
+    assert order.index("child_a") < order.index("child_b")
+
+
+def test_cdc_migration_uses_dependency_order():
+    """run_cdc should also use FK-aware data load order for initial sync."""
+    orchestrator, source, target = _orchestrator_for_order_test()
+    objects = ["child", "independent", "parent"]
+    schemas = {
+        "child": Schema(
+            name="child",
+            schema_name="dbo",
+            columns=[Column(name="id", source_type="int")],
+            foreign_keys=[ForeignKey("fk_child_parent", ["parent_id"], "parent", ["id"], "dbo")],
+        ),
+        "independent": _schema("independent"),
+        "parent": _schema("parent"),
+    }
+    source.list_objects.return_value = objects
+    source.get_schema.side_effect = lambda name, **kw: schemas[name]
+    source.list_all_sequences = MagicMock(return_value=[])
+    source.list_partitions = MagicMock(return_value=[])
+    source.list_partition_functions = MagicMock(return_value=[])
+    source.list_partition_schemes = MagicMock(return_value=[])
+    source.get_partitioned_tables = MagicMock(return_value=[])
+
+    result = orchestrator.run_cdc(max_iterations=1)
+
+    loaded = [c.args[0] for c in target.upsert_batch.call_args_list]
+    assert loaded == ["independent", "parent", "child"]
+    assert result["phases"]["data_load_order"] == loaded
 
 
 if __name__ == "__main__":

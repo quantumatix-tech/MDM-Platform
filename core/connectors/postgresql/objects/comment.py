@@ -20,7 +20,6 @@ from core.connectors.base import (
     quote_identifier,
 )
 
-
 # ============================================================================
 # SOURCE-SIDE COMMENT OPERATIONS
 # ============================================================================
@@ -38,13 +37,15 @@ def discover_comments(conn: Any, schemas: tuple[str, ...]) -> list[CommentDef]:
         cur.execute(
             "SELECT CASE c.relkind "
             "  WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' "
-            "  WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE 'TABLE' END, "
+            "  WHEN 'm' THEN 'MATERIALIZED VIEW' "
+            "  WHEN 'p' THEN 'TABLE' WHEN 'S' THEN 'SEQUENCE' "
+            "  ELSE 'TABLE' END, "
             "  n.nspname, c.relname, d.description "
             "FROM pg_description d "
             "JOIN pg_class c ON d.objoid = c.oid "
             "JOIN pg_namespace n ON c.relnamespace = n.oid "
             "WHERE n.nspname = ANY(%s) AND d.objsubid = 0 "
-            "  AND c.relkind IN ('r', 'v', 'm') "
+            "  AND c.relkind IN ('r', 'v', 'm', 'p', 'S') "
             "ORDER BY c.relname",
             (schema_list,),
         )

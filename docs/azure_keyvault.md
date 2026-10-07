@@ -244,7 +244,7 @@ Example:
 
 ```powershell
 az keyvault secret show `
-  --vault-name mdm-migration-kv `
+  --vault-name <your-key-vault-name> `
   --name mysql-target-password `
   --query "id" `
   -o tsv
@@ -259,7 +259,7 @@ A successful result is a secret resource ID. The secret value is not printed.
 Run:
 
 ```powershell
-python -c "from core.secrets.azure_keyvault import AzureKeyVaultProvider; AzureKeyVaultProvider('https://mdm-migration-kv.vault.azure.net/').get_secret('mysql-target-password'); print('Azure Key Vault secret is accessible.')"
+python -c "from core.secrets.azure_keyvault import AzureKeyVaultProvider; AzureKeyVaultProvider('https://<your-key-vault-name>.vault.azure.net/').get_secret('mysql-target-password'); print('Azure Key Vault secret is accessible.')"
 ```
 
 Expected:
@@ -283,7 +283,7 @@ Test-NetConnection 127.0.0.1 -Port 3306
 Azure MySQL:
 
 ```powershell
-Test-NetConnection mysql-mdm-migration-test.mysql.database.azure.com -Port 3306
+Test-NetConnection <your-mysql-server>.mysql.database.azure.com -Port 3306
 ```
 
 Look for:
@@ -338,7 +338,7 @@ Then:
 
 ```powershell
 az keyvault secret show `
-  --vault-name mdm-migration-kv `
+  --vault-name <your-key-vault-name> `
   --name mysql-target-password `
   --query "id" `
   -o tsv
@@ -347,7 +347,7 @@ az keyvault secret show `
 ## Step 3 — Check application access
 
 ```powershell
-python -c "from core.secrets.azure_keyvault import AzureKeyVaultProvider; AzureKeyVaultProvider('https://mdm-migration-kv.vault.azure.net/').get_secret('mysql-target-password'); print('Azure Key Vault secret is accessible.')"
+python -c "from core.secrets.azure_keyvault import AzureKeyVaultProvider; AzureKeyVaultProvider('https://<your-key-vault-name>.vault.azure.net/').get_secret('mysql-target-password'); print('Azure Key Vault secret is accessible.')"
 ```
 
 ## Step 4 — Check both database ports
@@ -359,7 +359,7 @@ Test-NetConnection 127.0.0.1 -Port 3306
 and:
 
 ```powershell
-Test-NetConnection mysql-mdm-migration-test.mysql.database.azure.com -Port 3306
+Test-NetConnection <your-mysql-server>.mysql.database.azure.com -Port 3306
 ```
 
 Both should show:
@@ -390,7 +390,7 @@ target:
   secret_provider: azure_keyvault
 
   connection:
-    host: mysql-mdm-migration-test.mysql.database.azure.com
+    host: <your-mysql-server>.mysql.database.azure.com
     port: 3306
     database: mysql_migration_target
     username: mysql_admin
@@ -416,7 +416,7 @@ secrets:
     auto_create: false
 
   azure_keyvault:
-    url: https://mdm-migration-kv.vault.azure.net/
+    url: https://<your-key-vault-name>.vault.azure.net/
 
 alerting:
   notifier: none
@@ -938,7 +938,7 @@ az account show
 
 ```powershell
 az keyvault secret show `
-  --vault-name mdm-migration-kv `
+  --vault-name <your-key-vault-name> `
   --name mysql-target-password `
   --query "id" `
   -o tsv
@@ -947,7 +947,7 @@ az keyvault secret show `
 ### Application access to Azure
 
 ```powershell
-python -c "from core.secrets.azure_keyvault import AzureKeyVaultProvider; AzureKeyVaultProvider('https://mdm-migration-kv.vault.azure.net/').get_secret('mysql-target-password'); print('Azure Key Vault secret is accessible.')"
+python -c "from core.secrets.azure_keyvault import AzureKeyVaultProvider; AzureKeyVaultProvider('https://<your-key-vault-name>.vault.azure.net/').get_secret('mysql-target-password'); print('Azure Key Vault secret is accessible.')"
 ```
 
 ### Local MySQL connectivity
@@ -959,7 +959,7 @@ Test-NetConnection 127.0.0.1 -Port 3306
 ### Azure MySQL connectivity
 
 ```powershell
-Test-NetConnection mysql-mdm-migration-test.mysql.database.azure.com -Port 3306
+Test-NetConnection <your-mysql-server>.mysql.database.azure.com -Port 3306
 ```
 
 ### YAML

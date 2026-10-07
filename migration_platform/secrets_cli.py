@@ -7,7 +7,7 @@ import getpass
 import sys
 import warnings
 from pathlib import Path
-from typing import Sequence
+from collections.abc import Sequence
 
 from core.secrets.local_encrypted_file import (
     LocalEncryptedFileProvider,

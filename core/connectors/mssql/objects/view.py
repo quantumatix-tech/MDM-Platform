@@ -9,14 +9,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from core.audit_logger import audit_log
 from core.connectors.base import (
     ViewDefinition,
     quote_identifier,
     validate_identifier,
 )
 from core.connectors.mssql._models import _resolve_mssql_schemas
-from core.audit_logger import audit_log
-
 
 # ============================================================================
 # SOURCE-SIDE VIEW OPERATIONS
@@ -110,6 +109,16 @@ def create_view(conn: Any, view: ViewDefinition) -> None:
     with conn.cursor() as cur:
         try:
             definition = view.definition
+            # Strip leading whitespace and comment lines so the normal
+            # ``CREATE VIEW`` prefix detection works even when SQL Server
+            # embeds leading comments in the definition text.
+            definition = definition.lstrip()
+            while definition.startswith("--"):
+                newline_pos = definition.find("\n")
+                if newline_pos == -1:
+                    definition = ""
+                    break
+                definition = definition[newline_pos + 1:].lstrip()
             if definition.upper().startswith("CREATE VIEW"):
                 definition = definition[len("CREATE VIEW"):].lstrip()
                 # SQL Server returns the definition with its original line

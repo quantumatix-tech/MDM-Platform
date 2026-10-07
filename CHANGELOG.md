@@ -44,6 +44,94 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - The 4 pre-existing unit test failures and the existing Ruff backlog are
   unchanged by this work.
 
+## [0.2.3] - 2026-10-05
+
+### Added
+
+- **FK-aware/dependency-ordered data loading.** Tables are now loaded in
+  topological order based on foreign key relationships, ensuring parent tables
+  are loaded before child tables across PostgreSQL, MySQL, and MSSQL.
+- **Topological ordering of FK dependencies.** New `core/dependency_order.py`
+  module with `build_dependency_graph()`, `topological_sort()`,
+  `order_data_load_objects()`, and `DependencyCycleError`.
+- **Deterministic ordering for independent objects.** Alphabetical tiebreaker
+  ensures consistent load order for unrelated tables.
+- **Cycle detection before data modification.** `DependencyCycleError` is
+  raised before `clear_objects_for_full_sync` is called, preventing partial
+  data loads in cyclic schemas.
+- **Support through existing `Schema.foreign_keys` metadata.** Works with
+  PostgreSQL, MySQL, and MSSQL connectors without schema changes.
+- **CDC initial-sync ordering.** CDC migrations now use the same dependency
+  ordering for initial data sync phase.
+
+### Notes
+
+- The 4 pre-existing unit test failures (`test_cross_engine_type_safety.py` ×2,
+  `test_mysql_datatypes.py` ×2) are unchanged by this work.
+
+## [0.2.2] - 2026-10-05
+
+### Added
+
+- **Azure Key Vault secret provider.** Azure Key Vault can now be used as a
+  secret provider via `secrets.provider: azure_keyvault` and
+  `secrets.azure_keyvault.url`. Uses `DefaultAzureCredential` for
+  authentication (no credential values are stored in config). Requires the
+  `azure-identity` and `azure-keyvault-secrets` packages.
+- **Independent endpoint secret-provider selection.** `source.secret_provider`
+  and `target.secret_provider` override the global `secrets.provider` for their
+  endpoint only, enabling e.g. a local encrypted-file store for the source and
+  Azure Key Vault for the target. When omitted, the existing global provider
+  remains the backward-compatible default.
+- **Local Encrypted File provider enhancements.** Platform-aware defaults
+  (OS keyring on Windows, environment key elsewhere), atomic file writes with
+  `fsync`, `list_secrets`/`set_secret`/`delete_secret` CLI operations, and
+  sanitized error messages that never expose secret values.
+- **`migration_platform.secrets_cli`** — interactive CLI for managing the local
+  encrypted-file store (`set`, `list`, `verify`, `delete`, `init`).
+- **`docs/azure_keyvault.md`** — comprehensive Azure Key Vault setup,
+  configuration, troubleshooting, and security guidance.
+- **`tests/unit/test_secret_provider_selection.py`** — 7 tests covering
+  provider selection, backward compatibility, and error sanitization.
+- **`tests/unit/test_local_encrypted_file_cli.py`** — 10 tests covering local
+  store CRUD, encryption-key management, and CLI security.
+
+### Changed
+
+- Updated `docs/RUNBOOK.md`, `docs/USER_GUIDE.md`, and
+  `docs/architecture/platform_architecture.md` with Azure Key Vault and
+  independent-provider-selection guidance.
+- `config/mysql_local_test.yaml` updated to demonstrate mixed local-store +
+  Azure Key Vault provider usage.
+- `config/migration_config.schema.yaml` — added optional `secret_provider`
+  field to `source` and `target` sections.
+
+### Notes
+
+- The 4 pre-existing unit test failures (`test_cross_engine_type_safety.py` ×2,
+  `test_mysql_datatypes.py` ×2) are unchanged by this work.
+
+## [0.2.1] - 2026-10-04
+
+### Added
+
+- **Acceptance E2E workflow (Mode 2).** New setup → external migration → validation
+  flow for real product/acceptance testing, coexisting with the existing automated
+  regression E2E (Mode 1). Supports MSSQL, PostgreSQL, and MySQL.
+  - `tests/e2e/acceptance/` — shared utilities (`E2EConfig`, config loader,
+    report writer, phase/count formatters).
+  - Per-engine `run_setup.py` and `run_validation.py` runners under
+    `tests/e2e/{mssql,postgresql,mysql}/`.
+  - `tests/e2e/acceptance_clean.py` — shared cleanup runner for all engines.
+  - Demo configs: `config/{mssql,postgresql,mysql}_e2e_acceptance.yaml`.
+  - `docs/e2e_validation/ACCEPTANCE_RUNBOOK.md` — full workflow documentation.
+  - `tests/unit/test_e2e_acceptance.py` — 28 unit tests for the shared module.
+
+### Changed
+
+- Replaced duplicate `_fmt_phase` helpers in per-engine validation runners with the
+  shared `fmt_phase` from `tests/e2e/acceptance/`.
+
 ## [0.2.0] - 2026-10-01
 
 First tagged release. Contains the completed platform architecture transition.
