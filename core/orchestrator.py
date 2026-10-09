@@ -248,8 +248,10 @@ class MigrationOrchestrator:
 
             # ---------- Phase 3: Custom Types ----------
             type_results: dict[str, str] = {}
+            source_types: list[Any] = []
             try:
-                for t in self._source.list_types():
+                source_types = list(self._source.list_types())
+                for t in source_types:
                     try:
                         self._target.create_type(t)
                         type_results[t.name] = f"created ({t.kind})"
@@ -282,8 +284,20 @@ class MigrationOrchestrator:
             all_schemas: dict[str, Any] = {}
             schema_reconciliation_enabled = (
                 self._config.get("migration", {}).get("reconcile_target_schema", False)
-                and self._config.get("target", {}).get("engine") == "mysql"
+                and self._config.get("target", {}).get("engine") in {"mysql", "postgresql"}
             )
+            postgres_source_views: list[Any] | None = None
+            if (
+                schema_reconciliation_enabled
+                and self._config.get("target", {}).get("engine") == "postgresql"
+            ):
+                try:
+                    postgres_source_views = list(self._source.list_views())
+                except Exception:
+                    # The normal views phase will report discovery errors. If
+                    # type reconciliation needs a dependent view meanwhile,
+                    # PostgreSQL's RESTRICT behavior safely blocks the ALTER.
+                    postgres_source_views = None
             reconciliation_results: dict[str, str] = {}
             object_failures: list[dict[str, str]] = []
             failed_objects: set[str] = set()
@@ -298,7 +312,12 @@ class MigrationOrchestrator:
                         continue
                     self._apply_field_mappings(schema)
                     if schema_reconciliation_enabled:
-                        outcome = self._target.reconcile_mysql_table(schema, set(objects))
+                        if self._config.get("target", {}).get("engine") == "mysql":
+                            outcome = self._target.reconcile_mysql_table(schema, set(objects))
+                        else:
+                            outcome = self._target.reconcile_postgresql_table(
+                                schema, postgres_source_views or []
+                            )
                         reconciliation_results[obj_name] = outcome
                     else:
                         self._target.create_object_if_missing(schema)
@@ -325,8 +344,11 @@ class MigrationOrchestrator:
 
             # ---------- Phase 4.5: Create Partition Children ----------
             partition_results: dict[str, str] = {}
+            partitions: list[Any] = []
+            partition_inventory_loaded = False
             try:
                 partitions = self._source.list_partitions()
+                partition_inventory_loaded = True
                 for part in partitions:
                     try:
                         self._target.create_partition(part)
@@ -358,6 +380,22 @@ class MigrationOrchestrator:
                     pass
             except Exception as exc:
                 partition_results["_error"] = str(exc)
+            if (
+                schema_reconciliation_enabled
+                and self._config.get("target", {}).get("engine") == "postgresql"
+                and partition_inventory_loaded
+                and hasattr(self._target, "reconcile_partitions")
+            ):
+                try:
+                    removed_partitions = self._target.reconcile_partitions(
+                        partitions,
+                        list(all_schemas.values()),
+                    )
+                    partition_results["_reconciled"] = {
+                        "removed": removed_partitions,
+                    }
+                except Exception as exc:
+                    partition_results["_reconcile_error"] = str(exc)
             result["phases"]["create_partitions"] = partition_results
             self._update_status("create_partitions", 17, all_errors)
 
@@ -391,6 +429,21 @@ class MigrationOrchestrator:
                 "strategy": "clear-before-load",
                 "cleared": cleared_objects,
             }
+            if (
+                schema_reconciliation_enabled
+                and self._config.get("target", {}).get("engine") == "postgresql"
+            ):
+                try:
+                    result["phases"]["enum_reconciliation"] = (
+                        self._target.reconcile_postgresql_types(
+                            source_types,
+                            list(all_schemas.values()),
+                            postgres_source_views or [],
+                        )
+                    )
+                except Exception as exc:
+                    result["phases"]["enum_reconciliation"] = {"error": str(exc)}
+                    all_errors.append(f"ENUM reconciliation: {exc}")
             total_rows = self._estimate_total_rows(data_load_order, schema_map)
             processed_rows = 0
             for idx, obj_name in enumerate(data_load_order, start=1):
@@ -479,10 +532,12 @@ class MigrationOrchestrator:
             try:
                 all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
                 for seq in all_sequences:
-                    if seq.owned_by:
+                    if seq.owned_by or self._config.get("target", {}).get("engine") == "postgresql":
                         try:
                             self._target.apply_sequence_ownership(seq)
-                            seq_owner_results[seq.name] = f"owned: {seq.owned_by}"
+                            seq_owner_results[seq.name] = (
+                                f"owned: {seq.owned_by}" if seq.owned_by else "unowned"
+                            )
                         except Exception as exc:
                             seq_owner_results[seq.name] = f"skipped: {exc}"
             except Exception as exc:
@@ -531,6 +586,12 @@ class MigrationOrchestrator:
                             seq_advance_results[tbl].append(f"{seq_qname}: advanced")
                         except Exception as exc:
                             seq_advance_results[tbl].append(f"{seq_qname}: skipped ({exc})")
+                    elif self._config.get("target", {}).get("engine") == "postgresql":
+                        try:
+                            self._target.restore_standalone_sequence_state(seq)
+                            seq_advance_results[seq.name] = ["standalone state restored"]
+                        except Exception as exc:
+                            seq_advance_results[seq.name] = [f"standalone state skipped ({exc})"]
             except Exception as exc:
                 seq_advance_results["_error"] = [str(exc)]
             result["phases"]["advance_sequences"] = seq_advance_results
@@ -539,7 +600,12 @@ class MigrationOrchestrator:
             # ---------- Phase 11: Views ----------
             view_results: dict[str, str] = {}
             try:
-                for view in self._source.list_views():
+                views_to_migrate = (
+                    postgres_source_views
+                    if postgres_source_views is not None
+                    else self._source.list_views()
+                )
+                for view in views_to_migrate:
                     try:
                         self._target.create_view(view)
                         view_results[view.name] = "created"
@@ -559,7 +625,10 @@ class MigrationOrchestrator:
             try:
                 for mv in self._source.list_materialized_views():
                     try:
-                        self._target.create_materialized_view(mv)
+                        if self._config.get("target", {}).get("engine") == "postgresql":
+                            self._target.reconcile_materialized_view(mv)
+                        else:
+                            self._target.create_materialized_view(mv)
                         self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
                         mv_results[mv.name] = "created+refreshed"
                     except Exception as exc:
@@ -641,8 +710,10 @@ class MigrationOrchestrator:
 
             # ---------- Phase 16: Comments ----------
             comment_results: dict[str, str] = {}
+            source_comments: list[Any] = []
             try:
-                for comment in self._source.list_comments():
+                source_comments = list(self._source.list_comments())
+                for comment in source_comments:
                     comment_key = (
                         comment.object_name
                         if comment.schema_name == "public"
@@ -655,6 +726,21 @@ class MigrationOrchestrator:
                         comment_results[comment_key] = f"skipped: {exc}"
             except Exception as exc:
                 comment_results["_error"] = str(exc)
+            if (
+                schema_reconciliation_enabled
+                and self._config.get("target", {}).get("engine") == "postgresql"
+            ):
+                try:
+                    result["phases"]["column_comment_reconciliation"] = (
+                        self._target.reconcile_postgresql_column_comments(
+                            list(all_schemas.values()), source_comments
+                        )
+                    )
+                except Exception as exc:
+                    result["phases"]["column_comment_reconciliation"] = {
+                        "error": str(exc)
+                    }
+                    all_errors.append(f"Column comment reconciliation: {exc}")
             result["phases"]["comments"] = comment_results
             self._update_status("comments", 88, all_errors)
 

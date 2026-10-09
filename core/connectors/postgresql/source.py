@@ -82,6 +82,20 @@ class PostgresSourceConnector(SourceConnector):
         self._conn = psycopg.connect(**_make_conn_kwargs(self._config))
         audit_log(phase="connect", status="success", details={"engine": "postgresql", "role": "source"})
 
+    def close(self) -> None:
+        """Roll back any unfinished read transaction and release the connection."""
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        finally:
+            self._conn = None
+
     # ------------------------------------------------------------------
     # Tables
     # ------------------------------------------------------------------

@@ -20,7 +20,7 @@ source:
   engine: postgresql
   connection:
     host: 127.0.0.1
-    port: 55432
+    port: 5432
     database: MigrationE2E_PostgreSQL_Source
     username: postgres
     password_secret: postgresql_e2e_source_pass
@@ -30,16 +30,17 @@ target:
   engine: postgresql
   connection:
     host: 127.0.0.1
-    port: 55432
+    port: 5432
     database: MigrationE2E_PostgreSQL_Target
     username: postgres
     password_secret: postgresql_e2e_target_pass
     ssl: false
-    source_engine: postgresql
 
+    
 migration:
   mode: full
   batch_size: 1000
+  reconcile_target_schema: true
   include_schemas:
     - training
 

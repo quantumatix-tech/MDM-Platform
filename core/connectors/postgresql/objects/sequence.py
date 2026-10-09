@@ -42,8 +42,8 @@ def discover_sequences(conn: Any, schemas: tuple[str, ...]) -> list[SequenceDef]
             "SELECT "
             "  s.schemaname, "
             "  s.sequencename, "
-            "  s.start_value, s.min_value, s.max_value, "
-            "  s.increment_by, s.cycle, "
+            "  s.data_type, s.start_value, s.min_value, s.max_value, "
+            "  s.increment_by, s.cycle, p.seqcache, "
             "  s.last_value, "
             "  ("
             "    SELECT n.nspname || '.' || pc.relname || '.' || a.attname "
@@ -57,14 +57,31 @@ def discover_sequences(conn: Any, schemas: tuple[str, ...]) -> list[SequenceDef]
             "    LIMIT 1 "
             "  ) AS owned_by "
             "FROM pg_sequences s "
+            "JOIN pg_class sc ON sc.relname = s.sequencename "
+            "  AND sc.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schemaname) "
+            "JOIN pg_sequence p ON p.seqrelid = sc.oid "
             "WHERE s.schemaname = ANY(%s) "
             "ORDER BY s.schemaname, s.sequencename",
             (list(schemas), list(schemas)),
         )
         for row in cur.fetchall():
-            seq_schema, seq_name, start, min_v, max_v, incr, cycle, last_v, owned_by = row
+            (seq_schema, seq_name, data_type, start, min_v, max_v, incr,
+             cycle, cache_size, last_v, owned_by) = row
+            is_called = None
+            seq_qname = _qualify(seq_schema, seq_name)
+            cur.execute("SAVEPOINT inspect_sequence_state")
+            try:
+                cur.execute(f"SELECT is_called FROM {seq_qname}")
+                state_row = cur.fetchone()
+                if state_row is not None:
+                    is_called = bool(state_row[0])
+                cur.execute("RELEASE SAVEPOINT inspect_sequence_state")
+            except Exception:
+                cur.execute("ROLLBACK TO SAVEPOINT inspect_sequence_state")
+                cur.execute("RELEASE SAVEPOINT inspect_sequence_state")
             results.append(SequenceDef(
                 name=seq_name,
+                data_type=str(data_type),
                 start_value=int(start),
                 min_value=int(min_v),
                 max_value=int(max_v),
@@ -73,6 +90,9 @@ def discover_sequences(conn: Any, schemas: tuple[str, ...]) -> list[SequenceDef]
                 last_value=int(last_v) if last_v is not None else None,
                 owned_by=owned_by,
                 schema=seq_schema,
+                cache_size=int(cache_size),
+                is_cached=int(cache_size) > 1,
+                is_called=is_called,
             ))
     return results
 
@@ -130,10 +150,22 @@ def create_sequence(conn: Any, seq: SequenceDef) -> None:
             cycle_clause = "CYCLE" if seq.cycle else "NO CYCLE"
             cur.execute(
                 f"CREATE SEQUENCE IF NOT EXISTS {seq_qname} "
+                f"AS {_sequence_data_type(seq.data_type)} "
                 f"START WITH {seq.start_value} "
                 f"INCREMENT BY {seq.increment} "
                 f"MINVALUE {seq.min_value} "
                 f"MAXVALUE {seq.max_value} "
+                f"CACHE {max(1, int(seq.cache_size))} "
+                f"{cycle_clause}"
+            )
+            cur.execute(
+                f"ALTER SEQUENCE {seq_qname} "
+                f"AS {_sequence_data_type(seq.data_type)} "
+                f"START WITH {seq.start_value} "
+                f"INCREMENT BY {seq.increment} "
+                f"MINVALUE {seq.min_value} "
+                f"MAXVALUE {seq.max_value} "
+                f"CACHE {max(1, int(seq.cache_size))} "
                 f"{cycle_clause}"
             )
             conn.commit()
@@ -238,32 +270,63 @@ def apply_sequence_ownership(conn: Any, seq: SequenceDef) -> None:
     schema as the sequence; a cross-schema owned sequence is skipped because
     PostgreSQL does not support it.
     """
-    if not seq.owned_by:
-        return
-    parts = seq.owned_by.split(".")
+    parts = seq.owned_by.split(".") if seq.owned_by else []
     if len(parts) not in (2, 3):
-        return
+        if seq.owned_by:
+            return
     seq_schema = seq.schema or "public"
     if len(parts) == 3:
         owned_schema, table_name, column_name = parts
         if owned_schema != seq_schema:
             return
-    else:
+    elif len(parts) == 2:
         table_name, column_name = parts
         if seq_schema != "public":
             return
     seq_qname = _qualify(seq_schema, seq.name)
-    table_qname = _qualify(seq_schema, table_name)
-    column_qname = quote_identifier(column_name)
+    ownership = "OWNED BY NONE"
+    if parts:
+        table_qname = _qualify(seq_schema, table_name)
+        column_qname = quote_identifier(column_name)
+        ownership = f"OWNED BY {table_qname}.{column_qname}"
     with conn.cursor() as cur:
         try:
-            cur.execute(
-                f"ALTER SEQUENCE {seq_qname} OWNED BY {table_qname}.{column_qname}"
-            )
+            cur.execute(f"ALTER SEQUENCE {seq_qname} {ownership}")
             conn.commit()
             audit_log(phase="apply_sequence_ownership", status="owned",
-                      details={"sequence": seq.name, "owned_by": f"{table_qname}.{column_qname}"})
+                      details={"sequence": seq.name, "owned_by": seq.owned_by or "NONE"})
         except Exception as exc:
             conn.rollback()
             audit_log(phase="apply_sequence_ownership", status="skipped",
                       details={"sequence": seq.name, "reason": str(exc)})
+
+
+def restore_standalone_sequence_state(conn: Any, seq: SequenceDef) -> None:
+    """Restore a source standalone sequence's nextval state after migration.
+
+    ``pg_sequences.last_value`` alone cannot distinguish a never-called
+    sequence from one whose last value equals its start value. ``is_called``
+    preserves that distinction; when PostgreSQL denies state inspection the
+    runtime value is left untouched rather than guessed.
+    """
+    if seq.owned_by is not None or seq.is_called is None:
+        return
+    value = seq.last_value if seq.last_value is not None else seq.start_value
+    seq_qname = _qualify(seq.schema or "public", seq.name)
+    with conn.cursor() as cur:
+        try:
+            cur.execute("SELECT setval(%s::regclass, %s, %s)", (seq_qname, value, seq.is_called))
+            conn.commit()
+            audit_log(phase="restore_sequence_state", status="restored",
+                      details={"sequence": seq_qname, "is_called": seq.is_called})
+        except Exception as exc:
+            conn.rollback()
+            audit_log(phase="restore_sequence_state", status="skipped",
+                      details={"sequence": seq_qname, "reason": str(exc)})
+
+
+def _sequence_data_type(data_type: str) -> str:
+    normalized = data_type.lower()
+    if normalized not in {"smallint", "integer", "bigint"}:
+        raise ValueError(f"Unsupported PostgreSQL sequence data type: {data_type!r}")
+    return normalized

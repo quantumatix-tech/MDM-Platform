@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 from tests.e2e.acceptance import E2EConfig, load_e2e_config, write_acceptance_report
+from core.secrets import create_secret_provider
 from tests.e2e.postgresql.setup.cleanup import cleanup_databases
 from tests.e2e.postgresql.setup.database import (
     _resolve_connection_params,
@@ -45,16 +46,23 @@ from tests.e2e.postgresql.setup.target import PROTECTED_DATABASES, is_protected_
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 
 
-def _connect(cfg: E2EConfig, db_name: str):
-    import psycopg
-
-    conn_cfg = cfg.source_connection
-    params = _resolve_connection_params(
+def _connection_params(cfg: E2EConfig, side: str, secret_resolver):
+    conn_cfg = cfg.source_connection if side == "source" else cfg.target_connection
+    return _resolve_connection_params(
         host=conn_cfg["host"],
         port=conn_cfg["port"],
         username=conn_cfg["username"],
         password_env=conn_cfg["password_secret"],
+        secret_resolver=secret_resolver,
     )
+
+
+def _connect(
+    cfg: E2EConfig, db_name: str, secret_resolver=None, side: str = "source"
+):
+    import psycopg
+
+    params = _connection_params(cfg, side, secret_resolver)
     return psycopg.connect(
         host=params["host"],
         port=params["port"],
@@ -65,8 +73,10 @@ def _connect(cfg: E2EConfig, db_name: str):
     )
 
 
-def _count_user_tables(cfg: E2EConfig, db_name: str) -> int:
-    conn = _connect(cfg, db_name)
+def _count_user_tables(
+    cfg: E2EConfig, db_name: str, secret_resolver=None, side: str = "source"
+) -> int:
+    conn = _connect(cfg, db_name, secret_resolver, side)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -79,9 +89,11 @@ def _count_user_tables(cfg: E2EConfig, db_name: str) -> int:
         conn.close()
 
 
-def _count_rows(cfg: E2EConfig, db_name: str, table_path: str) -> int:
+def _count_rows(
+    cfg: E2EConfig, db_name: str, table_path: str, secret_resolver=None
+) -> int:
     schema, table = table_path.split(".", 1)
-    conn = _connect(cfg, db_name)
+    conn = _connect(cfg, db_name, secret_resolver)
     try:
         with conn.cursor() as cur:
             cur.execute(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
@@ -101,6 +113,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     cfg: E2EConfig = load_e2e_config(args.config)
+    secret_resolver = create_secret_provider(cfg.raw)
 
     source_db = cfg.source_db
     target_db = cfg.target_db
@@ -127,12 +140,8 @@ def main() -> None:
     print(f"  Protected DBs: {sorted(PROTECTED_DATABASES)}")
     print("=" * 60)
 
-    params = _resolve_connection_params(
-        host=cfg.source_connection["host"],
-        port=cfg.source_connection["port"],
-        username=cfg.source_connection["username"],
-        password_env=cfg.source_connection["password_secret"],
-    )
+    params = _connection_params(cfg, "source", secret_resolver)
+    target_params = _connection_params(cfg, "target", secret_resolver)
 
     report: dict = {
         "mode": "acceptance_setup",
@@ -152,7 +161,11 @@ def main() -> None:
         print("\n[CLEANUP] Destroying E2E databases...")
         cleanup_databases(
             params["host"], params["port"], params["user"],
-            params.get("password"), [source_db, target_db], pattern,
+            params.get("password"), [source_db], pattern,
+        )
+        cleanup_databases(
+            target_params["host"], target_params["port"], target_params["user"],
+            target_params.get("password"), [target_db], pattern,
         )
         report["checks"].append({
             "name": "cleanup", "status": "PASS",
@@ -181,8 +194,8 @@ def main() -> None:
     print(f"\n[SETUP] Resetting target database: {target_db}")
     t0 = time.time()
     reset_database(
-        params["host"], params["port"], params["user"],
-        params.get("password"), target_db, pattern,
+        target_params["host"], target_params["port"], target_params["user"],
+        target_params.get("password"), target_db, pattern,
     )
     elapsed = time.time() - t0
     report["checks"].append({
@@ -204,6 +217,7 @@ def main() -> None:
         username=params["user"],
         password_env=cfg.source_connection["password_secret"],
         database=source_db,
+        password=params.get("password"),
     )
     elapsed = time.time() - t0
 
@@ -226,7 +240,7 @@ def main() -> None:
         sys.exit(1)
 
     # --- Verify source has expected tables ---
-    src_table_count = _count_user_tables(cfg, source_db)
+    src_table_count = _count_user_tables(cfg, source_db, secret_resolver)
     report["checks"].append({
         "name": "source_tables", "status": "PASS" if src_table_count > 0 else "FAIL",
         "message": f"{src_table_count} base tables found in source",
@@ -240,7 +254,7 @@ def main() -> None:
     if expected_rows:
         for tbl_path, expected_count in expected_rows.items():
             try:
-                actual = _count_rows(cfg, source_db, tbl_path)
+                actual = _count_rows(cfg, source_db, tbl_path, secret_resolver)
                 row_summary[tbl_path] = actual
                 ok = actual == expected_count
                 report["checks"].append({
@@ -259,7 +273,7 @@ def main() -> None:
                 all_ok = False
 
     # --- Verify target is clean ---
-    tgt_table_count = _count_user_tables(cfg, target_db)
+    tgt_table_count = _count_user_tables(cfg, target_db, secret_resolver, "target")
     target_clean = tgt_table_count == 0
     report["checks"].append({
         "name": "target_clean",

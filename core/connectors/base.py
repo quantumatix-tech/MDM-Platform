@@ -179,6 +179,7 @@ class SequenceDef:
     data_type: str = "bigint"
     cache_size: int = 1
     is_cached: bool = True
+    is_called: bool | None = None
 
 
 @dataclass
@@ -202,6 +203,7 @@ class TypeDef:
     kind: str           # 'enum', 'domain', 'composite'
     ddl: str            # complete CREATE DDL — ready to execute
     schema: str = "public"
+    enum_labels: list[str] | None = None
 
 
 @dataclass
@@ -228,6 +230,7 @@ class FunctionDef:
     ddl: str            # complete DDL from pg_get_functiondef — ready to execute
     schema_name: str = "public"
     kind: str = "function"             # function or procedure
+    identity_arguments: str | None = None  # PostgreSQL routine identity signature
 
 
 @dataclass
@@ -538,6 +541,9 @@ class TargetConnector(abc.ABC):
     def create_materialized_view(self, mv: MaterializedViewDef) -> None:
         pass
 
+    def reconcile_materialized_view(self, mv: MaterializedViewDef) -> None:
+        self.create_materialized_view(mv)
+
     def refresh_materialized_view(self, name: str, schema_name: str | None = None) -> None:
         pass
 
@@ -579,6 +585,9 @@ class TargetConnector(abc.ABC):
         pass
 
     def apply_sequence_ownership(self, seq: "SequenceDef") -> None:
+        pass
+
+    def restore_standalone_sequence_state(self, seq: "SequenceDef") -> None:
         pass
 
     def apply_comment(self, comment: CommentDef) -> None:

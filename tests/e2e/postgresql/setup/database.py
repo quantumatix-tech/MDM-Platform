@@ -24,6 +24,7 @@ from typing import Any
 import psycopg
 
 from core.connectors.base import quote_identifier
+from core.secrets.base import SecretResolver
 
 E2E_DB_NAME_PREFIX = "MigrationE2E_PostgreSQL_"
 DEFAULT_SERVER = "127.0.0.1"
@@ -51,15 +52,22 @@ def _resolve_connection_params(
     port: int | str | None = None,
     username: str | None = None,
     password_env: str | None = None,
+    secret_resolver: SecretResolver | None = None,
 ) -> dict[str, Any]:
-    """Resolve connection parameters, pulling the password from an env var.
+    """Resolve connection parameters, pulling the password from a secret provider.
 
     When ``password_env`` is provided but the corresponding ``SECRET_*``
     environment variable is not set, ``password`` is omitted from the
     returned dict so that PostgreSQL instances with ``trust`` authentication
     can connect without one.
     """
-    password = _resolve_password(password_env) if password_env else None
+    password = None
+    if password_env:
+        password = (
+            secret_resolver.resolve(password_env)
+            if secret_resolver is not None
+            else _resolve_password(password_env)
+        )
     params: dict[str, Any] = {
         "host": host or os.environ.get("POSTGRESQL_HOST", DEFAULT_SERVER),
         "port": port or os.environ.get("POSTGRESQL_PORT", DEFAULT_PORT),

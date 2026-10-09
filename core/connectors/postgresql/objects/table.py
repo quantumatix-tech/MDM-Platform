@@ -68,9 +68,18 @@ def get_row_count(conn: Any, object_name: str, schema_name: str | None = None) -
     """
     validate_identifier(object_name, "table")
     table_name = f"{schema_name}.{object_name}" if schema_name else object_name
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM {table_name}")
-        return cur.fetchone()[0]
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {table_name}")
+            row_count = cur.fetchone()[0]
+        conn.commit()
+        return row_count
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
 
 
 def coerce_value(v: Any) -> Any:

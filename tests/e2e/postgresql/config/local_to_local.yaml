@@ -35,6 +35,7 @@ target:
 migration:
   mode: full
   batch_size: 1000
+  reconcile_target_schema: true
   include_schemas:
     - training
 

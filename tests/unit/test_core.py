@@ -1415,7 +1415,7 @@ class TestPostgresFunctionSchemaQualification:
         )
         cur = MagicMock()
         cur.fetchall.return_value = [
-            ("get_customer_count", "audit_test", "CREATE OR REPLACE FUNCTION audit_test.get_customer_count() RETURNS integer LANGUAGE sql AS $function$ SELECT COUNT(*)::INTEGER FROM audit_test.test_customers; $function$"),
+            ("get_customer_count", "audit_test", "CREATE OR REPLACE FUNCTION audit_test.get_customer_count() RETURNS integer LANGUAGE sql AS $function$ SELECT COUNT(*)::INTEGER FROM audit_test.test_customers; $function$", "f", ""),
         ]
         cur.__enter__.return_value = cur
         cur.__exit__.return_value = False

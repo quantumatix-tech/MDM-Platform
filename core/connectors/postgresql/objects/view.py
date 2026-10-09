@@ -70,6 +70,18 @@ def create_view(conn: Any, view: ViewDefinition) -> None:
             cur.execute(f"CREATE OR REPLACE VIEW {view_name} AS {view.definition}")
             conn.commit()
             audit_log(phase="create_view", status="created", details={"view": view.name})
+            return
+        except Exception:
+            conn.rollback()
+
+        # PostgreSQL cannot replace a view when its output column types or
+        # order changed. Rebuild only this source-managed view, and use the
+        # default RESTRICT behavior so dependent objects are never cascaded.
+        try:
+            cur.execute(f"DROP VIEW {view_name}")
+            cur.execute(f"CREATE VIEW {view_name} AS {view.definition}")
+            conn.commit()
+            audit_log(phase="create_view", status="recreated", details={"view": view.name})
         except Exception as exc:
             conn.rollback()
             audit_log(phase="create_view", status="failed",
@@ -108,6 +120,47 @@ def create_materialized_view(conn: Any, mv: MaterializedViewDef) -> None:
             audit_log(phase="create_matview", status="failed",
                       details={"matview": mv_qname, "reason": str(exc)})
             raise
+
+
+def reconcile_materialized_view(conn: Any, mv: MaterializedViewDef) -> None:
+    """Restore one source-managed materialized view definition safely.
+
+    PostgreSQL has no CREATE OR REPLACE MATERIALIZED VIEW. A changed
+    definition is rebuilt with DROP's default RESTRICT behavior, so dependent
+    target-only objects prevent the replacement instead of being cascaded.
+    """
+    validate_identifier(mv.name, "materialized view")
+    mv_schema = mv.schema_name or "public"
+    mv_qname = _qualify(mv_schema, mv.name)
+    source_definition = mv.definition.rstrip().rstrip(";").strip()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_catalog.pg_get_viewdef(c.oid) "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND c.relname = %s AND c.relkind = 'm'",
+                (mv_schema, mv.name),
+            )
+            row = cur.fetchone()
+            if row is not None and row[0].rstrip().rstrip(";").strip() == source_definition:
+                conn.commit()
+                return
+            if row is not None:
+                cur.execute(f"DROP MATERIALIZED VIEW {mv_qname}")
+            cur.execute(
+                f"CREATE MATERIALIZED VIEW {mv_qname} AS {source_definition} WITH NO DATA"
+            )
+        conn.commit()
+        audit_log(
+            phase="reconcile_matview",
+            status="recreated" if row is not None else "created",
+            details={"matview": mv_qname},
+        )
+    except Exception as exc:
+        conn.rollback()
+        audit_log(phase="reconcile_matview", status="failed",
+                  details={"matview": mv_qname, "reason": str(exc)})
+        raise
 
 
 def refresh_materialized_view(conn: Any, name: str, schema_name: str | None = None) -> None:
