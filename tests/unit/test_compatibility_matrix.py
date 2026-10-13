@@ -153,18 +153,37 @@ class TestCompatibilityMatrixYAML:
         assert entries == sorted_entries, "Entries are not in deterministic order"
 
     def test_no_secrets_in_yaml(self):
+        """Verify no actual secret values are present in the YAML.
+
+        Checks for assignment-like patterns (e.g. password = "value") rather than
+        legitimate descriptive words such as "secret provider" or field names.
+        """
         with YAML_PATH.open("r", encoding="utf-8") as f:
             content = f.read()
 
-        secret_patterns = [
-            "password",
-            "secret",
-            "key",
-            "token",
-            "credential",
+        # Patterns that indicate an actual secret VALUE was committed, not a
+        # descriptive word or field name.  We look for YAML assignments where a
+        # secret-ish key is paired with a non-empty, non-placeholder value.
+        import re
+
+        secret_value_patterns = [
+            # password = "actual_value"  (not "*****", not empty)
+            r'''(?i)password\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+            # token = "actual_value"
+            r'''(?i)token\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+            # api_key = "actual_value"
+            r'''(?i)api[_-]?key\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+            # secret = "actual_value"  (but not "secret provider" or "secret_provider")
+            r'''(?i)(?<![\w ])secret\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+            # credential = "actual_value"
+            r'''(?i)credential\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
         ]
-        for pattern in secret_patterns:
-            assert pattern.lower() not in content.lower(), f"Potential secret '{pattern}' found in YAML"
+
+        for pattern in secret_value_patterns:
+            matches = re.findall(pattern, content)
+            assert not matches, (
+                f"Potential secret value found in YAML matching pattern {pattern}: {matches}"
+            )
 
     def test_specific_entries_exist(self):
         """Verify specific expected entries exist based on repository evidence."""
@@ -199,25 +218,25 @@ class TestCompatibilityMatrixYAML:
         assert e is not None, "PostgreSQL 16->17.4 cloud->local SUPPORTED entry missing"
         assert e["status"] == "SUPPORTED"
 
-        # MSSQL local -> local TESTED (version unspecified)
-        e = find_entry("mssql", "unspecified", "unspecified", "local", "local", "local_to_local")
+        # MSSQL local -> local TESTED (version unspecified, 2022-latest container)
+        e = find_entry("mssql", "unspecified (2022-latest container)", "unspecified (2022-latest container)", "local", "local", "local_to_local")
         assert e is not None, "MSSQL local->local TESTED entry missing"
         assert e["status"] == "TESTED"
 
-        # MSSQL local -> cloud TESTED (version unspecified)
-        e = find_entry("mssql", "unspecified", "unspecified", "local", "cloud", "local_to_cloud")
+        # MSSQL local -> cloud TESTED (version unspecified, 2022-latest container)
+        e = find_entry("mssql", "unspecified (2022-latest container)", "unspecified (2022-latest container)", "local", "cloud", "local_to_cloud")
         assert e is not None, "MSSQL local->cloud TESTED entry missing"
         assert e["status"] == "TESTED"
 
-        # MSSQL cloud -> local TESTED (version unspecified)
-        e = find_entry("mssql", "unspecified", "unspecified", "cloud", "local", "cloud_to_local")
+        # MSSQL cloud -> local TESTED (version unspecified, 2022-latest container)
+        e = find_entry("mssql", "unspecified (2022-latest container)", "unspecified (2022-latest container)", "cloud", "local", "cloud_to_local")
         assert e is not None, "MSSQL cloud->local TESTED entry missing"
         assert e["status"] == "TESTED"
 
-        # MySQL 8.0 local -> local UNVERIFIED
+        # MySQL 8.0 local -> local TESTED
         e = find_entry("mysql", "8.0", "8.0", "local", "local", "local_to_local")
-        assert e is not None, "MySQL 8.0 local->local UNVERIFIED entry missing"
-        assert e["status"] == "UNVERIFIED"
+        assert e is not None, "MySQL 8.0 local->local TESTED entry missing"
+        assert e["status"] == "TESTED"
 
         # MongoDB UNVERIFIED
         e = find_entry("mongodb", "7.0", "7.0", "local", "local", "local_to_local")
@@ -295,9 +314,22 @@ class TestGenerator:
         )
         assert result.returncode == 0
         output = result.stdout.lower()
-        secret_patterns = ["password", "secret", "token", "credential", "apikey", "api_key"]
-        for pattern in secret_patterns:
-            assert pattern not in output, f"Potential secret '{pattern}' in generated output"
+        # Check for actual secret VALUE assignments, not descriptive words
+        # like "secret provider" or field names in documentation.
+        import re
+
+        secret_value_patterns = [
+            r'''(?i)password\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+            r'''(?i)token\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+            r'''(?i)api[_-]?key\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+            r'''(?i)(?<![\w ])secret\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+            r'''(?i)credential\s*[:=]\s*["']?[^"'\s*{}]{3,}["']?''',
+        ]
+        for pattern in secret_value_patterns:
+            matches = re.findall(pattern, output)
+            assert not matches, (
+                f"Potential secret value found in generated output matching pattern {pattern}: {matches}"
+            )
 
     def test_generator_preserves_existing_markdown_not_overwritten(self):
         """Ensure generator doesn't blindly overwrite the existing rich Markdown."""
@@ -384,15 +416,24 @@ class TestMatrixCompleteness:
         assert ("local_to_cloud", "TESTED") in statuses
         assert ("cloud_to_local", "TESTED") in statuses
 
-    def test_mysql_all_unverified(self):
+    def test_mysql_entries_match_evidence(self):
         with YAML_PATH.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
 
         entries = data["compatibility_matrix"]["entries"]
         mysql_entries = [e for e in entries if e["engine"] == "mysql"]
 
+        # local_to_local should be TESTED (we have E2E evidence)
+        local_local = next(e for e in mysql_entries if e["flow"] == "local_to_local")
+        assert local_local["status"] == "TESTED", f"Expected TESTED, got {local_local['status']}"
+        assert local_local["validation_level"] == "e2e", f"Expected e2e, got {local_local['validation_level']}"
+
+        # Other three flows should be SUPPORTED (previously verified; historical evidence not recorded)
         for e in mysql_entries:
-            assert e["status"] == "UNVERIFIED", f"MySQL entry {e['flow']} should be UNVERIFIED"
+            if e["flow"] != "local_to_local":
+                assert e["status"] == "SUPPORTED", f"MySQL entry {e['flow']} should be SUPPORTED"
+                assert e["validation_level"] == "documented", f"MySQL entry {e['flow']} validation_level should be documented"
+                assert "historical E2E evidence is not currently recorded" in e["evidence"], f"MySQL entry {e['flow']} evidence should mention historical evidence"
 
     def test_mongodb_all_unverified(self):
         with YAML_PATH.open("r", encoding="utf-8") as f:
@@ -403,6 +444,96 @@ class TestMatrixCompleteness:
 
         for e in mongo_entries:
             assert e["status"] == "UNVERIFIED", f"MongoDB/Cosmos entry {e['flow']} should be UNVERIFIED"
+
+
+class TestRuntimeComponents:
+    """Tests for the runtime.components section of the compatibility matrix."""
+
+    ALLOWED_STATUSES = {"TESTED", "SUPPORTED", "UNVERIFIED"}
+    REQUIRED_FIELDS = ["component", "version", "status", "evidence", "notes"]
+
+    def _get_components(self):
+        with YAML_PATH.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        runtime = data["compatibility_matrix"].get("runtime")
+        assert runtime is not None, "runtime section missing from compatibility_matrix"
+        components = runtime.get("components")
+        assert components is not None, "runtime.components missing"
+        assert isinstance(components, list), "runtime.components must be a list"
+        return components
+
+    def test_runtime_section_exists(self):
+        with YAML_PATH.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        assert "runtime" in data["compatibility_matrix"], "runtime section missing"
+        assert "recorded_at" in data["compatibility_matrix"]["runtime"]
+        assert "recorded_by" in data["compatibility_matrix"]["runtime"]
+        assert "source" in data["compatibility_matrix"]["runtime"]
+
+    def test_required_fields_per_component(self):
+        components = self._get_components()
+        for i, comp in enumerate(components):
+            for field in self.REQUIRED_FIELDS:
+                assert field in comp, f"runtime.components[{i}] missing required field '{field}'"
+
+    def test_allowed_status_values(self):
+        components = self._get_components()
+        for i, comp in enumerate(components):
+            assert comp["status"] in self.ALLOWED_STATUSES, (
+                f"runtime.components[{i}] has invalid status: {comp['status']}"
+            )
+
+    def test_evidence_not_empty_for_tested_supported(self):
+        components = self._get_components()
+        for i, comp in enumerate(components):
+            if comp["status"] in {"TESTED", "SUPPORTED"}:
+                assert comp["evidence"].strip(), (
+                    f"runtime.components[{i}] ({comp['status']}) has empty evidence"
+                )
+
+    def test_no_duplicate_components(self):
+        components = self._get_components()
+        seen = set()
+        for i, comp in enumerate(components):
+            name = comp["component"]
+            assert name not in seen, f"runtime.components[{i}]: duplicate component '{name}'"
+            seen.add(name)
+
+    def test_expected_components_present(self):
+        components = self._get_components()
+        names = {c["component"] for c in components}
+        expected = {
+            "python", "psycopg", "pyodbc", "mysql-connector-python",
+            "pymongo", "cryptography", "azure-identity", "boto3",
+            "hvac", "rich", "pyyaml", "requests",
+        }
+        missing = expected - names
+        assert not missing, f"Missing runtime components: {missing}"
+
+    def test_python_is_tested(self):
+        components = self._get_components()
+        py = next(c for c in components if c["component"] == "python")
+        assert py["status"] == "TESTED", f"python should be TESTED, got {py['status']}"
+
+    def test_psycopg_is_tested(self):
+        components = self._get_components()
+        psycopg = next(c for c in components if c["component"] == "psycopg")
+        assert psycopg["status"] == "TESTED", f"psycopg should be TESTED, got {psycopg['status']}"
+
+    def test_pyodbc_is_tested(self):
+        components = self._get_components()
+        pyodbc = next(c for c in components if c["component"] == "pyodbc")
+        assert pyodbc["status"] == "TESTED", f"pyodbc should be TESTED, got {pyodbc['status']}"
+
+    def test_mysql_connector_is_tested(self):
+        components = self._get_components()
+        mysql = next(c for c in components if c["component"] == "mysql-connector-python")
+        assert mysql["status"] == "TESTED", f"mysql-connector-python should be TESTED, got {mysql['status']}"
+
+    def test_pymongo_is_supported(self):
+        components = self._get_components()
+        mongo = next(c for c in components if c["component"] == "pymongo")
+        assert mongo["status"] == "SUPPORTED", f"pymongo should be SUPPORTED, got {mongo['status']}"
 
 
 if __name__ == "__main__":

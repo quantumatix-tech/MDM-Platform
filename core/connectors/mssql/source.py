@@ -98,6 +98,20 @@ class MSSQLSourceConnector(SourceConnector):
         self._conn = pyodbc.connect(conn_str)
         audit_log(phase="connect", status="success", details={"engine": "mssql", "role": "source"})
 
+    def get_server_version(self) -> str | None:
+        """Return MSSQL server version string."""
+        if self._conn is None:
+            return None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT @@VERSION")
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+        except Exception:
+            pass
+        return None
+
     def list_objects(self) -> list[str]:
         """Return user base tables in the configured schemas.
 

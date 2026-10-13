@@ -94,6 +94,20 @@ class MSSQLTargetConnector(TargetConnector):
         self._conn = pyodbc.connect(conn_str)
         audit_log(phase="connect", status="success", details={"engine": "mssql", "role": "target"})
 
+    def get_server_version(self) -> str | None:
+        """Return MSSQL server version string."""
+        if self._conn is None:
+            return None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT @@VERSION")
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+        except Exception:
+            pass
+        return None
+
     def ensure_database_exists(self) -> None:
         """Create the target database if it does not exist.
 

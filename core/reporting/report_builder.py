@@ -150,10 +150,17 @@ def _svg_bar_chart(table_stats: dict[str, dict], max_width: int = 420) -> str:
 
 
 class ReportBuilder:
-    def __init__(self, result: dict[str, Any], start_time: float, end_time: float) -> None:
+    def __init__(
+        self,
+        result: dict[str, Any],
+        start_time: float,
+        end_time: float,
+        manifest: dict[str, Any] | None = None,
+    ) -> None:
         self._result = result
         self._start_time = start_time
         self._end_time = end_time
+        self._manifest = manifest
 
     def _duration(self) -> float:
         return round(self._end_time - self._start_time, 2)
@@ -165,7 +172,7 @@ class ReportBuilder:
     # JSON
     # ------------------------------------------------------------------
     def build_json(self) -> dict[str, Any]:
-        return {
+        report = {
             "report_version": "2.0",
             "platform_version": _platform_version(),
             "run_id": self._result.get("run_id"),
@@ -177,6 +184,9 @@ class ReportBuilder:
             "phases": self._result.get("phases", {}),
             "error": self._result.get("error") or self._result.get("cdc_error"),
         }
+        if self._manifest is not None:
+            report["runtime_manifest"] = self._manifest
+        return report
 
     # ------------------------------------------------------------------
     # HTML
@@ -298,6 +308,21 @@ class ReportBuilder:
             error_html = f"""<section class="section error-section">
         <h2 class="section-title" style="color:#f87171">⚠ Errors</h2>
         <pre class="error-pre">{str(err)}</pre>
+      </section>"""
+
+        # ---- Runtime Manifest ----
+        manifest_html = ""
+        manifest = data.get("runtime_manifest")
+        if manifest:
+            # Format manifest for display
+            import json as _json
+            manifest_json = _json.dumps(manifest, indent=2, default=str)
+            manifest_html = f"""<section class="section">
+        <h2 class="section-title">📋 Runtime Manifest <span class="section-sub">(schema v{manifest.get('schema_version', '1.0')})</span></h2>
+        <details class="accordion-item" open>
+          <summary class="accordion-summary">📋 Runtime Environment Manifest</summary>
+          <pre class="accordion-body" style="max-height: 500px;">{manifest_json}</pre>
+        </details>
       </section>"""
 
         # ---- Charts ----
@@ -497,6 +522,9 @@ class ReportBuilder:
     <h2 class="section-title">📋 Phase Details <span class="section-sub">(click to expand)</span></h2>
     <div class="accordion">{accordion_items or '<div style="padding:1.5rem;color:var(--muted);text-align:center">No phase details available</div>'}</div>
   </section>
+
+  <!-- Runtime Manifest -->
+  {manifest_html}
 
   <!-- Errors -->
   {error_html}

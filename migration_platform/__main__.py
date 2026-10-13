@@ -32,6 +32,8 @@ from core.orchestrator import MigrationOrchestrator
 from core.preflight import assert_python_version
 from core.progress_display import create_progress_display
 from core.reporting.report_builder import ReportBuilder
+from core.runtime_manifest import build_runtime_manifest, save_manifest
+from core.secrets import create_secret_provider
 from core.status_server import StatusServer
 
 from . import __version__
@@ -175,10 +177,21 @@ def main():
 
     end_time = time.time()
 
+    # ---- Build runtime manifest ----
+    secret_provider = create_secret_provider(config)
+    manifest = build_runtime_manifest(
+        config=config,
+        source_connector=source,
+        target_connector=target,
+        secret_provider=secret_provider,
+    )
+    manifest["run_id"] = run_id
+    manifest_path = save_manifest(manifest)
+
     # ---- Generate reports ----
-    builder = ReportBuilder(result, start_time, end_time)
+    builder = ReportBuilder(result, start_time, end_time, manifest=manifest)
     html_path, json_path = builder.save()
-    result["report"] = {"html": html_path, "json": json_path}
+    result["report"] = {"html": html_path, "json": json_path, "manifest": manifest_path}
 
     # ---- Detect local network IP (so same-network colleagues can open reports) ----
     import socket

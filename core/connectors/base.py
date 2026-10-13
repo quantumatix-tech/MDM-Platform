@@ -482,6 +482,14 @@ class SourceConnector(abc.ABC):
     def list_synonyms(self) -> list[SynonymDef]:
         return []
 
+    def get_server_version(self) -> str | None:
+        """Return the database server version string.
+
+            Connectors should override this to execute the appropriate version query.
+        Returns None if version cannot be determined.
+        """
+        return None
+
 
 class TargetConnector(abc.ABC):
     """Writes data and schema to the target database."""
@@ -599,6 +607,12 @@ class TargetConnector(abc.ABC):
     def create_role_membership(self, member_name: str, role_name: str) -> None:
         pass
 
+    def get_server_version(self) -> str | None:
+        """Return the database server version string.ss
+                        Connectors should override this to execute the appropriate version query.
+        Returns None if version cannot be determined.
+        """
+        return None
 
 
 class CDCEngine(abc.ABC):

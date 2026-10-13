@@ -35,6 +35,8 @@ REQUIRED_FIELDS = [
 ALLOWED_STATUSES = {"TESTED", "SUPPORTED", "UNVERIFIED", "UNSUPPORTED", "KNOWN_ISSUE"}
 ALLOWED_FLOWS = {"local_to_local", "local_to_cloud", "cloud_to_local", "cloud_to_cloud"}
 ALLOWED_DEPLOYMENTS = {"local", "cloud"}
+ALLOWED_RUNTIME_STATUSES = {"TESTED", "SUPPORTED", "UNVERIFIED"}
+RUNTIME_REQUIRED_FIELDS = ["component", "version", "status", "evidence", "notes"]
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -90,6 +92,36 @@ def validate_matrix(data: dict[str, Any]) -> list[str]:
         if key in seen_keys:
             errors.append(f"Entry {i}: duplicate entry for {key}")
         seen_keys.add(key)
+
+    # Validate runtime components section if present
+    runtime = matrix.get("runtime")
+    if runtime is not None:
+        if not isinstance(runtime, dict):
+            errors.append("'runtime' must be a mapping")
+        else:
+            components = runtime.get("components")
+            if components is None:
+                errors.append("'runtime.components' is required when 'runtime' is present")
+            elif not isinstance(components, list):
+                errors.append("'runtime.components' must be a list")
+            else:
+                seen_components = set()
+                for i, comp in enumerate(components):
+                    for field in RUNTIME_REQUIRED_FIELDS:
+                        if field not in comp:
+                            errors.append(f"runtime.components[{i}]: missing required field '{field}'")
+                    if comp.get("status") not in ALLOWED_RUNTIME_STATUSES:
+                        errors.append(
+                            f"runtime.components[{i}]: invalid status '{comp.get('status')}'"
+                        )
+                    if comp.get("status") in {"TESTED", "SUPPORTED"} and not comp.get("evidence", "").strip():
+                        errors.append(
+                            f"runtime.components[{i}]: evidence must not be empty for TESTED/SUPPORTED entries"
+                        )
+                    name = comp.get("component")
+                    if name in seen_components:
+                        errors.append(f"runtime.components[{i}]: duplicate component '{name}'")
+                    seen_components.add(name)
 
     return errors
 
@@ -163,6 +195,25 @@ def generate_markdown(matrix: dict[str, Any]) -> str:
         lines.append(f"| {engine} | {status} | {count} |")
 
     lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## Runtime Components")
+    lines.append("")
+
+    runtime = matrix.get("runtime")
+    if runtime and isinstance(runtime, dict):
+        components = runtime.get("components", [])
+        if components:
+            lines.append("| Component | Version | Status | Evidence | Notes |")
+            lines.append("|---|---|---|---|---|")
+            for comp in components:
+                lines.append(
+                    f"| {comp.get('component', '')} | {comp.get('version', '')} | "
+                    f"**{comp.get('status', '')}** | {comp.get('evidence', '')} | "
+                    f"{comp.get('notes', '')} |"
+                )
+            lines.append("")
+
     lines.append("---")
     lines.append("")
     lines.append("*This document is generated from `docs/compatibility_matrix.yaml`.*")
