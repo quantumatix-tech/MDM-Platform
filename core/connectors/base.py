@@ -77,6 +77,7 @@ class Index:
     # must not create it a second time as a standalone index. Manually-created
     # unique indexes have no backing constraint and remain independent indexes.
     constraint_backed: bool = False
+    descending_columns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -88,6 +89,8 @@ class ForeignKey:
     ref_schema: str = "public"
     on_delete: str = "NO ACTION"
     on_update: str = "NO ACTION"
+    is_disabled: bool = False
+    is_not_trusted: bool = False
 
 
 @dataclass
@@ -180,6 +183,9 @@ class SequenceDef:
     cache_size: int = 1
     is_cached: bool = True
     is_called: bool | None = None
+    last_used_value: int | None = None
+    last_used_value_available: bool = False
+    is_exhausted: bool = False
 
 
 @dataclass
@@ -208,10 +214,12 @@ class TypeDef:
 
 @dataclass
 class ViewDefinition:
-    """A regular SQL view."""
+    """A SQL view, with optional SQL Server schema-binding/index metadata."""
     name: str
     definition: str     # raw SELECT definition
     schema_name: str = "public"
+    is_schema_bound: bool = False
+    indexes: list[Index] = field(default_factory=list)
 
 
 @dataclass
@@ -525,7 +533,7 @@ class TargetConnector(abc.ABC):
     def create_type(self, type_def: TypeDef) -> None:
         pass
 
-    def apply_constraints(self, schema: Schema) -> None:
+    def apply_constraints(self, schema: Schema) -> list[str] | None:
         pass
 
     def get_capabilities(self) -> dict[str, dict[str, Any]]:

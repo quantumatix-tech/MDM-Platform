@@ -86,6 +86,33 @@ def _count_rows(cfg: E2EConfig, db_name: str, table: str, schema: str) -> int:
         conn.close()
 
 
+def _create_target_only_indexed_view(cfg: E2EConfig, db_name: str) -> None:
+    """Create a disposable target-owned indexed view for preservation tests."""
+    conn = _connect(cfg, db_name)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE training.Task4_TargetOnlyIV_Base "
+                "(ID int NOT NULL CONSTRAINT PK_Task4_TargetOnlyIV_Base PRIMARY KEY CLUSTERED)"
+            )
+            cur.execute("INSERT INTO training.Task4_TargetOnlyIV_Base (ID) VALUES (7), (8)")
+            cur.execute(
+                "CREATE VIEW training.Task4_TargetOnly_IV WITH SCHEMABINDING AS "
+                "SELECT ID, COUNT_BIG(*) AS RowCount "
+                "FROM training.Task4_TargetOnlyIV_Base GROUP BY ID"
+            )
+            cur.execute(
+                "CREATE UNIQUE CLUSTERED INDEX CIX_Task4_TargetOnly_IV "
+                "ON training.Task4_TargetOnly_IV (ID)"
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="MSSQL acceptance E2E — setup source and target databases."
@@ -94,6 +121,10 @@ def main() -> None:
     parser.add_argument(
         "--cleanup", action="store_true",
         help="Destroy both E2E databases after setup verification (destructive).",
+    )
+    parser.add_argument(
+        "--with-target-only-indexed-view", action="store_true",
+        help="Create a disposable target-only indexed view after the clean-target check.",
     )
     args = parser.parse_args()
     cfg: E2EConfig = load_e2e_config(args.config)
@@ -267,6 +298,20 @@ def main() -> None:
     })
     if not target_clean:
         all_ok = False
+
+    if args.with_target_only_indexed_view and all_ok:
+        try:
+            _create_target_only_indexed_view(cfg, target_db)
+            report["checks"].append({
+                "name": "target_only_indexed_view_setup", "status": "PASS",
+                "message": "Created target-only schema-bound view with unique clustered index.",
+            })
+        except Exception as exc:
+            report["checks"].append({
+                "name": "target_only_indexed_view_setup", "status": "FAIL",
+                "message": str(exc),
+            })
+            all_ok = False
 
     report["source_row_counts"] = row_summary
     report["source_table_count"] = src_table_count

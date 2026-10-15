@@ -39,6 +39,8 @@ class TargetValidator(SourceValidator):
                  skip_connectivity: bool = False) -> None:
         super().__init__(catalog, database_name)
         self._skip_connectivity = skip_connectivity
+        self._validate_target_only_indexed_views = True
+        self._preserve_target_only = True
 
     def validate(self) -> ValidationReport:
         start = time.time()

@@ -33,7 +33,7 @@ from core.audit_logger import audit_log
 # ---------------------------------------------------------------------------
 
 def list_grants(conn: Any, config: dict[str, Any]) -> list[GrantDef]:
-    """Discover database permissions (schema, table, column, database level).
+    """Discover database, schema, column, and typed object permissions.
 
     Replaces ``MSSQLSourceConnector.list_grants``.
 
@@ -54,6 +54,7 @@ def list_grants(conn: Any, config: dict[str, Any]) -> list[GrantDef]:
                 f"dp.major_id, dp.minor_id, "
                 f"grantee.name AS grantee_name, "
                 f"obj.name AS object_name, "
+                f"obj.type AS object_type, "
                 f"col.name AS column_name, "
                 f"sch.name AS schema_name, "
                 f"db.name AS database_name "
@@ -90,6 +91,7 @@ def list_grants(conn: Any, config: dict[str, Any]) -> list[GrantDef]:
                 f"dp.major_id, dp.minor_id, "
                 f"grantee.name AS grantee_name, "
                 f"obj.name AS object_name, "
+                f"obj.type AS object_type, "
                 f"col.name AS column_name, "
                 f"sch.name AS schema_name, "
                 f"db.name AS database_name "
@@ -130,6 +132,7 @@ def list_grants(conn: Any, config: dict[str, Any]) -> list[GrantDef]:
             minor_id,
             grantee_name,
             object_name,
+            sql_object_type,
             column_name,
             schema_name,
             database_name,
@@ -149,7 +152,20 @@ def list_grants(conn: Any, config: dict[str, Any]) -> list[GrantDef]:
                 obj_name = f"{object_name}.{column_name}"
                 sch = schema_name or ""
             else:
-                obj_type = "TABLE"
+                obj_type = {
+                    "U": "TABLE",
+                    "V": "VIEW",
+                    "P": "PROCEDURE",
+                    "PC": "PROCEDURE",
+                    "FN": "FUNCTION",
+                    "IF": "FUNCTION",
+                    "TF": "FUNCTION",
+                    "FS": "FUNCTION",
+                    "FT": "FUNCTION",
+                    "TR": "TRIGGER",
+                    "SN": "SYNONYM",
+                    "SO": "SEQUENCE",
+                }.get(sql_object_type, sql_object_type or "OBJECT")
                 obj_name = object_name or ""
                 sch = schema_name or ""
         else:

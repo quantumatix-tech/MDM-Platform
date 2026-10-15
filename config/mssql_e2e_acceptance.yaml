@@ -37,6 +37,7 @@ target:
 migration:
   mode: full
   batch_size: 1000
+  reconcile_mssql_partition_functions: true
   include_schemas:
     - training
 

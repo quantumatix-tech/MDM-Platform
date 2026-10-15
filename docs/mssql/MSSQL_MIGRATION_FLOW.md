@@ -47,7 +47,7 @@ The migration engine creates objects in dependency order to avoid foreign key or
 1. **Schemas** — Created first so all subsequent objects have a valid namespace.
 2. **UDTs / Custom types** — Created before tables that reference them.
 3. **Tables** — Created with all constraints, identity columns, computed columns.
-4. **Data** — Upserted into tables after table structures exist (using `MERGE` / UPSERT).
+4. **Data** — In FULL mode, rows in source-managed tables are deleted in reverse foreign-key dependency order, then source rows are loaded with `MERGE`. Target-only tables are not cleared.
 5. **Indexes** — Created after tables and data (clustered, non-clustered).
 6. **Constraints** — Primary keys, foreign keys, check constraints applied after tables exist.
 7. **Views** — Created after underlying tables exist.
@@ -59,6 +59,61 @@ The migration engine creates objects in dependency order to avoid foreign key or
 13. **Users / Roles / Permissions** — Applied after all objects and roles exist.
 
 If an object creation fails, the migration records the failure and continues (error isolation via `migration.stop_on_error`).
+
+### Existing target tables and FULL data loads
+
+FULL mode is replacement synchronization for tables discovered from the source. Before loading, MSSQL deletes rows only from those registered source-managed tables; target-only tables and their rows are preserved. Repeated runs therefore remove target-only rows from managed tables, restore missing source rows, and overwrite edits to source rows when the source rows are loaded again. The clear phase reports the tables actually deleted in `phases.full_target_sync.cleared`.
+
+Before a FULL data load, MSSQL reconciles columns on each source-managed table. Target-only columns on those tables are removed, and existing source-defined columns are compared by type, length/precision, scale, and nullability before data is loaded. A safe definition mismatch is altered in a transaction while preserving rows. A dependent index, foreign key, schema-bound view, or computed column blocks an alteration and is reported as an object failure; check/default constraints are saved and restored transactionally, and non-schema-bound dependent views are refreshed. An ALTER/conversion or constraint-restoration failure rolls back and is not reported as success. Missing source tables are created. A partially missing source column currently fails explicitly instead of being added implicitly to a populated table. This reconciliation is limited to source-managed tables; separate target-only tables and their rows are preserved.
+
+#### Existing-schema reconciliation test matrix
+
+#### Indexed views
+
+MSSQL view discovery carries `sys.sql_modules.is_schema_bound`, plus view-index
+key columns, uniqueness, and clustered/nonclustered type. FULL migration creates
+the view with `WITH SCHEMABINDING` before adding source indexes, with the unique
+clustered index first. Unsupported or unsafe existing clustered-index changes
+fail explicitly. Acceptance validation checks the source-managed indexed view
+through `OBJECTPROPERTY(..., 'IsSchemaBound')` and `sys.indexes`; source/target
+comparison includes view-index metadata.
+
+To exercise target-only indexed-view preservation, run setup with
+`--with-target-only-indexed-view`, then migrate and validate normally. Its
+dedicated check confirms the target-only view, schema-binding flag, and unique
+clustered index remain present.
+
+| Case | Expected result | Regression evidence |
+|---|---|---|
+| Definition already matches | No `ALTER COLUMN` | `tests/unit/test_mssql_schema_reconciliation.py::test_mssql_full_reconciliation_does_not_alter_matching_definition` |
+| `NVARCHAR(150) NOT NULL` target vs `NVARCHAR(100) NOT NULL` source | Alter to source length/nullability | `tests/unit/test_mssql_schema_reconciliation.py::test_mssql_full_reconciliation_restores_nvarchar_150_to_100_not_null` |
+| Compatible base type or nullability differs | Alter to source definition | `tests/unit/test_mssql_schema_reconciliation.py::test_mssql_full_reconciliation_alters_changed_definition` |
+| Equivalent `BIT` metadata with filtered-index dependency | No unnecessary ALTER | `tests/unit/test_mssql_schema_reconciliation.py::test_equivalent_is_active_with_filtered_city_index_does_not_alter_column` |
+| Real `BIT` nullability mismatch blocked by filtered index | Actionable failure; preserve index/data | `tests/unit/test_mssql_schema_reconciliation.py::test_real_is_active_mismatch_reports_filtered_index_dependency` |
+| Equivalent computed expression with metadata formatting differences | No unnecessary ALTER | `tests/unit/test_mssql_schema_reconciliation.py::test_equivalent_modified_at_computed_expression_is_already_reconciled` |
+| Different computed expression | Actionable unsupported-change failure | `tests/unit/test_mssql_schema_reconciliation.py::test_different_modified_at_expression_fails_actionably_without_recreation` |
+| Repeated reconciliation | Second pass makes no ALTER | `tests/unit/test_mssql_schema_reconciliation.py::test_second_reconciliation_is_idempotent_after_first_alter` |
+| Dependent index/FK/schema-bound view/computed column | Fail safely and roll back | `tests/unit/test_mssql_schema_reconciliation.py::test_mssql_full_reconciliation_fails_safely_on_blocking_dependencies` |
+| Unsupported IDENTITY definition mismatch | Fail explicitly; do not silently skip | `tests/unit/test_mssql_schema_reconciliation.py::test_mssql_full_reconciliation_fails_explicitly_for_special_column_mismatch` |
+| Affected CHECK constraint and view | Restore constraint state and refresh view | `tests/unit/test_mssql_schema_reconciliation.py::test_mssql_full_reconciliation_restores_check_constraint_after_alter` |
+
+The cases above are unit-test evidence, not a live SQL Server acceptance result. The E2E acceptance must verify `sys.columns.max_length = 200` and `is_nullable = 0` after changing the dedicated target `training.Customers.FullName` to `NVARCHAR(150) NOT NULL` and running FULL migration.
+
+### Scenario 4 — Existing target column-definition conflict
+
+**Expected result:** with the dedicated target `training.Customers.FullName` changed to `NVARCHAR(150) NOT NULL`, FULL sync reconciles it to the source definition `NVARCHAR(100) NOT NULL` (`sys.columns.max_length = 200`, `is_nullable = 0`). The existing `FK_Orders_Customers` remains enabled and intact. FULL sync clears dependent child rows before parent rows, then reloads parents before children. It must not drop or disable the FK. The seven source-managed table counts must match the source fixture (33 rows total), and the second run must leave those counts unchanged.
+
+**Investigation / acceptance steps:**
+
+1. Confirm the source and target are the dedicated `MigrationE2E_MSSQL_Source` and `MigrationE2E_MSSQL_Target` databases. Query `sys.columns` for `Customers.FullName` and verify the target is `max_length = 300`, `is_nullable = 0` before migration.
+2. Query `sys.foreign_keys` and `sys.foreign_key_columns` to confirm `FK_Orders_Customers` is present and enabled on the target. Do not drop or disable it.
+3. Run `python -m migration_platform --config config/mssql_e2e_acceptance.yaml --mode full`.
+4. Verify migration status is `success`, `FullName` is `max_length = 200` and `is_nullable = 0`, and `FK_Orders_Customers` remains enabled/trusted.
+5. Verify all seven table row counts against `tests/e2e/mssql/validation/expected.py` (5, 5, 5, 8, 5, 2, 3; total 33), then repeat FULL and confirm the same counts and constraint state.
+
+**Safety condition:** if any source table fails schema preparation, the orchestrator skips both FULL clearing and data loading. This prevents a successful parent table such as `Customers` from being deleted while a dependent source-managed child such as `Orders` was omitted from the cleanup set. The failure remains reported; the migration does not claim a successful replacement.
+
+Focused MSSQL reconciliation/FULL-sync/DDL and E2E-helper unit tests plus PostgreSQL reconciliation/FULL-sync/trigger regressions: **181 passed**. Full `tests/unit`: **880 passed, 8 failed**; the eight are outside these focused suites (MySQL/PostgreSQL orchestration, type/sequence, and one PostgreSQL existing-object test). Live acceptance requires the dedicated E2E SQL Server and has not been verified in this environment.
 
 ---
 
@@ -282,6 +337,18 @@ The source connector discovers MSSQL objects through catalog queries in this ord
 17. **Extended properties** — `sys.extended_properties`
 18. **Users / Roles** — `sys.database_principals` / `sys.server_principals`
 19. **Permissions** — `sys.database_permissions`
+
+---
+
+## Part 6 — Safe Partition Function Reconciliation
+
+`migration.reconcile_mssql_partition_functions` is an opt-in setting and defaults to `false`. When enabled, MSSQL FULL migration supports one narrow reconciliation: removing exactly one extra trailing boundary from a SQL Server `date` / `RANGE RIGHT` partition function when the target's rightmost partition is empty for every dependent index.
+
+Before issuing `ALTER PARTITION FUNCTION ... MERGE RANGE`, the connector verifies that the source boundaries are an exact prefix of the target boundaries; source/target fanout is consistent; every dependent scheme will have the expected source filegroup mapping afterward; all dependent schemes and indexes are source-managed; every row-filegroup is online and writable; and every dependent heap, table index, or indexed-view index has zero rows in the rightmost partition. It then performs the merge in a transaction and re-reads the function and scheme catalogs before reporting reconciliation success. It does not drop/recreate partition functions, schemes, tables, indexes, or data.
+
+Missing or interior boundaries, more than one extra boundary, non-date types, RANGE LEFT, occupied partitions, target-only dependencies, or unsafe destination/filegroup state are rejected with a structured diagnostic. The mismatch remains an error and FULL target clearing/data loading stays blocked. The local acceptance config opts into this supported case; production configurations remain opt-out unless explicitly enabled.
+
+`ALTER PARTITION FUNCTION` affects every dependent partitioned table and index atomically. The empty trailing partition precondition is required to avoid moving target rows during the merge; see [Microsoft's ALTER PARTITION FUNCTION documentation](https://learn.microsoft.com/en-us/sql/t-sql/statements/alter-partition-function-transact-sql?view=sql-server-ver16).
 
 ---
 

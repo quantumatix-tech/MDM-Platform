@@ -22,6 +22,8 @@ IF OBJECT_ID('training.fn_CustomerOrderStats', 'IF') IS NOT NULL DROP FUNCTION t
 GO
 
 -- Views
+IF OBJECT_ID('training.Task4_TargetOnly_IV', 'V') IS NOT NULL DROP VIEW training.Task4_TargetOnly_IV;
+IF OBJECT_ID('training.Task4_SourceManaged_IV', 'V') IS NOT NULL DROP VIEW training.Task4_SourceManaged_IV;
 IF OBJECT_ID('training.vw_CustomerOrders', 'V') IS NOT NULL DROP VIEW training.vw_CustomerOrders;
 GO
 
@@ -43,12 +45,15 @@ IF EXISTS (SELECT * FROM sys.partition_functions WHERE name = 'PF_OrderDate') DR
 GO
 
 -- Tables (DROP TABLE cascades constraints, indexes, triggers on that table)
+-- OrderDetails carries FK_OrderDetails_Products, so it must be dropped first.
 IF OBJECT_ID('training.OrderDetails', 'U') IS NOT NULL DROP TABLE training.OrderDetails;
 IF OBJECT_ID('training.Orders', 'U') IS NOT NULL DROP TABLE training.Orders;
 IF OBJECT_ID('training.OrderAudit', 'U') IS NOT NULL DROP TABLE training.OrderAudit;
 IF OBJECT_ID('training.Products', 'U') IS NOT NULL DROP TABLE training.Products;
 IF OBJECT_ID('training.Customers', 'U') IS NOT NULL DROP TABLE training.Customers;
 IF OBJECT_ID('training.PK_Name_Test', 'U') IS NOT NULL DROP TABLE training.PK_Name_Test;
+IF OBJECT_ID('training.Task4_SourceIV_Base', 'U') IS NOT NULL DROP TABLE training.Task4_SourceIV_Base;
+IF OBJECT_ID('training.Task4_TargetOnlyIV_Base', 'U') IS NOT NULL DROP TABLE training.Task4_TargetOnlyIV_Base;
 GO
 
 -- Sequences

@@ -395,6 +395,40 @@ class MSSQLCatalog:
             )
             return {r[0]: r[1] for r in cur.fetchall()}
 
+    def get_view_properties(self, schema: str) -> dict[str, dict[str, Any]]:
+        """Return SQL Server schema-binding and index metadata for views."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT v.name, OBJECTPROPERTY(v.object_id, 'IsSchemaBound') "
+                "FROM sys.views v JOIN sys.schemas s ON s.schema_id = v.schema_id "
+                "WHERE s.name = ? ORDER BY v.name",
+                (schema,),
+            )
+            result = {row[0]: {"is_schema_bound": bool(row[1]), "indexes": {}} for row in cur.fetchall()}
+            cur.execute(
+                "SELECT v.name, i.name, i.type_desc, i.is_unique, c.name, ic.key_ordinal "
+                "FROM sys.views v JOIN sys.schemas s ON s.schema_id = v.schema_id "
+                "JOIN sys.indexes i ON i.object_id = v.object_id "
+                "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+                "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+                "WHERE s.name = ? AND i.index_id > 0 "
+                "AND ic.key_ordinal > 0 AND ic.is_included_column = 0 "
+                "ORDER BY v.name, i.index_id, ic.key_ordinal",
+                (schema,),
+            )
+            for view_name, index_name, type_desc, unique, column, _ordinal in cur.fetchall():
+                if view_name not in result:
+                    continue
+                item = result[view_name]["indexes"].setdefault(index_name, {
+                    "type_desc": type_desc, "is_unique": bool(unique), "columns": [],
+                })
+                item["columns"].append(column)
+            return result
+
+    def get_view_properties_for(self, schema: str, view_name: str) -> dict[str, Any] | None:
+        """Return schema-binding and indexes for one view (if present)."""
+        return self.get_view_properties(schema).get(view_name)
+
     # ------------------------------------------------------------------ #
     # Functions (FN, IF, TF)
     # ------------------------------------------------------------------ #
@@ -461,16 +495,23 @@ class MSSQLCatalog:
 
     def get_sequences(self, schema: str) -> dict[str, dict[str, Any]]:
         with self._conn.cursor() as cur:
+            cur.execute("SELECT TRY_CONVERT(int, SERVERPROPERTY('ProductMajorVersion'))")
+            version_row = cur.fetchone()
+            product_major = version_row[0] if version_row else None
+            last_used_sql = (
+                "CAST(s.last_used_value AS BIGINT)"
+                if isinstance(product_major, int) and product_major >= 14
+                else "CAST(NULL AS BIGINT)"
+            )
             cur.execute(
-                """
-                SELECT s.name, TYPE_NAME(s.user_type_id) AS seq_type,
-                       CAST(s.start_value AS BIGINT), CAST(s.increment AS BIGINT),
-                       s.is_cycling, CAST(s.current_value AS BIGINT)
-                FROM sys.sequences s
-                JOIN sys.schemas sch ON s.schema_id = sch.schema_id
-                WHERE sch.name = ?
-                ORDER BY s.name
-                """,
+                "SELECT s.name, TYPE_NAME(s.user_type_id) AS seq_type, "
+                "CAST(s.start_value AS BIGINT), CAST(s.increment AS BIGINT), "
+                "CAST(s.minimum_value AS BIGINT), CAST(s.maximum_value AS BIGINT), "
+                "s.is_cycling, s.is_cached, CAST(s.cache_size AS BIGINT), "
+                "CAST(s.current_value AS BIGINT), " + last_used_sql + ", s.is_exhausted "
+                "FROM sys.sequences s "
+                "JOIN sys.schemas sch ON sch.schema_id = s.schema_id "
+                "WHERE sch.name = ? ORDER BY s.name",
                 (schema,),
             )
             return {
@@ -478,8 +519,15 @@ class MSSQLCatalog:
                     "data_type": r[1],
                     "start_value": r[2],
                     "increment": r[3],
-                    "is_cycling": bool(r[4]),
-                    "current_value": r[5],
+                    "minimum_value": r[4],
+                    "maximum_value": r[5],
+                    "is_cycling": bool(r[6]),
+                    "is_cached": bool(r[7]),
+                    "cache_size": int(r[8]) if bool(r[7]) and r[8] is not None else None,
+                    "current_value": r[9],
+                    "last_used_value": r[10],
+                    "last_used_value_available": isinstance(product_major, int) and product_major >= 14,
+                    "is_exhausted": bool(r[11]),
                 }
                 for r in cur.fetchall()
             }

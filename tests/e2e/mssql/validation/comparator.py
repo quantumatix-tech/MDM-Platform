@@ -8,7 +8,6 @@ contract in ``expected.py``.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 
 from tests.e2e.mssql.validation.catalog import MSSQLCatalog
@@ -20,6 +19,7 @@ from tests.e2e.mssql.validation.models import (
     PhaseResult,
     ValidationReport,
 )
+from tests.e2e.mssql.validation.sql_normalize import normalize_sql_definition
 
 
 @dataclass
@@ -33,6 +33,8 @@ class ComparisonCategory:
     missing: list[str] = field(default_factory=list)
     unexpected: list[str] = field(default_factory=list)
     mismatches: list[str] = field(default_factory=list)
+    preserved: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     def fail(self, reason: str = "") -> None:
         self.status = STATUS_FAIL
@@ -51,6 +53,7 @@ class SourceTargetComparator:
         self._src = source
         self._tgt = target
         self._categories: list[ComparisonCategory] = []
+        self._type_conflicts: dict[str, tuple[str, str]] = {}
 
     @property
     def categories(self) -> list[ComparisonCategory]:
@@ -60,8 +63,53 @@ class SourceTargetComparator:
     def passed(self) -> bool:
         return all(c.passed for c in self._categories)
 
+    def _collect_module_type_conflicts(self) -> dict[str, tuple[str, str]]:
+        source_types: dict[str, str] = {}
+        target_types: dict[str, str] = {}
+        for catalog, result in ((self._src, source_types), (self._tgt, target_types)):
+            result.update({name: "VIEW" for name in catalog.get_views(SCHEMA_NAME)})
+            result.update({name: f"FUNCTION:{info['type']}" for name, info in catalog.get_functions(SCHEMA_NAME).items()})
+            result.update({name: "PROCEDURE" for name in catalog.get_procedures(SCHEMA_NAME)})
+        return {
+            name: (source_types[name], target_types[name])
+            for name in sorted(source_types.keys() & target_types.keys())
+            if source_types[name] != target_types[name]
+        }
+
+    def _compare_module_type_conflicts(self) -> None:
+        cat = ComparisonCategory(name="object_type_conflicts")
+        cat.expected_count = len(self._type_conflicts)
+        cat.actual_count = len(self._type_conflicts)
+        for name, (source_type, target_type) in self._type_conflicts.items():
+            cat.mismatches.append(
+                f"{SCHEMA_NAME}.{name}: source type {source_type}, target type {target_type}; "
+                "preserved pending explicit operator resolution"
+            )
+        if cat.mismatches:
+            cat.fail()
+        self._categories.append(cat)
+
+    def _remove_type_conflicts(self, cat: ComparisonCategory) -> None:
+        """Keep a same-name type conflict in one dedicated failure category."""
+        names = set(self._type_conflicts)
+        cat.missing = [item for item in cat.missing if item.split(":", 1)[0] not in names]
+        cat.unexpected = [item for item in cat.unexpected if item.split(":", 1)[0] not in names]
+
+    @staticmethod
+    def _preserve_target_only(cat: ComparisonCategory) -> None:
+        """Report target-only objects while applying the preserve policy.
+
+        Source-owned omissions/definition mismatches remain failures. Extras
+        are retained and listed explicitly because the MSSQL policy preserves
+        target-only objects rather than deleting them during FULL migration.
+        """
+        cat.preserved.extend(cat.unexpected)
+        cat.unexpected.clear()
+
     def compare(self) -> None:
         """Run all comparison categories and populate results."""
+        self._type_conflicts = self._collect_module_type_conflicts()
+        self._compare_module_type_conflicts()
         self._compare_schemas()
         self._compare_tables()
         self._compare_columns()
@@ -95,6 +143,7 @@ class SourceTargetComparator:
         cat.actual_count = len(tgt_schemas)
         cat.missing = sorted(src_schemas - tgt_schemas)
         cat.unexpected = sorted(tgt_schemas - src_schemas)
+        self._preserve_target_only(cat)
         if cat.missing or cat.unexpected:
             cat.fail(
                 f"Schemas differ: missing={cat.missing}, "
@@ -110,6 +159,7 @@ class SourceTargetComparator:
         cat.actual_count = len(tgt)
         cat.missing = sorted(src - tgt)
         cat.unexpected = sorted(tgt - src)
+        self._preserve_target_only(cat)
         if cat.missing or cat.unexpected:
             cat.fail(
                 f"Tables differ: missing={cat.missing}, "
@@ -270,11 +320,7 @@ class SourceTargetComparator:
         semantically equivalent definitions that differ only in formatting
         are treated as identical.
         """
-        text = definition
-        text = re.sub(r"--[^\n]*", "", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(r"\[(\w+)\]", r"\1", text)
-        return text.lower()
+        return normalize_sql_definition(definition)
 
     def _compare_views(self) -> None:
         cat = ComparisonCategory(name="views")
@@ -284,11 +330,31 @@ class SourceTargetComparator:
         cat.actual_count = len(tgt_views)
         cat.missing = sorted(set(src_views) - set(tgt_views))
         cat.unexpected = sorted(set(tgt_views) - set(src_views))
+        self._remove_type_conflicts(cat)
+        self._preserve_target_only(cat)
         for v in sorted(set(src_views) & set(tgt_views)):
             if self._normalize_ddl(src_views[v]) != self._normalize_ddl(tgt_views[v]):
                 cat.mismatches.append(
                     f"View {v} definition differs"
                 )
+        src_properties = self._src.get_view_properties(SCHEMA_NAME)
+        tgt_properties = self._tgt.get_view_properties(SCHEMA_NAME)
+        for view_name in sorted(set(src_properties) & set(tgt_properties)):
+            src_props, tgt_props = src_properties[view_name], tgt_properties[view_name]
+            if src_props["is_schema_bound"] != tgt_props["is_schema_bound"]:
+                cat.mismatches.append(
+                    f"View {view_name}.IsSchemaBound: {src_props['is_schema_bound']} != {tgt_props['is_schema_bound']}"
+                )
+            for index_name, src_index in src_props["indexes"].items():
+                tgt_index = tgt_props["indexes"].get(index_name)
+                if tgt_index is None:
+                    cat.missing.append(f"view:{view_name}.index:{index_name}")
+                elif src_index != tgt_index:
+                    cat.mismatches.append(
+                        f"View {view_name} index {index_name}: {src_index!r} != {tgt_index!r}"
+                    )
+            for index_name in set(tgt_props["indexes"]) - set(src_props["indexes"]):
+                cat.unexpected.append(f"view:{view_name}.index:{index_name}")
         if cat.mismatches or cat.missing or cat.unexpected:
             cat.fail()
         self._categories.append(cat)
@@ -301,11 +367,17 @@ class SourceTargetComparator:
         cat.actual_count = len(tgt_fn)
         cat.missing = sorted(set(src_fn) - set(tgt_fn))
         cat.unexpected = sorted(set(tgt_fn) - set(src_fn))
+        self._remove_type_conflicts(cat)
         for f in sorted(set(src_fn) & set(tgt_fn)):
             if src_fn[f]["type"] != tgt_fn[f]["type"]:
                 cat.mismatches.append(
                     f"Function {f}: type {src_fn[f]['type']} != {tgt_fn[f]['type']}"
                 )
+            elif self._normalize_ddl(src_fn[f].get("definition") or "") != self._normalize_ddl(
+                tgt_fn[f].get("definition") or ""
+            ):
+                cat.mismatches.append(f"Function {f} normalized definition differs")
+        self._preserve_target_only(cat)
         if cat.mismatches or cat.missing or cat.unexpected:
             cat.fail()
         self._categories.append(cat)
@@ -318,7 +390,12 @@ class SourceTargetComparator:
         cat.actual_count = len(tgt_proc)
         cat.missing = sorted(set(src_proc) - set(tgt_proc))
         cat.unexpected = sorted(set(tgt_proc) - set(src_proc))
-        if cat.missing or cat.unexpected:
+        self._remove_type_conflicts(cat)
+        for p in sorted(set(src_proc) & set(tgt_proc)):
+            if self._normalize_ddl(src_proc[p] or "") != self._normalize_ddl(tgt_proc[p] or ""):
+                cat.mismatches.append(f"Procedure {p} normalized definition differs")
+        self._preserve_target_only(cat)
+        if cat.mismatches or cat.missing or cat.unexpected:
             cat.fail()
         self._categories.append(cat)
 
@@ -339,6 +416,7 @@ class SourceTargetComparator:
                 cat.mismatches.append(
                     f"Trigger {t}: {src_trig[t]} != {tgt_trig[t]}"
                 )
+        self._preserve_target_only(cat)
         if cat.mismatches or cat.missing or cat.unexpected:
             cat.fail()
         self._categories.append(cat)
@@ -352,12 +430,21 @@ class SourceTargetComparator:
         cat.missing = sorted(set(src_seq) - set(tgt_seq))
         cat.unexpected = sorted(set(tgt_seq) - set(src_seq))
         for s in sorted(set(src_seq) & set(tgt_seq)):
-            for key in ("data_type", "start_value"):
-                if src_seq[s].get(key) != tgt_seq[s].get(key):
+            source, target = src_seq[s], tgt_seq[s]
+            for key in (
+                "data_type", "start_value", "increment", "minimum_value",
+                "maximum_value", "is_cycling", "is_cached", "cache_size",
+            ):
+                if source.get(key) != target.get(key):
                     cat.mismatches.append(
-                        f"Sequence {s}.{key}: "
-                        f"{src_seq[s].get(key)!r} != {tgt_seq[s].get(key)!r}"
+                        f"Sequence {s}.{key}: {source.get(key)!r} != {target.get(key)!r}"
                     )
+            cat.notes.append(
+                f"Sequence {s} source runtime state: current={source.get('current_value')}, "
+                f"last_used={source.get('last_used_value')}, exhausted={source.get('is_exhausted')}; "
+                "the functional sequence check verifies the next emitted target value."
+            )
+        self._preserve_target_only(cat)
         if cat.mismatches or cat.missing or cat.unexpected:
             cat.fail()
         self._categories.append(cat)
@@ -375,6 +462,7 @@ class SourceTargetComparator:
                 cat.mismatches.append(
                     f"Synonym {s}: {src_syn[s]} != {tgt_syn[s]}"
                 )
+        self._preserve_target_only(cat)
         if cat.mismatches or cat.missing or cat.unexpected:
             cat.fail()
         self._categories.append(cat)
@@ -394,6 +482,7 @@ class SourceTargetComparator:
                         f"UDT {u}.{key}: "
                         f"{src_ut[u].get(key)!r} != {tgt_ut[u].get(key)!r}"
                     )
+        self._preserve_target_only(cat)
         if cat.mismatches or cat.missing or cat.unexpected:
             cat.fail()
         self._categories.append(cat)
@@ -537,14 +626,17 @@ class SourceTargetComparator:
                 actual=cat.actual_count,
                 message=(
                     f"missing={cat.missing[:10]}, unexpected={cat.unexpected[:10]}, "
-                    f"mismatches={cat.mismatches[:10]}"
-                    if cat.missing or cat.unexpected or cat.mismatches
+                    f"preserved_target_only={cat.preserved[:10]}, "
+                    f"mismatches={cat.mismatches[:10]}, notes={cat.notes[:10]}"
+                    if cat.missing or cat.unexpected or cat.preserved or cat.mismatches or cat.notes
                     else "All objects match"
                 ),
                 details={
                     "missing": cat.missing,
                     "unexpected": cat.unexpected,
+                    "preserved_target_only": cat.preserved,
                     "mismatches": cat.mismatches,
+                    "notes": cat.notes,
                 },
             ))
             phase.duration_s = 0.0

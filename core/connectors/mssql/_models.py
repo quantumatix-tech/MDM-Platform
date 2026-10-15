@@ -21,6 +21,7 @@ Public import path remains: ``from core.connectors.mssql import ...``
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,6 +50,7 @@ class PartitionFunctionDef:
     data_type: str = "datetime2"
     boundaries: list[Any] = field(default_factory=list)
     range_desc: str = "RANGE RIGHT"
+    fanout: int | None = None
 
 
 @dataclass
@@ -58,6 +60,7 @@ class PartitionSchemeDef:
     schema_name: str = "dbo"
     partition_function_name: str = ""
     filegroups: list[str] = field(default_factory=list)
+    destinations: list[tuple[int, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -91,6 +94,84 @@ def _qualify(schema_name: str | None, object_name: str) -> str:
     return f"{quote_identifier(schema)}.{quote_identifier(object_name)}"
 
 
+def _skip_mssql_sql_trivia(sql: str, offset: int = 0) -> int:
+    """Skip SQL Server whitespace and leading line/block comments.
+
+    T-SQL block comments may nest, so a small scanner is more reliable than a
+    regular expression when finding the first DDL token in catalog text.
+    """
+    length = len(sql)
+    while offset < length:
+        if sql[offset].isspace():
+            offset += 1
+        elif sql.startswith("--", offset):
+            newline = sql.find("\n", offset + 2)
+            offset = length if newline < 0 else newline + 1
+        elif sql.startswith("/*", offset):
+            offset += 2
+            depth = 1
+            while offset < length and depth:
+                if sql.startswith("/*", offset):
+                    depth += 1
+                    offset += 2
+                elif sql.startswith("*/", offset):
+                    depth -= 1
+                    offset += 2
+                else:
+                    offset += 1
+        else:
+            break
+    return offset
+
+
+def _read_mssql_identifier(sql: str, offset: int) -> int | None:
+    """Return the end offset of one quoted or unquoted T-SQL identifier."""
+    if offset >= len(sql):
+        return None
+    if sql[offset] == "[":
+        offset += 1
+        while offset < len(sql):
+            if sql[offset] == "]":
+                if offset + 1 < len(sql) and sql[offset + 1] == "]":
+                    offset += 2
+                    continue
+                return offset + 1
+            offset += 1
+        return None
+    if sql[offset] == '"':
+        offset += 1
+        while offset < len(sql):
+            if sql[offset] == '"':
+                if offset + 1 < len(sql) and sql[offset + 1] == '"':
+                    offset += 2
+                    continue
+                return offset + 1
+            offset += 1
+        return None
+    match = re.match(r"(?:[^\W\d]|[_#@])(?:[\w$#@])*", sql[offset:], re.UNICODE)
+    return offset + match.end() if match else None
+
+
+def _read_mssql_qualified_identifier(
+    sql: str, offset: int, *, max_parts: int = 2
+) -> tuple[int, int] | None:
+    """Return (end offset, part count) for a quoted T-SQL multipart name."""
+    end = _read_mssql_identifier(sql, offset)
+    if end is None:
+        return None
+    parts = 1
+    while parts < max_parts:
+        dot_offset = _skip_mssql_sql_trivia(sql, end)
+        if dot_offset >= len(sql) or sql[dot_offset] != ".":
+            break
+        next_offset = _skip_mssql_sql_trivia(sql, dot_offset + 1)
+        end = _read_mssql_identifier(sql, next_offset)
+        if end is None:
+            return None
+        parts += 1
+    return end, parts
+
+
 # ---------------------------------------------------------------------------
 # DDL builders
 # ---------------------------------------------------------------------------
@@ -103,17 +184,21 @@ def _build_mssql_index_ddl(
     key_cols: list[tuple[str, bool]],   # (column_name, is_descending)
     included_cols: list[str] = None,
     filter_def: str | None = None,
+    *,
+    on_view: bool = False,
+    clustered: bool = False,
 ) -> str:
-    """Build a complete CREATE [UNIQUE] INDEX DDL for MSSQL."""
+    """Build a complete CREATE [UNIQUE] [CLUSTERED] INDEX DDL for MSSQL."""
     schema = schema_name or "dbo"
     schema_q = quote_identifier(schema)
     table_q = quote_identifier(table_name)
     unique_str = "UNIQUE " if is_unique else ""
+    clustered_str = "CLUSTERED " if clustered else "NONCLUSTERED " if on_view else ""
     cols = ", ".join(
         f"{quote_identifier(col)} {'DESC' if desc else 'ASC'}"
         for col, desc in key_cols
     )
-    ddl = f"CREATE {unique_str}INDEX {quote_identifier(idx_name)} ON {schema_q}.{table_q}({cols})"
+    ddl = f"CREATE {unique_str}{clustered_str}INDEX {quote_identifier(idx_name)} ON {schema_q}.{table_q}({cols})"
     if included_cols:
         inc = ", ".join(quote_identifier(c) for c in included_cols)
         ddl += f" INCLUDE ({inc})"
