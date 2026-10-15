@@ -15,6 +15,7 @@ from tests.e2e.mssql.validation.expected import (
     EXPECTED_EXT_PROP_COUNT,
     FOREIGN_KEYS,
     FUNCTIONS,
+    INDEXED_VIEWS,
     INDEXES,
     PARTITION_FUNCTION,
     PARTITION_SCHEME,
@@ -27,6 +28,7 @@ from tests.e2e.mssql.validation.expected import (
     SEQUENCES,
     SYNONYMS,
     TABLES,
+    TARGET_ONLY_INDEXED_VIEWS,
     TRIGGERS,
     UNIQUE_CONSTRAINTS,
     USER_TYPES,
@@ -70,6 +72,8 @@ class SourceValidator:
         self._validate_default_constraints()
         self._validate_indexes()
         self._validate_views()
+        if getattr(self, "_validate_target_only_indexed_views", False):
+            self._validate_target_only_views()
         self._validate_functions()
         self._validate_procedures()
         self._validate_triggers()
@@ -130,16 +134,24 @@ class SourceValidator:
         expected = set(TABLES.keys())
         missing = expected - actual
         extra = actual - expected
+        allow_target_only = getattr(self, "_preserve_target_only", False)
+        table_set_ok = not missing and (allow_target_only or not extra)
         phase.add_check(CheckResult(
             name="table_set",
-            status=STATUS_PASS if not missing and not extra else STATUS_FAIL,
+            status=STATUS_PASS if table_set_ok else STATUS_FAIL,
             expected=sorted(expected),
             actual=sorted(actual),
             message=(
                 f"Expected {len(expected)} tables, got {len(actual)}. "
                 f"Missing: {sorted(missing) or 'none'}, "
-                f"Extra: {sorted(extra) or 'none'}"
+                f"Target-only preserved by policy: {sorted(extra) or 'none'}"
+                if allow_target_only else f"Extra: {sorted(extra) or 'none'}"
             ),
+            details={
+                "missing_source_tables": sorted(missing),
+                "target_only_preserved_by_policy": sorted(extra) if allow_target_only else [],
+                "unexpected": sorted(extra) if not allow_target_only else [],
+            },
         ))
         phase.duration_s = time.time() - t0
 
@@ -374,6 +386,7 @@ class SourceValidator:
         phase = self._new_phase("views")
         t0 = time.time()
         actual = self._cat.get_views(SCHEMA_NAME)
+        view_properties = self._cat.get_view_properties(SCHEMA_NAME)
         for v_name in VIEWS:
             exists = v_name in actual
             has_def = exists and bool(actual[v_name])
@@ -390,7 +403,53 @@ class SourceValidator:
                 actual=exists and has_def,
                 message=msg,
             ))
+            if v_name in INDEXED_VIEWS:
+                expected_index, expected_columns = INDEXED_VIEWS[v_name]
+                props = view_properties.get(v_name, {"is_schema_bound": False, "indexes": {}})
+                bound = props["is_schema_bound"]
+                index = props["indexes"].get(expected_index)
+                ok_index = bool(
+                    bound and index
+                    and index["type_desc"] == "CLUSTERED"
+                    and index["is_unique"]
+                    and index["columns"] == expected_columns
+                )
+                phase.add_check(CheckResult(
+                    name=f"view:{v_name}:indexed_view",
+                    status=STATUS_PASS if ok_index else STATUS_FAIL,
+                    expected={"is_schema_bound": True, "index": expected_index,
+                              "type_desc": "CLUSTERED", "is_unique": True,
+                              "columns": expected_columns},
+                    actual={"is_schema_bound": bound, "index": index},
+                    message=None if ok_index else (
+                        f"Indexed view {v_name} must be schema-bound and have unique clustered index "
+                        f"{expected_index} on {expected_columns}"
+                    ),
+                ))
+        # Target-only indexed-view preservation assertions are evaluated by
+        # the target validator, not against the source fixture.
         phase.duration_s = time.time() - t0
+
+    def _validate_target_only_views(self) -> None:
+        phase = self._new_phase("target_only_indexed_views")
+        props = self._cat.get_view_properties(SCHEMA_NAME)
+        for view_name, (index_name, columns) in TARGET_ONLY_INDEXED_VIEWS.items():
+            actual_view = props.get(view_name)
+            index = actual_view["indexes"].get(index_name) if actual_view else None
+            passed = bool(
+                actual_view and actual_view["is_schema_bound"] and index
+                and index["type_desc"] == "CLUSTERED" and index["is_unique"]
+                and index["columns"] == columns
+            )
+            phase.add_check(CheckResult(
+                name=f"target_only_indexed_view:{view_name}",
+                status=STATUS_PASS if passed else STATUS_FAIL,
+                expected={"preserved": True, "is_schema_bound": True,
+                          "index": index_name, "columns": columns},
+                actual=actual_view,
+                message=None if passed else f"Target-only indexed view {view_name} was not preserved intact",
+            ))
+        phase.duration_s = 0.0
 
     def _validate_functions(self) -> None:
         phase = self._new_phase("functions")
@@ -466,14 +525,29 @@ class SourceValidator:
             phase.add_check(CheckResult(
                 name=f"sequence:{s_name}",
                 status=STATUS_PASS if ok else STATUS_FAIL,
-                expected={"type": s_type, "start": s_start},
+                expected={
+                    "type": s_type,
+                    "start": s_start,
+                },
                 actual=None if not info else {
                     "type": info["data_type"],
                     "start": info["start_value"],
+                    "increment": info.get("increment"),
+                    "minimum_value": info.get("minimum_value"),
+                    "maximum_value": info.get("maximum_value"),
+                    "is_cycling": info.get("is_cycling"),
+                    "is_cached": info.get("is_cached"),
+                    "cache_size": info.get("cache_size"),
+                    "current_value": info.get("current_value"),
+                    "last_used_value": info.get("last_used_value"),
                 },
                 message=(
-                    f"Sequence {s_name}: expected type={s_type}, start={s_start}"
+                    f"Sequence {s_name}: expected type={s_type}, start={s_start}; "
+                    f"actual type={info.get('data_type') if info else None}, "
+                    f"start={info.get('start_value') if info else None}, "
+                    f"current={info.get('current_value') if info else None}"
                 ) if not ok else None,
+                details={"source_authoritative_definition": True},
             ))
         phase.duration_s = time.time() - t0
 

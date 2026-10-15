@@ -173,7 +173,11 @@ def _run_target_validation(cfg: E2EConfig, src_conn, tgt_conn) -> dict:
     print("\n[4] FUNCTIONAL VALIDATION")
     print("-" * 60)
     tgt_conn.autocommit = True
-    func_validator = FunctionalValidator(tgt_conn, database_name=cfg.target_db)
+    func_validator = FunctionalValidator(
+        tgt_conn,
+        database_name=cfg.target_db,
+        expected_sequences=src_cat.get_sequences(cfg.schema),
+    )
     func_report = func_validator.validate()
     for phase in func_report.phases:
         print(fmt_phase(phase))

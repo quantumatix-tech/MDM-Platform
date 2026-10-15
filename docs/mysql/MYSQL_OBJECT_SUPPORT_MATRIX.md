@@ -81,16 +81,14 @@ Full mode is replacement synchronisation, not an incremental upsert:
   incompatible with foreign-key-referenced tables; foreign-key checks are
   disabled only for the duration of the delete and always restored.
 
-## Implemented but not orchestrated
+## Implemented but not separately orchestrated
 
-These are implemented in the connector and covered by unit tests, but the
-orchestrator does not yet drive them. Do not rely on them without verifying the
-wiring first.
+These are implemented in the connector and covered by unit tests. The scheduled
+event snapshot remains outside the main orchestrated phases.
 
 | Feature | Status |
 |---|---|
-| Staged target schema reconciliation (`reconcile_mysql_table`) | Implemented, not wired; no config key exposed |
-| Reconciliation backup cleanup (`finalize_schema_reconciliations`) | Implemented, not wired |
+| FULL target schema reconciliation (`reconcile_mysql_table`) | Wired when `migration.reconcile_target_schema: true`; source-managed tables are dropped/recreated after incoming-FK safety checks; short-lived staging is promoted and cleaned up on failure |
 | Scheduled-event snapshot phase | Implemented, not wired as a separate phase |
 
 ## Configuration

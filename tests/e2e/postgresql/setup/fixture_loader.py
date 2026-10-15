@@ -24,6 +24,8 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+_IS_WINDOWS = os.name == "nt"
+
 # Scripts are applied in this exact numeric order.
 # Mirrors the MSSQL fixture loader so the two pipelines stay structurally
 # aligned; PostgreSQL substitutes native equivalents where the dialect
@@ -87,23 +89,43 @@ def _resolve_password(password_env: str) -> str | None:
 
 
 def _psql_path() -> str:
-    """Return the path to the psql executable, raising if not found.
+    """Resolve a native psql executable from PSQL_PATH or PATH.
 
-    Prefers ``psql.exe`` over ``psql.cmd`` because the ``.cmd`` wrapper
-    often hardcodes connection parameters and masks the real exit code.
+    Wrapper scripts are deliberately rejected: they can redirect connections
+    or hide the real psql process exit code.
     """
-    path = shutil.which("psql.exe")
-    if not path:
-        path = shutil.which("psql")
-        if path and not path.lower().endswith(".exe"):
-            # Fall back to .cmd wrapper but warn — it won't propagate exit codes
-            pass
-    if not path:
-        raise SystemExit(
-            "psql not found in PATH. Install PostgreSQL client tools "
-            "(https://www.postgresql.org/download/)."
-        )
-    return path
+    configured_path = os.environ.get("PSQL_PATH", "").strip()
+    if configured_path:
+        if not _is_native_psql(configured_path):
+            raise SystemExit(
+                f"PSQL_PATH must point to an existing, launchable native psql "
+                f"executable; got {configured_path!r}. Windows .cmd/.bat "
+                "wrappers are not supported."
+            )
+        return os.path.abspath(configured_path)
+
+    command = "psql.exe" if _IS_WINDOWS else "psql"
+    path = shutil.which(command)
+    if path and _is_native_psql(path):
+        return path
+
+    detail = f"PATH resolved {path!r}, which is not a native executable" if path else ""
+    raise SystemExit(
+        "PostgreSQL client executable psql was not found. "
+        "Install PostgreSQL client tools and add psql to PATH, or set PSQL_PATH "
+        "to the native psql executable. "
+        f"{detail}"
+    )
+
+
+def _is_native_psql(path: str) -> bool:
+    """Return whether *path* is a launchable psql binary, not a wrapper."""
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in {".cmd", ".bat"}:
+        return False
+    if _IS_WINDOWS and suffix != ".exe":
+        return False
+    return os.path.isfile(path) and os.access(path, os.X_OK)
 
 
 def run_sql_file(
@@ -123,6 +145,8 @@ def run_sql_file(
     psql = _psql_path()
     cmd = [
         psql,
+        "-X",  # ignore system/user startup files
+        "-w",  # never prompt interactively for a password
         "-h", str(host),
         "-p", str(port),
         "-U", username,
@@ -150,7 +174,7 @@ def run_sql_file(
         duration = time.time() - start
         ok = proc.returncode == 0
         output = proc.stdout.strip()
-        error = proc.stderr.strip() if not ok else ""
+        error = proc.stderr.strip()
         return ScriptResult(
             script=os.path.basename(sql_file),
             ok=ok,
@@ -176,13 +200,15 @@ def load_fixture(
     password_env: str,
     database: str,
     reset: bool = True,
+    password: str | None = None,
 ) -> LoadResult:
     """Load all fixture SQL scripts into *database* in order.
 
     When *reset* is True the reset script (00_reset.sql) is run first.
     Passwords are resolved from the ``SECRET_<name>`` env var.
     """
-    password = _resolve_password(password_env)
+    if password is None:
+        password = _resolve_password(password_env)
     result = LoadResult(fixture_dir=fixture_dir, database=database)
 
     scripts = FIXTURE_SCRIPTS

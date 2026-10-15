@@ -20,7 +20,7 @@ source:
   engine: mysql
   connection:
     host: 127.0.0.1
-    port: 33062
+    port: 3306
     database: MigrationE2E_MySQL_Source
     username: root
     password_secret: mysql_e2e_source_pass
@@ -30,7 +30,7 @@ target:
   engine: mysql
   connection:
     host: 127.0.0.1
-    port: 33062
+    port: 3306
     database: MigrationE2E_MySQL_Target
     username: root
     password_secret: mysql_e2e_target_pass

@@ -134,8 +134,9 @@ def test_azure_failures_are_sanitized(exception, expected, caplog):
 
     provider = AzureKeyVaultProvider("https://vault.example/")
     provider._client = FakeClient()
-    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError) as raised:
-        provider.get_secret("db-password")
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError) as raised:
+            provider.get_secret("db-password")
 
     assert expected in str(raised.value)
     assert "SECRET_VALUE" not in str(raised.value)

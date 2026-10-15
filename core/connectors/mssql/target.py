@@ -52,6 +52,7 @@ from core.connectors.base import (
 from core.driver_installer import ensure_driver
 from core.retry import retry_with_backoff
 from core.audit_logger import audit_log
+from core.dependency_order import order_data_load_objects
 
 from core.connectors.mssql._models import (
     PartitionFunctionDef,
@@ -75,6 +76,12 @@ class MSSQLTargetConnector(TargetConnector):
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
         self._conn: Any = None
+        # Keep the source schema metadata supplied by the orchestrator. FULL
+        # sync cleanup must be limited to these tables; catalog-wide cleanup
+        # could otherwise delete unrelated target-owned data.
+        self._managed_schemas: dict[str, Schema] = {}
+        self._suspended_triggers: list[TriggerDef] = []
+        self._deferred_not_null_columns: dict[str, list[str]] = {}
 
     @retry_with_backoff(max_retries=3, base_delay=1.0)
     def connect(self) -> None:
@@ -132,6 +139,15 @@ class MSSQLTargetConnector(TargetConnector):
         """
         _mssql_sequence.create_sequence(self._conn, seq)
 
+    def advance_sequence(
+        self, sequence_name: str, table: str, column: str,
+        owned_by: str | None = None,
+    ) -> None:
+        """Advance an owned sequence beyond loaded table data without rewinding it."""
+        _mssql_sequence.advance_sequence(
+            self._conn, sequence_name, table, column, owned_by
+        )
+
     def create_type(self, type_def: "TypeDef") -> None:
         """Create a user-defined (alias) data type on the target.
 
@@ -146,6 +162,97 @@ class MSSQLTargetConnector(TargetConnector):
     def create_object_if_missing(self, schema: "Schema") -> None:
         """Create a table if it doesn't exist. Delegates to ``table.create_table``."""
         _mssql_table.create_table(self._conn, schema, self._config)
+        self._managed_schemas[schema.name] = schema
+
+    def reconcile_mssql_table(self, schema: Schema) -> dict[str, list[str]]:
+        """Create a source table if missing and reconcile its definitions."""
+        _mssql_table.create_table(self._conn, schema, self._config)
+        self._managed_schemas[schema.name] = schema
+        outcome = _mssql_table.reconcile_table_columns(self._conn, schema)
+        # FULL reconciliation only visits source-managed tables. Remove
+        # standalone target indexes that have no corresponding source
+        # definition, while leaving PK/UNIQUE constraint indexes alone.
+        source_index_names = {index.name for index in schema.indexes}
+        source_index_names.update(
+            name for name in (
+                schema.primary_key_name,
+                *(constraint.name for constraint in schema.unique_constraints),
+            ) if name
+        )
+        table_qname = _qualify(schema.schema_name or "dbo", schema.name)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT i.name FROM sys.indexes i "
+                "WHERE i.object_id = OBJECT_ID(?) AND i.index_id > 0 "
+                "AND i.is_primary_key = 0 AND i.is_unique_constraint = 0",
+                (table_qname,),
+            )
+            extra_indexes = sorted(
+                row[0] for row in cur.fetchall()
+                if row[0] not in source_index_names
+            )
+            for index_name in extra_indexes:
+                cur.execute(
+                    f"DROP INDEX {quote_identifier(index_name)} ON {table_qname}"
+                )
+        if extra_indexes:
+            self._conn.commit()
+            audit_log(
+                phase="reconcile_table",
+                status="reconciled",
+                details={"table": schema.name, "dropped_indexes": extra_indexes},
+            )
+        if outcome.get("deferred_not_null_columns"):
+            self._deferred_not_null_columns[schema.name] = outcome[
+                "deferred_not_null_columns"
+            ]
+        return outcome
+
+    def clear_objects_for_full_sync(self, objects: list[str]) -> list[str]:
+        """Delete rows from known source-managed tables before a FULL load.
+
+        Tables are deleted in reverse FK dependency order so SQL Server
+        constraints remain enabled. Names absent from ``_managed_schemas``
+        are ignored, preserving target-only tables and their data.
+        """
+        managed = {
+            name: self._managed_schemas[name]
+            for name in objects
+            if name in self._managed_schemas
+        }
+        if not managed:
+            return []
+
+        delete_order = list(reversed(order_data_load_objects(managed, list(managed))))
+        try:
+            with self._conn.cursor() as cur:
+                for name in delete_order:
+                    schema = managed[name]
+                    qualified = _qualify(schema.schema_name or "dbo", schema.name)
+                    cur.execute(f"DELETE FROM {qualified}")
+                # Finalize staged NOT NULL additions within the same
+                # transaction as cleanup. If any ALTER fails, rollback also
+                # restores all source-managed rows deleted above.
+                for name in delete_order:
+                    columns = self._deferred_not_null_columns.get(name, [])
+                    if columns:
+                        _mssql_table.finalize_required_columns(
+                            cur, managed[name], columns
+                        )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+        for name in delete_order:
+            self._deferred_not_null_columns.pop(name, None)
+
+        audit_log(
+            phase="clear_full_sync",
+            status="success",
+            details={"tables": delete_order},
+        )
+        return delete_order
 
     def upsert_batch(
         self,
@@ -168,7 +275,7 @@ class MSSQLTargetConnector(TargetConnector):
         """Stream all rows from a table. Delegates to ``table.export_table_data``."""
         yield from _mssql_table.export_table_data(self._conn, object_name, schema_name)
 
-    def apply_constraints(self, schema: "Schema") -> None:
+    def apply_constraints(self, schema: "Schema") -> list[str]:
         """Apply indexes, unique constraints, foreign keys, CHECK and DEFAULT constraints.
 
         Intentionally retained in ``target.py`` as a single combined
@@ -191,12 +298,71 @@ class MSSQLTargetConnector(TargetConnector):
         schema_name = schema.schema_name or "dbo"
         validate_identifier(schema_name, "schema")
         table_qname = _qualify(schema_name, schema.name)
+        errors: list[str] = []
         with self._conn.cursor() as cur:
             for idx in schema.indexes:
+                if idx.constraint_backed:
+                    audit_log(
+                        phase="create_index", status="skipped",
+                        details={"index": idx.name, "reason": "backed by a source constraint"},
+                    )
+                    continue
                 try:
                     ddl = idx.ddl
-                    if ddl:
-                        cur.execute(ddl)
+                    if not ddl:
+                        raise RuntimeError(f"Source DDL is unavailable for index {idx.name}")
+                    cur.execute(
+                        "SELECT i.is_unique, i.filter_definition, c.name, "
+                        "ic.key_ordinal, ic.is_included_column, ic.is_descending_key, "
+                        "i.is_primary_key, i.is_unique_constraint "
+                        "FROM sys.indexes i "
+                        "LEFT JOIN sys.index_columns ic "
+                        "ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+                        "LEFT JOIN sys.columns c "
+                        "ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+                        "WHERE i.object_id = OBJECT_ID(?) AND i.name = ? "
+                        "ORDER BY ic.is_included_column, ic.key_ordinal, ic.index_column_id",
+                        (table_qname, idx.name),
+                    )
+                    existing_rows = cur.fetchall()
+                    if existing_rows:
+                        actual_keys = [
+                            row[2] for row in existing_rows
+                            if row[2] is not None and not bool(row[4])
+                        ]
+                        actual_includes = [
+                            row[2] for row in existing_rows
+                            if row[2] is not None and bool(row[4])
+                        ]
+                        actual_descending = [
+                            row[2] for row in existing_rows
+                            if row[2] is not None and not bool(row[4]) and bool(row[5])
+                        ]
+                        actual_unique = bool(existing_rows[0][0])
+                        actual_filter = existing_rows[0][1]
+                        is_constraint_backed = any(
+                            bool(row[6]) or bool(row[7]) for row in existing_rows
+                        )
+                        matches = (
+                            actual_keys == list(idx.columns)
+                            and actual_descending == list(idx.descending_columns)
+                            and set(actual_includes) == set(idx.included_columns)
+                            and actual_unique == bool(idx.unique)
+                            and (actual_filter or None) == (idx.filter_definition or None)
+                        )
+                        if matches:
+                            audit_log(
+                                phase="create_index", status="skipped",
+                                details={"index": idx.name, "reason": "definition already matches"},
+                            )
+                            continue
+                        if is_constraint_backed:
+                            raise RuntimeError(
+                                f"Cannot reconcile mismatched index {idx.name}: "
+                                "target index backs a primary-key or unique constraint"
+                            )
+                        cur.execute(f"DROP INDEX {quote_identifier(idx.name)} ON {table_qname}")
+                    cur.execute(ddl)
                     self._conn.commit()
                     audit_log(
                         phase="create_index", status="created",
@@ -204,8 +370,9 @@ class MSSQLTargetConnector(TargetConnector):
                     )
                 except Exception as exc:
                     self._conn.rollback()
+                    errors.append(f"index {idx.name}: {exc}")
                     audit_log(
-                        phase="create_index", status="skipped",
+                        phase="create_index", status="failed",
                         details={"index": idx.name, "reason": str(exc)},
                     )
 
@@ -218,8 +385,8 @@ class MSSQLTargetConnector(TargetConnector):
                     (table_qname,),
                 )
                 existing_uqs = {row[0] for row in cur.fetchall()}
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"unique constraint catalog query for {schema.name}: {exc}")
             for uq in schema.unique_constraints:
                 if uq.name in existing_uqs:
                     audit_log(
@@ -242,23 +409,68 @@ class MSSQLTargetConnector(TargetConnector):
                     )
                 except Exception as exc:
                     self._conn.rollback()
+                    errors.append(f"unique constraint {uq.name}: {exc}")
                     audit_log(
-                        phase="create_unique", status="skipped",
+                        phase="create_unique", status="failed",
                         details={"unique": uq.name, "reason": str(exc)},
                     )
 
             # --- Foreign Keys (cross-schema aware, idempotent) ---
-            cur.execute(
-                "SELECT name FROM sys.foreign_keys "
-                "WHERE parent_object_id = OBJECT_ID(?)",
-                (table_qname,),
-            )
-            existing_fks = {row[0] for row in cur.fetchall()}
+            try:
+                cur.execute(
+                    "SELECT name, is_disabled, is_not_trusted FROM sys.foreign_keys "
+                    "WHERE parent_object_id = OBJECT_ID(?)",
+                    (table_qname,),
+                )
+                existing_fks = {
+                    row[0]: (bool(row[1]), bool(row[2])) for row in cur.fetchall()
+                }
+            except Exception as exc:
+                errors.append(f"foreign key catalog query for {schema.name}: {exc}")
+                existing_fks = {}
             for fk in schema.foreign_keys:
                 if fk.name in existing_fks:
+                    target_disabled, target_untrusted = existing_fks[fk.name]
+                    source_state = (fk.is_disabled, fk.is_not_trusted)
+                    target_state = (target_disabled, target_untrusted)
+                    if source_state != target_state:
+                        try:
+                            if fk.is_disabled:
+                                cur.execute(
+                                    f"ALTER TABLE {table_qname} NOCHECK CONSTRAINT "
+                                    f"{quote_identifier(fk.name)}"
+                                )
+                            elif fk.is_not_trusted:
+                                cur.execute(
+                                    f"ALTER TABLE {table_qname} WITH NOCHECK CHECK CONSTRAINT "
+                                    f"{quote_identifier(fk.name)}"
+                                )
+                            else:
+                                # WITH CHECK validates existing rows before
+                                # enabling the FK and marks it trusted on success.
+                                cur.execute(
+                                    f"ALTER TABLE {table_qname} WITH CHECK CHECK CONSTRAINT "
+                                    f"{quote_identifier(fk.name)}"
+                                )
+                            self._conn.commit()
+                        except Exception as exc:
+                            self._conn.rollback()
+                            errors.append(f"foreign key {fk.name}: {exc}")
+                            audit_log(
+                                phase="create_fk", status="failed",
+                                details={"fk": fk.name, "reason": str(exc)},
+                            )
+                            continue
                     audit_log(
-                        phase="create_fk", status="skipped",
-                        details={"fk": fk.name, "reason": "already exists"},
+                        phase="create_fk",
+                        status="reconciled" if target_disabled or target_untrusted else "skipped",
+                        details={
+                            "fk": fk.name,
+                            "source_disabled": fk.is_disabled,
+                            "source_untrusted": fk.is_not_trusted,
+                            "target_disabled": target_disabled,
+                            "target_untrusted": target_untrusted,
+                        },
                     )
                     continue
                 col_list = ", ".join(quote_identifier(c) for c in fk.columns)
@@ -281,8 +493,9 @@ class MSSQLTargetConnector(TargetConnector):
                     )
                 except Exception as exc:
                     self._conn.rollback()
+                    errors.append(f"foreign key {fk.name}: {exc}")
                     audit_log(
-                        phase="create_fk", status="skipped",
+                        phase="create_fk", status="failed",
                         details={"fk": fk.name, "reason": str(exc)},
                     )
 
@@ -295,8 +508,8 @@ class MSSQLTargetConnector(TargetConnector):
                     (table_qname,),
                 )
                 existing_checks = {row[0] for row in cur.fetchall()}
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"check constraint catalog query for {schema.name}: {exc}")
             for chk in schema.check_constraints:
                 if chk.name in existing_checks:
                     audit_log(
@@ -317,8 +530,9 @@ class MSSQLTargetConnector(TargetConnector):
                     )
                 except Exception as exc:
                     self._conn.rollback()
+                    errors.append(f"check constraint {chk.name}: {exc}")
                     audit_log(
-                        phase="create_check", status="skipped",
+                        phase="create_check", status="failed",
                         details={"check": chk.name, "reason": str(exc)},
                     )
 
@@ -331,8 +545,8 @@ class MSSQLTargetConnector(TargetConnector):
                     (table_qname,),
                 )
                 existing_defaults = {row[0] for row in cur.fetchall()}
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"default constraint catalog query for {schema.name}: {exc}")
             for dfl in schema.default_constraints:
                 if dfl.name in existing_defaults:
                     audit_log(
@@ -353,10 +567,12 @@ class MSSQLTargetConnector(TargetConnector):
                     )
                 except Exception as exc:
                     self._conn.rollback()
+                    errors.append(f"default constraint {dfl.name}: {exc}")
                     audit_log(
-                        phase="create_default", status="skipped",
+                        phase="create_default", status="failed",
                         details={"default": dfl.name, "reason": str(exc)},
                     )
+        return errors
 
     def create_view(self, view: "ViewDefinition") -> None:
         """Create or alter a view. Delegates to ``view.create_view``."""
@@ -369,12 +585,32 @@ class MSSQLTargetConnector(TargetConnector):
         """
         _mssql_function.create_function(self._conn, func)
 
-    def create_trigger(self, trigger: "TriggerDef") -> None:
+    def create_trigger(self, trigger: "TriggerDef") -> bool | None:
         """Create or alter a trigger on the target database.
 
         Delegates to ``core.connectors.mssql.objects.trigger.create_trigger``.
         """
-        _mssql_trigger.create_trigger(self._conn, trigger)
+        return _mssql_trigger.create_trigger(self._conn, trigger)
+
+    def suspend_triggers_for_data_load(
+        self, triggers: list["TriggerDef"]
+    ) -> list["TriggerDef"]:
+        """Disable matching existing triggers during a FULL data reload."""
+        self._suspended_triggers = _mssql_trigger.suspend_triggers_for_data_load(
+            self._conn, triggers
+        )
+        return list(self._suspended_triggers)
+
+    def restore_suspended_triggers(self) -> None:
+        """Restore suspended triggers to their pre-load state after failure."""
+        if self._suspended_triggers:
+            suspended = self._suspended_triggers
+            self._suspended_triggers = []
+            _mssql_trigger.restore_suspended_triggers(self._conn, suspended)
+
+    def complete_trigger_data_load(self) -> None:
+        """Forget the snapshot after Phase 15 applies source trigger state."""
+        self._suspended_triggers = []
 
     def create_synonym(self, synonym: "SynonymDef") -> None:
         """Create a synonym on the target database.
@@ -393,6 +629,18 @@ class MSSQLTargetConnector(TargetConnector):
         Delegates to ``objects.partition.create_partition_function``.
         """
         _mssql_partition.create_partition_function(self._conn, pf)
+
+    def reconcile_partition_function(
+        self, pf: "PartitionFunctionDef", source_metadata: dict[str, Any]
+    ) -> None:
+        """Apply only the explicitly supported non-destructive PF reconciliation."""
+        _mssql_partition.reconcile_partition_function(self._conn, pf, source_metadata)
+
+    def reconcile_partition_scheme(
+        self, ps: "PartitionSchemeDef", source_metadata: dict[str, Any]
+    ) -> None:
+        """Restore an eligible explicit NEXT USED mapping without rebuilding the scheme."""
+        _mssql_partition.reconcile_partition_scheme(self._conn, ps, source_metadata)
 
     def create_partition_scheme(self, ps: "PartitionSchemeDef") -> None:
         """Create a partition scheme from metadata.
@@ -414,6 +662,15 @@ class MSSQLTargetConnector(TargetConnector):
         _mssql_partition.create_partitioned_table(
             self._conn, schema, partition_scheme_name, partition_column
         )
+        self._managed_schemas[schema.name] = schema
+
+    def inspect_partition_metadata(self) -> dict[str, Any]:
+        """Return complete SQL Server partition metadata for validation."""
+        return {
+            "functions": _mssql_partition.inspect_partition_functions(self._conn),
+            "schemes": _mssql_partition.inspect_partition_schemes(self._conn),
+            "tables": _mssql_partition.inspect_partitioned_tables(self._conn),
+        }
 
     # ------------------------------------------------------------------
     # Step 14 — Security: Roles, Users & Role Memberships (target creation)

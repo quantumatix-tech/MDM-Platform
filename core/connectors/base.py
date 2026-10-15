@@ -77,6 +77,7 @@ class Index:
     # must not create it a second time as a standalone index. Manually-created
     # unique indexes have no backing constraint and remain independent indexes.
     constraint_backed: bool = False
+    descending_columns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -88,6 +89,8 @@ class ForeignKey:
     ref_schema: str = "public"
     on_delete: str = "NO ACTION"
     on_update: str = "NO ACTION"
+    is_disabled: bool = False
+    is_not_trusted: bool = False
 
 
 @dataclass
@@ -179,6 +182,10 @@ class SequenceDef:
     data_type: str = "bigint"
     cache_size: int = 1
     is_cached: bool = True
+    is_called: bool | None = None
+    last_used_value: int | None = None
+    last_used_value_available: bool = False
+    is_exhausted: bool = False
 
 
 @dataclass
@@ -202,14 +209,17 @@ class TypeDef:
     kind: str           # 'enum', 'domain', 'composite'
     ddl: str            # complete CREATE DDL — ready to execute
     schema: str = "public"
+    enum_labels: list[str] | None = None
 
 
 @dataclass
 class ViewDefinition:
-    """A regular SQL view."""
+    """A SQL view, with optional SQL Server schema-binding/index metadata."""
     name: str
     definition: str     # raw SELECT definition
     schema_name: str = "public"
+    is_schema_bound: bool = False
+    indexes: list[Index] = field(default_factory=list)
 
 
 @dataclass
@@ -228,6 +238,7 @@ class FunctionDef:
     ddl: str            # complete DDL from pg_get_functiondef — ready to execute
     schema_name: str = "public"
     kind: str = "function"             # function or procedure
+    identity_arguments: str | None = None  # PostgreSQL routine identity signature
 
 
 @dataclass
@@ -530,7 +541,7 @@ class TargetConnector(abc.ABC):
     def create_type(self, type_def: TypeDef) -> None:
         pass
 
-    def apply_constraints(self, schema: Schema) -> None:
+    def apply_constraints(self, schema: Schema) -> list[str] | None:
         pass
 
     def get_capabilities(self) -> dict[str, dict[str, Any]]:
@@ -545,6 +556,9 @@ class TargetConnector(abc.ABC):
 
     def create_materialized_view(self, mv: MaterializedViewDef) -> None:
         pass
+
+    def reconcile_materialized_view(self, mv: MaterializedViewDef) -> None:
+        self.create_materialized_view(mv)
 
     def refresh_materialized_view(self, name: str, schema_name: str | None = None) -> None:
         pass
@@ -587,6 +601,9 @@ class TargetConnector(abc.ABC):
         pass
 
     def apply_sequence_ownership(self, seq: "SequenceDef") -> None:
+        pass
+
+    def restore_standalone_sequence_state(self, seq: "SequenceDef") -> None:
         pass
 
     def apply_comment(self, comment: CommentDef) -> None:

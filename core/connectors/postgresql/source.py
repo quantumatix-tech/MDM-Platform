@@ -96,6 +96,20 @@ class PostgresSourceConnector(SourceConnector):
             pass
         return None
 
+    def close(self) -> None:
+        """Roll back any unfinished read transaction and release the connection."""
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        finally:
+            self._conn = None
+
     # ------------------------------------------------------------------
     # Tables
     # ------------------------------------------------------------------

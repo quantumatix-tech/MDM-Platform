@@ -85,3 +85,51 @@ def create_trigger(conn: Any, trigger: TriggerDef) -> None:
             conn.rollback()
             audit_log(phase="create_trigger", status="skipped",
                       details={"trigger": trigger.name, "reason": str(exc)})
+
+
+def suspend_triggers_for_data_load(
+    conn: Any, triggers: list[TriggerDef]
+) -> list[TriggerDef]:
+    """Disable matching existing user triggers before a FULL data reload.
+
+    The orchestrator recreates source trigger definitions after loading. A
+    target trigger left enabled during the reload would create side effects
+    (for example, duplicate audit rows) on top of the source rows being copied.
+    """
+    suspended: list[TriggerDef] = []
+    try:
+        with conn.cursor() as cur:
+            for trigger in triggers:
+                validate_identifier(trigger.name, "trigger")
+                validate_identifier(trigger.table, "table")
+                schema = trigger.schema_name or "public"
+                table_qname = _qualify(schema, trigger.table)
+                cur.execute(
+                    "SELECT t.tgenabled "
+                    "FROM pg_trigger t "
+                    "JOIN pg_class c ON c.oid = t.tgrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = %s AND c.relname = %s "
+                    "AND t.tgname = %s AND NOT t.tgisinternal",
+                    (schema, trigger.table, trigger.name),
+                )
+                row = cur.fetchone()
+                if row is None or row[0] == "D":
+                    continue
+                cur.execute(
+                    f"ALTER TABLE {table_qname} DISABLE TRIGGER "
+                    f"{quote_identifier(trigger.name)}"
+                )
+                suspended.append(trigger)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    if suspended:
+        audit_log(
+            phase="suspend_triggers",
+            status="success",
+            details={"triggers": [trigger.name for trigger in suspended]},
+        )
+    return suspended
