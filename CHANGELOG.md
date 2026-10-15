@@ -10,39 +10,45 @@ The application version is defined by the `version` field in `pyproject.toml`.
 
 ## [Unreleased]
 
-### Changed
-
-- **Centralized dependency management.** `pyproject.toml` is now the single
-  authoritative source for Python dependencies, package metadata, and the
-  application version. `requirements.txt` was removed, along with the parity
-  check that existed only to keep two hand-maintained dependency lists aligned.
-  `docker/Dockerfile` and `bootstrap.py` now install the project itself instead
-  of a duplicated dependency list.
-- **`bootstrap.py` installs the project**, not just its dependencies, and
-  verifies that a real installed distribution exists before reporting success.
-  Repository-local build artifacts such as a stale `migration_platform.egg-info`
-  are no longer accepted as proof of installation.
-- **Docker runtime installs from `pyproject.toml`** and no longer sets
-  `PYTHONPATH` to work around missing package metadata.
-
 ### Added
 
-- **Runtime and CLI version visibility.** `python -m migration_platform
-  --version` reports the installed version, `requires-python` is re-validated at
-  startup by `core/preflight.py`, and generated reports expose
-  `platform_version` in both JSON and HTML.
-- **Release and compatibility tooling.** `scripts/release_validation.py`
-  validates packaging, versioning, and dependency metadata; `docs/
-  compatibility_matrix.md` records evidence-based engine compatibility;
-  `docs/release_process.md` documents the release procedure and checklist.
+- **Version Management implementation (Stages 1-9).** The repository now has a
+  complete, evidence-based version-management system:
+  - `scripts/release_validation.py` validates packaging, versioning, and
+    dependency metadata before any release tag.
+  - `docs/compatibility_matrix.yaml` records engine compatibility and a
+    `runtime` section for Python and dependency versions, with statuses
+    TESTED, SUPPORTED, or UNVERIFIED.
+  - `core/runtime_manifest.py` captures application version, Git metadata,
+    Python runtime, package/driver versions, and database engine versions for
+    every migration execution.
+  - `core/reporting/report_builder.py` includes the runtime manifest in both
+    JSON and HTML migration reports.
+  - `docker/Dockerfile` and `docker/entrypoint.sh` provide a reproducible
+    runtime image with a pinned Python 3.11.9 base and MSODBC Driver 18.
+  - `.github/workflows/ci.yml` runs a dedicated `version-validation` job that
+    executes release validation, compatibility matrix validation, and the
+    relevant unit tests on every push and pull request.
+- **Docker reproducibility.** The Docker image is built from a pinned
+  `python:3.11.9-slim` base, installs dependencies from `pyproject.toml`, and
+  verifies the runtime manifest inside the container. Secrets are supplied at
+  runtime via environment variables and are never baked into the image.
+
+### Changed
+
+- **Compatibility matrix now records runtime components.** The
+  `runtime` section in `docs/compatibility_matrix.yaml` lists the important
+  Python packages and drivers with their tested versions and evidence.
+  `scripts/generate_compatibility_matrix.py` validates this section and renders
+  it in the generated Markdown.
 
 ### Notes
 
-- The Docker image build has not been verified; `docker` is unavailable in the
-  development environment. Installation layout was validated by replicating the
-  builder-stage prefix install locally.
-- The 4 pre-existing unit test failures and the existing Ruff backlog are
-  unchanged by this work.
+- The Docker image build and container run have been verified locally with
+  Podman 5.4.2. The runtime manifest inside the container correctly reports
+  application version 0.2.3, Python 3.11.9, and installed package versions.
+- The 4 pre-existing unit test failures (`test_cross_engine_type_safety.py` ×2,
+  `test_mysql_datatypes.py` ×2) are unchanged by this work.
 
 ## [0.2.3] - 2026-10-05
 
@@ -98,9 +104,9 @@ The application version is defined by the `version` field in `pyproject.toml`.
 
 ### Changed
 
-- Updated `docs/RUNBOOK.md`, `docs/USER_GUIDE.md`, and
+- Updated `docs/USER_GUIDE.md` and
   `docs/architecture/platform_architecture.md` with Azure Key Vault and
-  independent-provider-selection guidance.
+  independent-provider-selection guidance (chaos/resilience procedures moved from `docs/RUNBOOK.md`).
 - `config/mysql_local_test.yaml` updated to demonstrate mixed local-store +
   Azure Key Vault provider usage.
 - `config/migration_config.schema.yaml` — added optional `secret_provider`

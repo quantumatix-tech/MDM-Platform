@@ -327,3 +327,28 @@ def test_save_manifest(tmp_path: Path):
     saved = json.loads(path.read_text(encoding="utf-8"))
 
     assert saved == manifest
+
+
+def test_manifest_structure_unchanged_across_version_changes(monkeypatch):
+    config = {
+        "source": {"engine": "postgresql", "host": "localhost"},
+        "target": {"engine": "postgresql", "host": "azure.example"},
+    }
+    monkeypatch.setattr(runtime_manifest, "_get_git_metadata", lambda: {"commit_sha": "a"})
+    monkeypatch.setattr(runtime_manifest, "_get_python_info", lambda: {"version": "3.12.6", "implementation": "CPython", "platform": "x"})
+    monkeypatch.setattr(runtime_manifest, "_get_package_versions", lambda: {})
+    monkeypatch.setattr(runtime_manifest, "_get_db_version", lambda c, r: "v")
+    monkeypatch.setattr(runtime_manifest, "_get_app_version", lambda: "0.2.3")
+    m1 = runtime_manifest.build_runtime_manifest(config=config)
+    monkeypatch.setattr(runtime_manifest, "_get_app_version", lambda: "0.2.4")
+    m2 = runtime_manifest.build_runtime_manifest(config=config)
+    required_keys = {"schema_version", "generated_at", "application", "git", "python", "packages", "database", "config_hash"}
+    for m in [m1, m2]:
+        assert required_keys.issubset(set(m.keys()))
+        assert m["schema_version"] == "1.0"
+        assert m["application"]["name"] == "migration-platform"
+        assert len(m["generated_at"]) > 0
+    assert m1["application"]["version"] == "0.2.3"
+    assert m2["application"]["version"] == "0.2.4"
+    assert set(m1.keys()) == set(m2.keys())
+    assert set(m1["application"].keys()) == set(m2["application"].keys())

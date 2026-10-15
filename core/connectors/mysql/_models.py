@@ -64,6 +64,8 @@ _MYSQL_DEFINER_RE = re.compile(
 )
 def _mysql_definer_identity(ddl: str) -> tuple[str, str] | None:
     """Extract a stored object's exact MySQL DEFINER account identity."""
+    if not isinstance(ddl, str) or not ddl:
+        return None
     match = _MYSQL_DEFINER_RE.match(ddl)
     if match is None:
         return None

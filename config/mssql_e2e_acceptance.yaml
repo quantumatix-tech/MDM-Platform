@@ -16,7 +16,7 @@
 source:
   engine: mssql
   connection:
-    host: localhost
+    host: 172.24.48.1
     port: 1533
     database: MigrationE2E_MSSQL_Source
     username: sa
@@ -26,7 +26,7 @@ source:
 target:
   engine: mssql
   connection:
-    host: localhost
+    host: 172.24.48.1
     port: 1533
     database: MigrationE2E_MSSQL_Target
     username: sa

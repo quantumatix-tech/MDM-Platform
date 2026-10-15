@@ -6,6 +6,7 @@ import platform
 import re
 import subprocess
 import time
+import traceback
 from collections.abc import Iterator
 from typing import Any
 
@@ -743,6 +744,7 @@ class MigrationOrchestrator:
             self._update_status("completed", 100, all_errors)
 
         except Exception as exc:
+            traceback.print_exc()
             result["status"] = "failed"
             result["error"] = str(exc)
             audit_log(phase="run_full", status="failed", details={"error": str(exc)})

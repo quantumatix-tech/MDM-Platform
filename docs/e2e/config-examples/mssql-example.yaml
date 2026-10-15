@@ -1,0 +1,69 @@
+# MSSQL E2E Configuration Example
+#
+# This is an illustrative template. Replace all placeholder values with your
+# actual connection details before running. Never commit real passwords.
+#
+# Usage:
+#   1. Copy this file to a new name (e.g., config/my_mssql_migration.yaml)
+#   2. Edit the placeholder values marked with <...>
+#   3. Set required environment variables (see below)
+#   4. Run: python -m migration_platform --config config/my_mssql_migration.yaml --mode full
+#
+# IMPORTANT: Placeholders like <SOURCE_HOST> are NOT valid YAML. You MUST replace
+# them with actual values before the file can be parsed.
+
+source:
+  engine: mssql
+  connection:
+    host: <SOURCE_HOST>           # e.g., localhost, 192.168.1.10, or myserver.database.windows.net
+    port: 1433                    # Default MSSQL port; use 1533 for named instance DMSQL
+    database: <SOURCE_DATABASE>   # e.g., source_db
+    username: <SOURCE_USERNAME>   # e.g., sa
+    password_secret: source_db_pass
+    ssl: false                    # Set true for Azure SQL / cloud; false for local
+    # trust_server_certificate is automatic: true when ssl: false, false when ssl: true
+
+target:
+  engine: mssql
+  connection:
+    host: <TARGET_HOST>           # e.g., localhost, (localdb)\MSSQLLocalDB, or myserver.database.windows.net
+    port: 1433                    # Default MSSQL port; omit for LocalDB (uses named pipe)
+    database: <TARGET_DATABASE>   # e.g., target_db (created automatically if missing)
+    username: <TARGET_USERNAME>   # e.g., sa
+    password_secret: target_db_pass
+    ssl: false                    # Set true for Azure SQL / cloud; false for local
+    # trust_server_certificate is automatic: true when ssl: false, false when ssl: true
+    # source_engine is injected by the platform at runtime (do not set here)
+
+migration:
+  mode: full                      # full | cdc-incremental | cdc-continuous
+  batch_size: 1000                # Rows per INSERT batch; lower for slow networks
+  include_schemas:                # Schemas to migrate; omit to discover all user schemas (MSSQL default: all)
+    - <SCHEMA_1>                  # e.g., sales
+    - <SCHEMA_2>                  # e.g., billing
+
+# Retry and circuit breaker settings (optional; shown with defaults)
+retry:
+  max_retries: 3
+  base_delay_seconds: 1.0
+  max_delay_seconds: 30.0
+  circuit_breaker_max_failures: 5
+  circuit_breaker_reset_timeout_seconds: 60.0
+
+# Secrets provider: env reads SECRET_<name> from environment variables
+secrets:
+  provider: env
+
+# Alerting (optional)
+alerting:
+  notifier: none                  # none | slack | teams | webhook | email
+
+# Validation mode
+validation:
+  mode: count                     # count | checksum | full
+  sample_size: 1000               # Only used by checksum mode
+
+# Logging
+logging:
+  level: INFO                     # DEBUG | INFO | WARNING | ERROR
+  # file: migration.log           # Optional additional log file
