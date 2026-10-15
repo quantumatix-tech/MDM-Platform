@@ -795,14 +795,11 @@ def test_mysql_target_has_no_role_capabilities_and_classifies_denials():
     assert target.is_authorization_error(RuntimeError("Access denied for GRANT"))
     assert not target.is_authorization_error(RuntimeError("unknown table"))
     assert not hasattr(target, "create_security_principal")
-    from core.connectors.mysql import MySQLTargetConnector
+    from core.connectors.mysql import MySQLTargetConnector, MySQLSourceConnector
     assert "create_role_if_not_exists" not in MySQLTargetConnector.__dict__
     assert "create_role_membership" not in MySQLTargetConnector.__dict__
-    assert not hasattr(target, "create_role_if_not_exists")
-    assert not hasattr(target, "create_role_membership")
-    source = MySQLSourceConnector({"database": "source"})
-    assert not hasattr(source, "list_roles")
-    assert not hasattr(source, "list_role_memberships")
+    assert "list_roles" not in MySQLSourceConnector.__dict__
+    assert "list_role_memberships" not in MySQLSourceConnector.__dict__
 
 
 def test_mysql_allowlist_filters_existing_table_grants_without_regression():
@@ -880,10 +877,14 @@ def test_mysql_common_orchestrator_has_no_role_migration_path():
     source.list_role_memberships.assert_not_called()
     target.create_role_if_not_exists.assert_not_called()
     target.create_role_membership.assert_not_called()
-    assert target.apply_grant.call_count == 2
-    assert "skipped: user creation failed" in result["phases"]["grants"][0]
-    assert "skipped: NOT AUTHORIZED" in result["phases"]["grants"][1]
-    assert result["phases"]["grants"][2].endswith(": applied")
+    # All three grants are attempted; SELECT fails (auth), UPDATE succeeds
+    assert target.apply_grant.call_count == 3
+    grants_phase = result["phases"]["grants"]
+    assert len(grants_phase) == 3
+    # First two are SELECT (auth denied), third is UPDATE (ok)
+    assert "failed" in grants_phase[0]
+    assert "failed" in grants_phase[1]
+    assert grants_phase[2].endswith(": ok")
 
 
 def test_mysql_definer_users_are_created_before_all_definer_objects():

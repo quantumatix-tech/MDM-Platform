@@ -1101,12 +1101,15 @@ class MigrationOrchestrator:
             try:
                 grants = list(self._source.list_grants())
                 # Ensure all grantee roles exist on target before applying grants
-                grantees = {g.grantee for g in grants}
-                for grantee in grantees:
-                    try:
-                        self._target.create_role_if_not_exists(grantee)
-                    except Exception as exc:
-                        grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
+                # Only for engines with role support (not MySQL)
+                target_engine = self._config.get("target", {}).get("engine", "")
+                if target_engine != "mysql":
+                    grantees = {g.grantee for g in grants}
+                    for grantee in grantees:
+                        try:
+                            self._target.create_role_if_not_exists(grantee)
+                        except Exception as exc:
+                            grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
                 for grant in grants:
                     if grant.object_type == "SCHEMA":
                         grant_key = f"{grant.object_name} TO {grant.grantee}"
@@ -1131,7 +1134,6 @@ class MigrationOrchestrator:
                     except Exception as exc:
                         grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
                         all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
-                        failed_objects.add(grant_key)
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results
