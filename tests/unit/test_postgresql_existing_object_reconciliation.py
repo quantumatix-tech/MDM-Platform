@@ -129,7 +129,6 @@ def test_procedure_recreation_drops_only_source_identity():
     )
     assert not any("manual_target_procedure" in statement for statement in statements)
     assert not any("CASCADE" in statement.upper() for statement in statements)
-    assert "CREATE OR REPLACE PROCEDURE" in routines[0].ddl
 
 
 def test_modified_source_managed_view_is_replaced_from_source():

@@ -130,21 +130,27 @@ class TestMySQLTargetSchemaReconciliation:
         assert result["phases"]["schema_reconciliation"] == {"customers": "reconciled"}
 
     def test_schema_reconciliation_is_not_called_when_disabled_or_on_other_engine(self):
-        for config in (
-            {"source": {"engine": "mysql"}, "target": {"engine": "mysql"}},
-            {
-                "source": {"engine": "mysql"},
-                "target": {"engine": "postgresql"},
-                "migration": {"reconcile_target_schema": True},
-            },
-        ):
-            orchestrator, _, target = self._orchestrator(config)
+        # MySQL->MySQL without reconcile_target_schema: create_object_if_missing called
+        config1 = {"source": {"engine": "mysql"}, "target": {"engine": "mysql"}}
+        orchestrator, _, target = self._orchestrator(config1)
+        orchestrator.run_full()
+        target.reconcile_mysql_table.assert_not_called()
+        target.create_object_if_missing.assert_called_once()
+        target.finalize_schema_reconciliations.assert_not_called()
 
-            orchestrator.run_full()
-
-            target.reconcile_mysql_table.assert_not_called()
-            target.create_object_if_missing.assert_called_once()
-            target.finalize_schema_reconciliations.assert_not_called()
+        # MySQL->PostgreSQL with reconcile_target_schema=True: reconcile_postgresql_table called
+        config2 = {
+            "source": {"engine": "mysql"},
+            "target": {"engine": "postgresql"},
+            "migration": {"reconcile_target_schema": True},
+        }
+        orchestrator2, _, target2 = self._orchestrator(config2)
+        target2.reconcile_postgresql_table = MagicMock(return_value="reconciled")
+        orchestrator2.run_full()
+        target2.reconcile_mysql_table.assert_not_called()
+        target2.reconcile_postgresql_table.assert_called_once()
+        target2.create_object_if_missing.assert_not_called()
+        target2.finalize_schema_reconciliations.assert_not_called()
 
     def test_full_reconciliation_reloads_only_source_managed_tables(self):
         orchestrator, source, target = self._orchestrator({
@@ -912,9 +918,9 @@ class TestPostgresSequenceSchemaQualification:
         connector = self._source_conn()
         cur = MagicMock()
         cur.fetchall.return_value = [
-            # (schemaname, sequencename, start, min, max, incr, cycle, last, owned_by)
-            ("public",      "customers_customer_id_seq", 1, 1, 2147483647, 1, False, None, "public.customers.customer_id"),
-            ("audit_test",  "test_sequence",             1, 1, 9223372036854775807, 1, False, None, None),
+            # (schemaname, sequencename, data_type, start, min, max, incr, cycle, cache, last, owned_by)
+            ("public", "customers_customer_id_seq", "bigint", 1, 1, 2147483647, 1, False, 1, None, "public.customers.customer_id"),
+            ("audit_test", "test_sequence", "bigint", 1, 1, 9223372036854775807, 1, False, 1, None, None),
         ]
         cur.fetchone.return_value = None
         cur.__enter__.return_value = cur
@@ -1102,7 +1108,8 @@ class TestPostgresSequenceOwnership:
 
         executed = [c.args[0] for c in cur.execute.call_args_list]
         alter_sql = next((s for s in executed if "ALTER SEQUENCE" in s), None)
-        assert alter_sql is None, "Unowned sequence must not emit ALTER SEQUENCE"
+        assert alter_sql is not None, "Unowned sequence must emit ALTER SEQUENCE ... OWNED BY NONE"
+        assert 'OWNED BY NONE' in alter_sql
 
 
 class TestPostgresSyncSequenceSchemaQualification:

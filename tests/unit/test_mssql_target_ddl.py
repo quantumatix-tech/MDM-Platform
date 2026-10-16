@@ -1924,7 +1924,8 @@ def test_export_full_casts_sql_variant_columns():
 
     # Verify the SELECT includes CAST for the sql_variant column
     executed_sqls = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
-    select_sql = next(s for s in executed_sqls if s.strip().startswith("SELECT"))
+    # Find the data export SELECT (from the table, not sys.columns metadata query)
+    select_sql = next(s for s in executed_sqls if s.strip().startswith("SELECT") and "FROM" in s and "sys.columns" not in s)
     assert "CAST" in select_sql
     assert "sql_variant" not in select_sql  # no literal sql_variant in SELECT
     assert "variant_int" in select_sql
