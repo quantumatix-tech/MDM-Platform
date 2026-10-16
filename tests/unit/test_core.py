@@ -82,6 +82,100 @@ class TestBug1NeverDropWithIncremental:
             assert "DROP" not in str(call)
 
 
+class TestMySQLTargetSchemaReconciliation:
+    @staticmethod
+    def _orchestrator(config):
+        source = MagicMock(spec=SourceConnector)
+        source.get_partitioned_tables = MagicMock(return_value=[])
+        target = MagicMock(spec=TargetConnector)
+        source.list_objects.return_value = ["customers"]
+        source.get_schema.return_value = Schema(
+            name="customers",
+            columns=[Column(name="name", source_type="VARCHAR(100)")],
+        )
+        source.get_object_count.return_value = 1
+        source.export_full.return_value = iter([{"name": "Alice"}])
+        source.list_users.return_value = []
+        source.list_roles.return_value = []
+        source.list_events.return_value = []
+        source.list_functions.return_value = []
+        source.get_all_triggers.return_value = []
+        target.upsert_batch.return_value = UpsertResult(success_count=1)
+        target.reconcile_mysql_table.return_value = "reconciled"
+        target.inspect_schema.return_value = None
+        target.apply_constraints.return_value = None
+        target.create_view.return_value = None
+        orchestrator = MigrationOrchestrator(source, target, config)
+        # Avoid unrelated optional discovery phases on generic mocks.
+        orchestrator.validate = MagicMock(return_value={"status": "success"})
+        return orchestrator, source, target
+
+    def test_full_mysql_migration_reconciles_existing_target_schema_when_enabled(self):
+        orchestrator, _, target = self._orchestrator({
+            "source": {"engine": "mysql"},
+            "target": {"engine": "mysql"},
+            "migration": {"reconcile_target_schema": True},
+        })
+
+        result = orchestrator.run_full()
+
+        target.reconcile_mysql_table.assert_called_once()
+        reconciled_schema, managed_tables = target.reconcile_mysql_table.call_args.args
+        assert reconciled_schema.columns[0].source_type == "VARCHAR(100)"
+        assert managed_tables == {"customers"}
+        target.create_object_if_missing.assert_not_called()
+        target.clear_objects_for_full_sync.assert_called_once_with(["customers"])
+        target.upsert_batch.assert_called_once()
+        target.finalize_schema_reconciliations.assert_not_called()
+        assert result["phases"]["schema_reconciliation"] == {"customers": "reconciled"}
+
+    def test_schema_reconciliation_is_not_called_when_disabled_or_on_other_engine(self):
+        # MySQL->MySQL without reconcile_target_schema: create_object_if_missing called
+        config1 = {"source": {"engine": "mysql"}, "target": {"engine": "mysql"}}
+        orchestrator, _, target = self._orchestrator(config1)
+        orchestrator.run_full()
+        target.reconcile_mysql_table.assert_not_called()
+        target.create_object_if_missing.assert_called_once()
+        target.finalize_schema_reconciliations.assert_not_called()
+
+        # MySQL->PostgreSQL with reconcile_target_schema=True: reconcile_postgresql_table called
+        config2 = {
+            "source": {"engine": "mysql"},
+            "target": {"engine": "postgresql"},
+            "migration": {"reconcile_target_schema": True},
+        }
+        orchestrator2, _, target2 = self._orchestrator(config2)
+        target2.reconcile_postgresql_table = MagicMock(return_value="reconciled")
+        orchestrator2.run_full()
+        target2.reconcile_mysql_table.assert_not_called()
+        target2.reconcile_postgresql_table.assert_called_once()
+        target2.create_object_if_missing.assert_not_called()
+        target2.finalize_schema_reconciliations.assert_not_called()
+
+    def test_full_reconciliation_reloads_only_source_managed_tables(self):
+        orchestrator, source, target = self._orchestrator({
+            "source": {"engine": "mysql"},
+            "target": {"engine": "mysql"},
+            "migration": {"reconcile_target_schema": True},
+        })
+        managed_tables = ["customers", "orders", "products"]
+        source.list_objects.return_value = managed_tables
+        source.get_schema.side_effect = lambda name: Schema(
+            name=name, columns=[Column(name="id", source_type="INT")]
+        )
+        source.export_full.side_effect = lambda name, schema_name=None: iter([{"id": name}])
+
+        orchestrator.run_full()
+
+        assert target.reconcile_mysql_table.call_count == len(managed_tables)
+        assert all(call.args[1] == set(managed_tables) for call in target.reconcile_mysql_table.call_args_list)
+        target.clear_objects_for_full_sync.assert_called_once_with(managed_tables)
+        assert [entry.args[0] for entry in source.export_full.call_args_list] == managed_tables
+        assert target.upsert_batch.call_count == len(managed_tables)
+        assert "manual_table" not in managed_tables
+        assert target.finalize_schema_reconciliations.call_count == 0
+
+
 class TestBug2StatusFromValidation:
     def test_status_not_hardcoded(self):
         source = MagicMock(spec=SourceConnector)
@@ -824,9 +918,9 @@ class TestPostgresSequenceSchemaQualification:
         connector = self._source_conn()
         cur = MagicMock()
         cur.fetchall.return_value = [
-            # (schemaname, sequencename, start, min, max, incr, cycle, last, owned_by)
-            ("public",      "customers_customer_id_seq", 1, 1, 2147483647, 1, False, None, "public.customers.customer_id"),
-            ("audit_test",  "test_sequence",             1, 1, 9223372036854775807, 1, False, None, None),
+            # (schemaname, sequencename, data_type, start, min, max, incr, cycle, cache, last, owned_by)
+            ("public", "customers_customer_id_seq", "bigint", 1, 1, 2147483647, 1, False, 1, None, "public.customers.customer_id"),
+            ("audit_test", "test_sequence", "bigint", 1, 1, 9223372036854775807, 1, False, 1, None, None),
         ]
         cur.fetchone.return_value = None
         cur.__enter__.return_value = cur
@@ -1014,7 +1108,8 @@ class TestPostgresSequenceOwnership:
 
         executed = [c.args[0] for c in cur.execute.call_args_list]
         alter_sql = next((s for s in executed if "ALTER SEQUENCE" in s), None)
-        assert alter_sql is None, "Unowned sequence must not emit ALTER SEQUENCE"
+        assert alter_sql is not None, "Unowned sequence must emit ALTER SEQUENCE ... OWNED BY NONE"
+        assert 'OWNED BY NONE' in alter_sql
 
 
 class TestPostgresSyncSequenceSchemaQualification:
@@ -1327,7 +1422,7 @@ class TestPostgresFunctionSchemaQualification:
         )
         cur = MagicMock()
         cur.fetchall.return_value = [
-            ("get_customer_count", "audit_test", "CREATE OR REPLACE FUNCTION audit_test.get_customer_count() RETURNS integer LANGUAGE sql AS $function$ SELECT COUNT(*)::INTEGER FROM audit_test.test_customers; $function$"),
+            ("get_customer_count", "audit_test", "CREATE OR REPLACE FUNCTION audit_test.get_customer_count() RETURNS integer LANGUAGE sql AS $function$ SELECT COUNT(*)::INTEGER FROM audit_test.test_customers; $function$", "f", ""),
         ]
         cur.__enter__.return_value = cur
         cur.__exit__.return_value = False

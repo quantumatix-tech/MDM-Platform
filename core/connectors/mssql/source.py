@@ -62,6 +62,7 @@ from core.connectors.mssql._models import (
     PartitionSchemeDef,
     PartitionedTableDef,
     _build_mssql_index_ddl,
+    _resolve_mssql_schemas,
 )
 from core.connectors.mssql.objects import table as _mssql_table
 from core.connectors.mssql.objects import view as _mssql_view
@@ -97,6 +98,20 @@ class MSSQLSourceConnector(SourceConnector):
 
         self._conn = pyodbc.connect(conn_str)
         audit_log(phase="connect", status="success", details={"engine": "mssql", "role": "source"})
+
+    def get_server_version(self) -> str | None:
+        """Return MSSQL server version string."""
+        if self._conn is None:
+            return None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT @@VERSION")
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+        except Exception:
+            pass
+        return None
 
     def list_objects(self) -> list[str]:
         """Return user base tables in the configured schemas.
@@ -295,6 +310,7 @@ class MSSQLSourceConnector(SourceConnector):
                         ddl=ddl,
                         included_columns=entry["included_cols"],
                         filter_definition=_idx_filter[idx_name],
+                        descending_columns=[c for c, is_desc in key_cols if is_desc],
                     )
                 )
 
@@ -331,7 +347,8 @@ class MSSQLSourceConnector(SourceConnector):
                 "  rc.name AS ref_col, "
                 "  OBJECT_SCHEMA_NAME(fk.referenced_object_id) AS ref_schema, "
                 "  OBJECT_NAME(fk.referenced_object_id) AS ref_table, "
-                "  fkc.constraint_column_id AS ord "
+                "  fkc.constraint_column_id AS ord, "
+                "  fk.is_disabled, fk.is_not_trusted "
                 "FROM sys.foreign_keys fk "
                 "JOIN sys.foreign_key_columns fkc "
                 "  ON fk.object_id = fkc.constraint_object_id "
@@ -349,7 +366,10 @@ class MSSQLSourceConnector(SourceConnector):
             )
             fk_map: dict = {}
             for row in cur.fetchall():
-                fk_name, parent_col, ref_col, ref_schema, ref_table, _ord = row
+                (
+                    fk_name, parent_col, ref_col, ref_schema, ref_table, _ord,
+                    disabled, untrusted,
+                ) = row
                 if fk_name not in fk_map:
                     fk_map[fk_name] = ForeignKey(
                         name=fk_name,
@@ -357,6 +377,8 @@ class MSSQLSourceConnector(SourceConnector):
                         ref_table=ref_table,
                         ref_columns=[],
                         ref_schema=ref_schema,
+                        is_disabled=bool(disabled),
+                        is_not_trusted=bool(untrusted),
                     )
                 fk_map[fk_name].columns.append(parent_col)
                 fk_map[fk_name].ref_columns.append(ref_col)
@@ -508,6 +530,15 @@ class MSSQLSourceConnector(SourceConnector):
         Delegates to ``objects.partition.get_partitioned_tables``.
         """
         return _mssql_partition.get_partitioned_tables(self._conn, self._config)
+
+    def inspect_partition_metadata(self) -> dict[str, Any]:
+        """Return complete SQL Server partition metadata for validation."""
+        schemas = _resolve_mssql_schemas(self._config)
+        return {
+            "functions": _mssql_partition.inspect_partition_functions(self._conn),
+            "schemes": _mssql_partition.inspect_partition_schemes(self._conn),
+            "tables": _mssql_partition.inspect_partitioned_tables(self._conn, schemas),
+        }
 
     # ------------------------------------------------------------------
     # Step 15 — Comments / Extended Properties

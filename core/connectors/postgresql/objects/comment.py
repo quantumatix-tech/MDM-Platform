@@ -144,3 +144,35 @@ def apply_comment(conn: Any, comment: CommentDef) -> None:
             conn.rollback()
             audit_log(phase="apply_comment", status="skipped",
                       details={"object": comment.object_name, "reason": str(exc)})
+
+
+def reconcile_column_comments(
+    conn: Any,
+    managed_schemas: list[Any],
+    source_comments: list[CommentDef],
+) -> list[str]:
+    """Clear target comments absent from source on source-managed columns only."""
+    source_column_comments = {
+        (comment.schema_name or "public", *comment.object_name.split(".", 1))
+        for comment in source_comments
+        if comment.object_type == "COLUMN" and "." in comment.object_name
+    }
+    cleared: list[str] = []
+    try:
+        with conn.cursor() as cur:
+            for schema in managed_schemas:
+                schema_name = schema.schema_name or "public"
+                for column in schema.columns:
+                    key = (schema_name, schema.name, column.name)
+                    if key in source_column_comments:
+                        continue
+                    cur.execute(
+                        f"COMMENT ON COLUMN {quote_identifier(schema_name)}."
+                        f"{quote_identifier(schema.name)}.{quote_identifier(column.name)} IS NULL"
+                    )
+                    cleared.append(f"{schema_name}.{schema.name}.{column.name}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return cleared

@@ -107,6 +107,18 @@ def _full_pass_catalog() -> MagicMock:
         for idx_name, is_unique, cols, included, is_clustered in INDEXES.get(table, [])
     ]
     cat.get_views.return_value = {v: f"SELECT 1 AS {v}" for v in VIEWS}
+    cat.get_view_properties.return_value = {
+        "Task4_SourceManaged_IV": {
+            "is_schema_bound": True,
+            "indexes": {
+                "CIX_Task4_SourceManaged_IV": {
+                    "type_desc": "CLUSTERED",
+                    "is_unique": True,
+                    "columns": ["ID"],
+                }
+            },
+        }
+    }
     cat.get_functions.return_value = {
         f_name: {"type": f_type, "definition": "FN"}
         for f_name, f_type in FUNCTIONS.items()

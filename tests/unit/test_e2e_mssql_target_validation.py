@@ -83,6 +83,20 @@ class TestComparisonCategory:
         assert "something broke" in cat.mismatches
 
 
+def test_target_table_validation_reports_and_preserves_target_only_tables():
+    from tests.e2e.mssql.validation.expected import TABLES
+
+    catalog = _make_catalog_mock({
+        "get_base_tables": MagicMock(return_value=[*TABLES, "Task4_TargetOnly"]),
+    })
+    validator = TargetValidator(catalog, "MigrationE2E_MSSQL_Target", skip_connectivity=True)
+    validator._preserve_target_only = True
+    validator._validate_tables()
+    check = validator._report.phases[0].checks[0]
+    assert check.passed
+    assert check.details["target_only_preserved_by_policy"] == ["Task4_TargetOnly"]
+
+
 # --------------------------------------------------------------------------- #
 # SourceTargetComparator — PASS case
 # --------------------------------------------------------------------------- #
@@ -288,8 +302,81 @@ class TestComparatorPass:
         comparator.compare()
 
         views_cat = next(c for c in comparator.categories if c.name == "views")
-        assert not views_cat.passed
-        assert "vw_Extra" in views_cat.unexpected
+        assert views_cat.passed
+        assert "vw_Extra" in views_cat.preserved
+
+    def test_sequence_definition_mismatch_fails_even_when_target_runtime_is_ahead(self):
+        src = _make_catalog_mock({"get_sequences": MagicMock(return_value={
+            "Seq_OrderNumber": {"data_type": "bigint", "start_value": 1000,
+                                "increment": 1, "current_value": 1004},
+        })})
+        tgt = _make_catalog_mock({"get_sequences": MagicMock(return_value={
+            "Seq_OrderNumber": {"data_type": "bigint", "start_value": 1050,
+                                "increment": 1, "current_value": 1050},
+        })})
+        comparator = SourceTargetComparator(src, tgt)
+        comparator._compare_sequences()
+        result = comparator.categories[-1]
+        assert not result.passed
+        assert any("start_value" in mismatch for mismatch in result.mismatches)
+
+    def test_sequence_exact_definition_matches_under_source_authoritative_policy(self):
+        src = _make_catalog_mock({"get_sequences": MagicMock(return_value={
+            "Seq_OrderNumber": {"data_type": "bigint", "start_value": 1000,
+                                "increment": 1, "minimum_value": 1, "maximum_value": 9999,
+                                "is_cycling": False, "is_cached": True, "cache_size": 10,
+                                "current_value": 1004},
+        })})
+        tgt = _make_catalog_mock({"get_sequences": MagicMock(return_value={
+            "Seq_OrderNumber": {"data_type": "bigint", "start_value": 1000,
+                                "increment": 1, "minimum_value": 1, "maximum_value": 9999,
+                                "is_cycling": False, "is_cached": True, "cache_size": 10,
+                                "current_value": 1004},
+        })})
+        comparator = SourceTargetComparator(src, tgt)
+        comparator._compare_sequences()
+        result = comparator.categories[-1]
+        assert result.passed
+        assert not result.mismatches
+
+    def test_function_and_procedure_definitions_are_compared(self):
+        src = _make_catalog_mock({
+            "get_functions": MagicMock(return_value={"fn_calc": {"type": "FN", "definition": "RETURN 1"}}),
+            "get_procedures": MagicMock(return_value={"usp_get": "SELECT 1"}),
+        })
+        tgt = _make_catalog_mock({
+            "get_functions": MagicMock(return_value={"fn_calc": {"type": "FN", "definition": "RETURN 2"}}),
+            "get_procedures": MagicMock(return_value={"usp_get": "SELECT 2"}),
+        })
+        comparator = SourceTargetComparator(src, tgt)
+        comparator._compare_functions()
+        comparator._compare_procedures()
+        assert not comparator.categories[0].passed
+        assert "normalized definition differs" in comparator.categories[0].mismatches[0]
+        assert not comparator.categories[1].passed
+        assert "normalized definition differs" in comparator.categories[1].mismatches[0]
+
+    def test_same_name_object_type_conflict_is_reported_once(self):
+        src = _make_catalog_mock({
+            "get_views": MagicMock(return_value={"same_name": "SELECT 1"}),
+            "get_functions": MagicMock(return_value={}),
+            "get_procedures": MagicMock(return_value={}),
+        })
+        tgt = _make_catalog_mock({
+            "get_views": MagicMock(return_value={}),
+            "get_functions": MagicMock(return_value={}),
+            "get_procedures": MagicMock(return_value={"same_name": "SELECT 2"}),
+        })
+        comparator = SourceTargetComparator(src, tgt)
+        comparator._type_conflicts = comparator._collect_module_type_conflicts()
+        comparator._compare_module_type_conflicts()
+        view_cat = ComparisonCategory(name="views", missing=["same_name"])
+        proc_cat = ComparisonCategory(name="procedures", unexpected=["same_name"])
+        comparator._remove_type_conflicts(view_cat)
+        comparator._remove_type_conflicts(proc_cat)
+        assert view_cat.missing == [] and proc_cat.unexpected == []
+        assert comparator.categories[0].status == STATUS_FAIL
+        assert "source type VIEW, target type PROCEDURE" in comparator.categories[0].mismatches[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -353,6 +440,35 @@ class TestFunctionalValidator:
                 if p.name == "functional_scalar_function"
             )
             assert fn_phase.status == STATUS_FAIL
+
+    def test_sequence_next_value_must_match_source_runtime_state(self):
+        source_state = {
+            "data_type": "bigint", "start_value": 1000, "increment": 1,
+            "minimum_value": 1, "maximum_value": 9999, "is_cycling": False,
+            "is_exhausted": False, "last_used_value_available": True,
+            "last_used_value": 1004,
+        }
+        for emitted, expected_status in ((1005, STATUS_PASS), (1050, STATUS_FAIL)):
+            validator = self._make_validator({})
+            validator._expected_sequences = {"Seq_OrderNumber": source_state}
+            with patch.object(validator, "_execute", return_value=[(emitted,) ]):
+                validator._validate_sequence()
+            result = validator._report.phases[-1]
+            assert result.status == expected_status
+            assert result.checks[0].expected == 1005
+
+    def test_sequence_validator_reports_ambiguous_source_state_as_failure(self):
+        validator = self._make_validator({})
+        validator._expected_sequences = {"Seq_OrderNumber": {
+            "start_value": 1000, "increment": 1, "current_value": 1000,
+            "minimum_value": 1, "maximum_value": 9999,
+            "last_used_value_available": False,
+        }}
+        with patch.object(validator, "_execute", return_value=[(1001,) ]):
+            validator._validate_sequence()
+        result = validator._report.phases[-1]
+        assert result.status == STATUS_FAIL
+        assert "last_used_value is unavailable" in result.checks[0].message
 
 
 # --------------------------------------------------------------------------- #

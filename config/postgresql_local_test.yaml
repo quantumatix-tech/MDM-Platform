@@ -2,20 +2,20 @@ source:
   engine: postgresql
   connection:
     host: 127.0.0.1
-    port: 55432
-    database: migration_source
+    port: 5432
+    database: postgres_existing_source
     username: postgres
-    password_secret: source_db_pass
+    password_secret: postgres-source-password
     ssl: false
 
 target:
   engine: postgresql
   connection:
     host: 127.0.0.1
-    port: 55432
-    database: migration_target
+    port: 5432
+    database: postgres_existing_target
     username: postgres
-    password_secret: target_db_pass
+    password_secret: postgres-target-password
     ssl: false
 
 migration:
@@ -23,7 +23,6 @@ migration:
   batch_size: 1000
   include_schemas:
     - public
-    - audit_test
 
 retry:
   max_retries: 3
@@ -31,7 +30,11 @@ retry:
   max_delay_seconds: 30.0
 
 secrets:
-  provider: env
+  provider: local_encrypted_file
+  local_encrypted_file:
+    key_source: keyring
+    keyring_service: migration-platform/secrets-key
+    auto_create: false
 
 alerting:
   notifier: none

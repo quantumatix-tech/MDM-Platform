@@ -133,7 +133,7 @@ def test_source_get_schema_extracts_foreign_keys():
         [("id", "int", "NO", None, 10, 0)],
         [],
         [("id", "PK_sales_orders")],
-        [("fk_orders_cust", "customer_id", "id", "sales", "customers", 1)],
+        [("fk_orders_cust", "customer_id", "id", "sales", "customers", 1, 0, 0)],
         [],  # check constraints (empty)
         [],  # default constraints (empty)
     ]
@@ -151,6 +151,8 @@ def test_source_get_schema_extracts_foreign_keys():
     assert fk.ref_table == "customers"
     assert fk.ref_columns == ["id"]
     assert fk.columns == ["customer_id"]
+    assert fk.is_disabled is False
+    assert fk.is_not_trusted is False
 
 
 def test_target_apply_constraints_creates_fk():
@@ -260,7 +262,7 @@ def test_target_apply_constraints_emits_index_ddl():
     )
     target.apply_constraints(schema)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
-    idx_sql = next(s for s in executed if "INDEX" in s.upper())
+    idx_sql = next(s for s in executed if s.lstrip().upper().startswith("CREATE "))
     assert "IX_orders_date" in idx_sql
 
 
@@ -269,7 +271,7 @@ def test_target_apply_constraints_emits_index_ddl():
 def test_source_list_all_sequences_matches():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("seq_invoice", "sales", "int", 1000, 10, 1000, 1100, 0, 10, 1020, 1),
+        ("seq_invoice", "sales", "int", 1000, 10, 1000, 1100, 0, 10, 1020, 1, 1020, 0),
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -295,7 +297,34 @@ def test_source_list_all_sequences_matches():
 
 
 def test_target_create_sequence_matches():
-    target, cur = _build_target_helper()
+    cur = MagicMock()
+    # Sequence of fetchone calls:
+    # 1. Server version check (for last_used_value support) - ProductMajorVersion
+    # 2. Check schema exists (None -> schema doesn't exist)
+    # 3. Check sequence exists (None -> sequence doesn't exist)
+    # 4. Conflict check for existing object (None -> no conflict)
+    # 5. After CREATE SEQUENCE, runtime state reproduction (NEXT VALUE FOR)
+    # 6. After reconciliation check (12 columns)
+    fetchone_sequence = [
+        (14,),  # server version >= 14 (supports last_used_value)
+        None,  # schema check
+        None,  # sequence exists check
+        None,  # conflict check
+        (1020,),  # NEXT VALUE FOR runtime state reproduction
+        ("int", 1000, 10, 1000, 1100, False, True, 10, 1020, 1020, False, 1),  # after reconciliation (12 cols)
+    ]
+    fetchone_iter = iter(fetchone_sequence)
+    def fetchone_side_effect(*args, **kwargs):
+        try:
+            return next(fetchone_iter)
+        except StopIteration:
+            return None
+    cur.fetchone.side_effect = fetchone_side_effect
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    target = MSSQLTargetConnector({"database": "mssql_migration_target", "source_engine": "mssql"})
+    target._conn = conn
     seq = SequenceDef(
         name="seq_invoice", schema="sales", data_type="int",
         start_value=1000, increment=10, min_value=1000, max_value=1100,
@@ -314,7 +343,7 @@ def test_target_create_sequence_matches():
 def test_source_list_views_matches():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("v_summary", "sales", "SELECT * FROM sales.customers"),
+        ("v_summary", "sales", "SELECT * FROM sales.customers", 0),
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -346,7 +375,7 @@ def test_target_create_view_matches():
 def test_source_list_functions_matches():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("sales", "fn_count", "CREATE FUNCTION sales.fn_count() RETURNS INT AS BEGIN RETURN 1 END"),
+        ("sales", "fn_count", "CREATE FUNCTION sales.fn_count() RETURNS INT AS BEGIN RETURN 1 END", "FN"),
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -465,8 +494,8 @@ def test_source_list_partition_functions_matches():
     from datetime import datetime
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("pf_dates", "RANGE", True, datetime(2024, 1, 1), 1, "datetime2", None, None, None),
-        ("pf_dates", "RANGE", True, datetime(2025, 1, 1), 2, "datetime2", None, None, None),
+        ("pf_dates", "RANGE", True, 3, datetime(2024, 1, 1), 1, "datetime2", None, None, None),
+        ("pf_dates", "RANGE", True, 3, datetime(2025, 1, 1), 2, "datetime2", None, None, None),
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -482,11 +511,15 @@ def test_source_list_partition_functions_matches():
     assert pf.data_type == "datetime2"
     assert pf.range_desc == "RANGE RIGHT"
     assert len(pf.boundaries) == 2
+    assert pf.fanout == 3
 
 
 def test_source_list_partition_schemes_matches():
     cur = MagicMock()
-    cur.fetchall.return_value = [("ps_dates", "pf_dates", "PRIMARY")]
+    cur.fetchall.side_effect = [
+        [("ps_dates", "pf_dates")],
+        [("ps_dates", "pf_dates", "PRIMARY", 1, 7)],
+    ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur
     conn.cursor.return_value.__exit__.return_value = False
@@ -499,6 +532,7 @@ def test_source_list_partition_schemes_matches():
     assert pss[0].name == "ps_dates"
     assert pss[0].partition_function_name == "pf_dates"
     assert pss[0].filegroups == ["PRIMARY"]
+    assert pss[0].destinations == [(1, "PRIMARY")]
 
 
 def test_source_get_partitioned_tables_matches():
@@ -560,7 +594,7 @@ def test_source_list_roles_matches():
 def test_source_list_grants_matches():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("SELECT", "OBJECT_OR_COLUMN", 1, 0, "app_user", "customers", None, "sales", None),
+        ("SELECT", "OBJECT_OR_COLUMN", 1, 0, "app_user", "customers", "U", None, "sales", None),
     ]
     conn, _ = _mock_conn()
     conn.cursor.return_value.__enter__.return_value = cur

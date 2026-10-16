@@ -52,7 +52,6 @@ class MySQLTargetConnector(TargetConnector):
     def __init__(self, config: dict[str, Any]) -> None:
         self._config = config
         self._conn: Any = None
-        self._reconciliation_backups: list[str] = []
         self._routine_definer: str | None = config.get("routine_definer")
         self._preserve_source_definer: bool = bool(config.get("preserve_source_definer", False))
         self._available_definer_accounts: set[tuple[str, str]] = set()
@@ -122,6 +121,20 @@ class MySQLTargetConnector(TargetConnector):
                 self._routine_definer = current_user
         audit_log(phase="connect", status="success", details={"engine": "mysql", "role": "target"})
 
+    def get_server_version(self) -> str | None:
+        """Return MySQL server version string."""
+        if self._conn is None:
+            return None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT VERSION()")
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+        except Exception:
+            pass
+        return None
+
     def close(self) -> None:
         if self._conn is None:
             return
@@ -178,15 +191,10 @@ class MySQLTargetConnector(TargetConnector):
 
 
     def reconcile_mysql_table(self, schema: Schema, managed_tables: set[str]) -> str:
-        """Stage and atomically swap a source-equivalent table, retaining backup until success."""
+        """Replace a managed table with source-equivalent DDL."""
         return table_ops.reconcile_mysql_table(
             self._conn, self._config, schema, managed_tables,
-            self._reconciliation_backups,
         )
-
-    def finalize_schema_reconciliations(self) -> list[str]:
-        """Drop retained backup tables once the run has succeeded."""
-        return table_ops.finalize_schema_reconciliations(self._conn, self._reconciliation_backups)
 
     @staticmethod
     @staticmethod

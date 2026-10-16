@@ -1,0 +1,71 @@
+# PostgreSQL E2E Configuration Example
+#
+# This is an illustrative template. Replace all placeholder values with your
+# actual connection details before running. Never commit real passwords.
+#
+# Usage:
+#   1. Copy this file to a new name (e.g., config/my_pg_migration.yaml)
+#   2. Edit the placeholder values marked with <...>
+#   3. Set required environment variables (see below)
+#   4. Run: python -m migration_platform --config config/my_pg_migration.yaml --mode full
+#
+# IMPORTANT: Placeholders like <SOURCE_HOST> are NOT valid YAML. You MUST replace
+# them with actual values before the file can be parsed.
+
+source:
+  engine: postgresql
+  connection:
+    host: <SOURCE_HOST>           # e.g., localhost, 192.168.1.10, or myserver.postgres.database.azure.com
+    port: 5432                    # Default PostgreSQL port
+    database: <SOURCE_DATABASE>   # e.g., source_db
+    username: <SOURCE_USERNAME>   # e.g., postgres
+    password_secret: source_db_pass
+    ssl: false                    # Set true for Azure / cloud; false for local
+    # ssl_ca_cert: /path/to/ca.crt  # Optional CA cert path for SSL verification
+    keepalives_idle: 30           # TCP keepalive seconds; recommended for cloud
+
+target:
+  engine: postgresql
+  connection:
+    host: <TARGET_HOST>           # e.g., localhost, 192.168.1.10, or myserver.postgres.database.azure.com
+    port: 5432                    # Default PostgreSQL port
+    database: <TARGET_DATABASE>   # e.g., target_db (created automatically if missing)
+    username: <TARGET_USERNAME>   # e.g., postgres
+    password_secret: target_db_pass
+    ssl: false                    # Set true for Azure / cloud; false for local
+    # ssl_ca_cert: /path/to/ca.crt  # Optional CA cert path for SSL verification
+    keepalives_idle: 30           # TCP keepalive seconds; recommended for cloud
+    # source_engine is injected by the platform at runtime (do not set here)
+
+migration:
+  mode: full                      # full | cdc-incremental | cdc-continuous
+  batch_size: 1000                # Rows per INSERT batch; lower for slow networks
+  include_schemas:                # Schemas to migrate; default ["public"] if omitted
+    - <SCHEMA_1>                  # e.g., public
+    - <SCHEMA_2>                  # e.g., audit_test
+
+# Retry and circuit breaker settings (optional; shown with defaults)
+retry:
+  max_retries: 3
+  base_delay_seconds: 1.0
+  max_delay_seconds: 30.0
+  circuit_breaker_max_failures: 5
+  circuit_breaker_reset_timeout_seconds: 60.0
+
+# Secrets provider: env reads SECRET_<name> from environment variables
+secrets:
+  provider: env
+
+# Alerting (optional)
+alerting:
+  notifier: none                  # none | slack | teams | webhook | email
+
+# Validation mode
+validation:
+  mode: count                     # count | checksum | full
+  sample_size: 1000               # Only used by checksum mode
+
+# Logging
+logging:
+  level: INFO                     # DEBUG | INFO | WARNING | ERROR
+  # file: migration.log           # Optional additional log file

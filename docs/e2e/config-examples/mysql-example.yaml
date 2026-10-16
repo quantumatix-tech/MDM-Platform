@@ -1,0 +1,75 @@
+# MySQL E2E Configuration Example
+#
+# This is an illustrative template. Replace all placeholder values with your
+# actual connection details before running. Never commit real passwords.
+#
+# Usage:
+#   1. Copy this file to a new name (e.g., config/my_mysql_migration.yaml)
+#   2. Edit the placeholder values marked with <...>
+#   3. Set required environment variables (see below)
+#   4. Run: python -m migration_platform --config config/my_mysql_migration.yaml --mode full
+#
+# IMPORTANT: Placeholders like <SOURCE_HOST> are NOT valid YAML. You MUST replace
+# them with actual values before the file can be parsed.
+
+source:
+  engine: mysql
+  connection:
+    host: <SOURCE_HOST>           # e.g., localhost, 192.168.1.10, or myserver.mysql.database.azure.com
+    port: 3306                    # Default MySQL port
+    database: <SOURCE_DATABASE>   # e.g., source_db
+    username: <SOURCE_USERNAME>   # e.g., root
+    password_secret: source_db_pass
+    ssl: false                    # Set true for Azure / cloud; false for local
+    # Default ssl is TRUE. For local non-TLS databases you MUST set ssl: false
+
+target:
+  engine: mysql
+  connection:
+    host: <TARGET_HOST>           # e.g., localhost, 192.168.1.10, or myserver.mysql.database.azure.com
+    port: 3306                    # Default MySQL port
+    database: <TARGET_DATABASE>   # e.g., target_db (created automatically if missing)
+    username: <TARGET_USERNAME>   # e.g., root
+    password_secret: target_db_pass
+    ssl: false                    # Set true for Azure / cloud; false for local
+    # Default ssl is TRUE. For local non-TLS databases you MUST set ssl: false
+    # source_engine is injected by the platform at runtime (do not set here)
+    # preserve_source_definer: false  # Keep source DEFINER on migrated routines/triggers
+    # routine_definer: "user@host"    # Override DEFINER for migrated routines/triggers/events
+
+    # Optional MySQL security users allowlist (global permissions discovery)
+    # Only used when migrating MySQL users/roles. Lists specific accounts to discover.
+    # security_users:
+    #   - user: <USERNAME>
+    #     host: "%"
+
+migration:
+  mode: full                      # full | cdc-incremental | cdc-continuous
+  batch_size: 1000                # Rows per INSERT batch; lower for slow networks
+  include_schemas: []             # Empty = discover all schemas; or list schemas to migrate
+
+# Retry and circuit breaker settings (optional; shown with defaults)
+retry:
+  max_retries: 3
+  base_delay_seconds: 1.0
+  max_delay_seconds: 30.0
+  circuit_breaker_max_failures: 5
+  circuit_breaker_reset_timeout_seconds: 60.0
+
+# Secrets provider: env reads SECRET_<name> from environment variables
+secrets:
+  provider: env
+
+# Alerting (optional)
+alerting:
+  notifier: none                  # none | slack | teams | webhook | email
+
+# Validation mode
+validation:
+  mode: count                     # count | checksum | full
+  sample_size: 1000               # Only used by checksum mode
+
+# Logging
+logging:
+  level: INFO                     # DEBUG | INFO | WARNING | ERROR
+  # file: migration.log           # Optional additional log file

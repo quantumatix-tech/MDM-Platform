@@ -6,8 +6,8 @@ import argparse
 import getpass
 import sys
 import warnings
-from collections.abc import Sequence
 from pathlib import Path
+from collections.abc import Sequence
 
 from core.secrets.local_encrypted_file import (
     LocalEncryptedFileProvider,
@@ -170,7 +170,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         value == "--key-source" or value.startswith("--key-source=") for value in provided
     )
     has_key_configuration = has_key_source_option or any(
-        value.startswith(("--key-env-var", "--keyring-service"))
+        value == "--key-env-var"
+        or value.startswith("--key-env-var=")
+        or value == "--keyring-service"
+        or value.startswith("--keyring-service=")
         for value in provided
     )
     if args.file is None:

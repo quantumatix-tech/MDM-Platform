@@ -1,0 +1,27 @@
+source:
+  engine: mysql
+  connection:
+    host: 172.24.48.1
+    port: 33062
+    database: MigrationE2E_MySQL_Source
+    username: migration_e2e
+    password_secret: mysql_e2e_source_pass
+    ssl: true
+
+target:
+  engine: mysql
+  connection:
+    host: 172.24.48.1
+    port: 33062
+    database: MigrationE2E_MySQL_Target
+    username: migration_e2e
+    password_secret: mysql_e2e_target_pass
+    ssl: true
+    source_engine: mysql
+
+migration:
+  mode: full
+  batch_size: 1000
+  include_schemas: []
+
+security_users: []

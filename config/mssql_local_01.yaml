@@ -1,0 +1,40 @@
+source:
+  engine: mssql
+  connection:
+    host: localhost
+    port: 1533
+    database: MigrationE2E_MSSQL_Source
+    username: sa
+    password_secret: mssql_e2e_source_pass
+    ssl: false
+
+target:
+  engine: mssql
+  connection:
+    host: localhost
+    port: 1533
+    database: MigrationE2E_MSSQL_Target
+    username: sa
+    password_secret: mssql_e2e_target_pass
+    ssl: false
+    source_engine: mssql
+
+migration:
+  mode: full
+  batch_size: 1000
+  reconcile_mssql_partition_functions: true
+  include_schemas:
+    - training
+
+secrets:
+  provider: env
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO

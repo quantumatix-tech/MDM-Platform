@@ -6,6 +6,7 @@ import platform
 import re
 import subprocess
 import time
+import traceback
 from collections.abc import Iterator
 from typing import Any
 
@@ -20,11 +21,75 @@ from core.connectors.base import (
     TargetConnector,
     UpsertResult,
 )
-from core.dependency_order import order_data_load_objects
 from core.schema_mapping.registry import TypeMappingRegistry
+from core.dependency_order import order_data_load_objects
 from core.secrets import create_secret_provider
 from core.status_server import StatusServer
 from core.validator import Validator
+from core.connectors.mssql.objects.partition import PartitionDefinitionMismatch
+
+
+class _PartitionDefinitionError(RuntimeError):
+    """Raised when stop_on_error is enabled for partition validation failures."""
+
+
+def _mssql_partition_comparison(source: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    """Compare source-managed SQL Server partition objects from two inventories."""
+    result: dict[str, Any] = {"definition_matches": True, "mismatches": []}
+
+    def compare_group(kind: str, source_items: dict, target_items: dict) -> None:
+        for key in sorted(source_items, key=str):
+            source_def = source_items[key]
+            target_def = target_items.get(key)
+            if target_def is None:
+                result["definition_matches"] = False
+                mismatch = {
+                    "object": ".".join(str(part) for part in key) if isinstance(key, tuple) else key,
+                    "kind": kind, "source": source_def,
+                    "target": None, "reason": f"target {kind} is missing",
+                }
+                if kind == "partitioned_table_index":
+                    mismatch["table_name"] = source_def["table_name"]
+                    mismatch["schema_name"] = source_def["schema_name"]
+                result["mismatches"].append(mismatch)
+            elif source_def != target_def:
+                result["definition_matches"] = False
+                mismatch = {
+                    "object": ".".join(str(part) for part in key) if isinstance(key, tuple) else key,
+                    "kind": kind, "source": source_def,
+                    "target": target_def, "reason": f"source and target {kind} definitions differ",
+                }
+                if kind == "partitioned_table_index":
+                    mismatch["table_name"] = source_def["table_name"]
+                    mismatch["schema_name"] = source_def["schema_name"]
+                result["mismatches"].append(mismatch)
+
+    source_functions = source.get("functions", {})
+    source_schemes = source.get("schemes", {})
+    source_tables = source.get("tables", {})
+    target_functions = target.get("functions", {})
+    target_schemes = target.get("schemes", {})
+    target_tables = target.get("tables", {})
+    compare_group("partition_function", source_functions, target_functions)
+    for name, definition in source_functions.items():
+        if not definition.get("catalog_consistent", True):
+            result["definition_matches"] = False
+            result["mismatches"].append({
+                "object": name, "kind": "partition_function", "source": definition,
+                "target": target_functions.get(name),
+                "reason": definition.get("catalog_error", "source partition function metadata is inconsistent"),
+            })
+    for name, definition in target_functions.items():
+        if name in source_functions and not definition.get("catalog_consistent", True):
+            result["definition_matches"] = False
+            result["mismatches"].append({
+                "object": name, "kind": "partition_function", "source": source_functions[name],
+                "target": definition,
+                "reason": definition.get("catalog_error", "target partition function metadata is inconsistent"),
+            })
+    compare_group("partition_scheme", source_schemes, target_schemes)
+    compare_group("partitioned_table_index", source_tables, target_tables)
+    return result
 
 
 class MigrationOrchestrator:
@@ -181,8 +246,10 @@ class MigrationOrchestrator:
                         ext_results[ext.name] = "created"
                     except Exception as exc:
                         ext_results[ext.name] = f"skipped: {exc}"
+                        all_errors.append(f"extension {ext.name}: {exc}")
             except Exception as exc:
                 ext_results["_error"] = str(exc)
+                all_errors.append(f"extension discovery: {exc}")
             result["phases"]["extensions"] = ext_results
             self._update_status("extensions", 6, all_errors)
 
@@ -241,22 +308,28 @@ class MigrationOrchestrator:
                         schema_results[s.name] = "created"
                     except Exception as exc:
                         schema_results[s.name] = f"skipped: {exc}"
+                        all_errors.append(f"schema {s.name}: {exc}")
             except Exception as exc:
                 schema_results["_error"] = str(exc)
+                all_errors.append(f"schema discovery: {exc}")
             result["phases"]["schemas"] = schema_results
             self._update_status("schemas", 8, all_errors)
 
             # ---------- Phase 3: Custom Types ----------
             type_results: dict[str, str] = {}
+            source_types: list[Any] = []
             try:
-                for t in self._source.list_types():
+                source_types = list(self._source.list_types())
+                for t in source_types:
                     try:
                         self._target.create_type(t)
                         type_results[t.name] = f"created ({t.kind})"
                     except Exception as exc:
                         type_results[t.name] = f"skipped: {exc}"
+                        all_errors.append(f"type {t.name}: {exc}")
             except Exception as exc:
                 type_results["_error"] = str(exc)
+                all_errors.append(f"type discovery: {exc}")
             result["phases"]["custom_types"] = type_results
             self._update_status("custom_types", 10, all_errors)
 
@@ -270,16 +343,38 @@ class MigrationOrchestrator:
                         seq_create_results[seq.name] = "created"
                     except Exception as exc:
                         seq_create_results[seq.name] = f"skipped: {exc}"
+                        all_errors.append(f"sequence {seq.name}: {exc}")
             except AttributeError:
                 # Non-PostgreSQL sources don't have list_all_sequences — skip silently
                 pass
             except Exception as exc:
                 seq_create_results["_error"] = str(exc)
+                all_errors.append(f"sequence discovery: {exc}")
             result["phases"]["create_sequences"] = seq_create_results
             self._update_status("create_sequences", 12, all_errors)
 
             # ---------- Phase 4: Create Tables ----------
             all_schemas: dict[str, Any] = {}
+            schema_reconciliation_enabled = (
+                self._config.get("migration", {}).get("reconcile_target_schema", False)
+                and self._config.get("target", {}).get("engine") in {"mysql", "postgresql"}
+            )
+            mssql_full_reconciliation = (
+                self._config.get("target", {}).get("engine") == "mssql"
+            )
+            postgres_source_views: list[Any] | None = None
+            if (
+                schema_reconciliation_enabled
+                and self._config.get("target", {}).get("engine") == "postgresql"
+            ):
+                try:
+                    postgres_source_views = list(self._source.list_views())
+                except Exception:
+                    # The normal views phase will report discovery errors. If
+                    # type reconciliation needs a dependent view meanwhile,
+                    # PostgreSQL's RESTRICT behavior safely blocks the ALTER.
+                    postgres_source_views = None
+            reconciliation_results: dict[str, Any] = {}
             object_failures: list[dict[str, str]] = []
             failed_objects: set[str] = set()
             result["phases"]["object_failures"] = object_failures
@@ -292,7 +387,20 @@ class MigrationOrchestrator:
                         all_schemas[obj_name] = schema
                         continue
                     self._apply_field_mappings(schema)
-                    self._target.create_object_if_missing(schema)
+                    if mssql_full_reconciliation:
+                        reconciliation_results[obj_name] = self._target.reconcile_mssql_table(
+                            schema
+                        )
+                    elif schema_reconciliation_enabled:
+                        if self._config.get("target", {}).get("engine") == "mysql":
+                            outcome = self._target.reconcile_mysql_table(schema, set(objects))
+                        else:
+                            outcome = self._target.reconcile_postgresql_table(
+                                schema, postgres_source_views or []
+                            )
+                        reconciliation_results[obj_name] = outcome
+                    else:
+                        self._target.create_object_if_missing(schema)
                     all_schemas[obj_name] = schema
                 except Exception as exc:
                     failed_objects.add(obj_name)
@@ -310,12 +418,23 @@ class MigrationOrchestrator:
             result["phases"]["create_tables"] = (
                 "partial_success" if failed_objects else "success"
             )
+            if schema_reconciliation_enabled:
+                result["phases"]["schema_reconciliation"] = reconciliation_results
             self._update_status("create_tables", 16, all_errors)
 
             # ---------- Phase 4.5: Create Partition Children ----------
             partition_results: dict[str, str] = {}
+            partitions: list[Any] = []
+            partition_inventory_loaded = False
+            partition_source_metadata: dict[str, Any] | None = None
+            partition_reconcile_errors: dict[str, str] = {}
+            partition_definition_validation_passed = True
+            partition_reconciliation_enabled = bool(
+                self._config.get("migration", {}).get("reconcile_mssql_partition_functions", False)
+            )
             try:
                 partitions = self._source.list_partitions()
+                partition_inventory_loaded = True
                 for part in partitions:
                     try:
                         self._target.create_partition(part)
@@ -327,27 +446,187 @@ class MigrationOrchestrator:
                     for pf in self._source.list_partition_functions():
                         try:
                             self._target.create_partition_function(pf)
-                            partition_results[pf.name] = "partition function created"
+                            partition_results[pf.name] = f"partition function created"
                         except Exception as exc:
-                            partition_results[pf.name] = f"skipped: {exc}"
+                            if (partition_reconciliation_enabled
+                                    and isinstance(exc, PartitionDefinitionMismatch)
+                                    and hasattr(self._source, "inspect_partition_metadata")
+                                    and hasattr(self._target, "reconcile_partition_function")):
+                                try:
+                                    if partition_source_metadata is None:
+                                        partition_source_metadata = self._source.inspect_partition_metadata()
+                                    self._target.reconcile_partition_function(pf, partition_source_metadata)
+                                    partition_results[pf.name] = "reconciled"
+                                except Exception as reconcile_exc:
+                                    partition_reconcile_errors[pf.name] = str(reconcile_exc)
+                                    partition_results[pf.name] = f"reconciliation_failed: {reconcile_exc}"
+                            else:
+                                partition_results[pf.name] = f"mismatch_pending_validation: {exc}"
                     for ps in self._source.list_partition_schemes():
+                        if ps.partition_function_name in partition_reconcile_errors:
+                            partition_results[ps.name] = {
+                                "status": "blocked",
+                                "reason": (
+                                    f"partition function {ps.partition_function_name} reconciliation failed; "
+                                    "the dependent scheme was preserved"
+                                ),
+                            }
+                            continue
                         try:
                             self._target.create_partition_scheme(ps)
-                            partition_results[ps.name] = "partition scheme created"
+                            partition_results[ps.name] = f"partition scheme created"
                         except Exception as exc:
+                            if (partition_reconciliation_enabled
+                                    and isinstance(exc, PartitionDefinitionMismatch)
+                                    and hasattr(self._source, "inspect_partition_metadata")
+                                    and hasattr(self._target, "reconcile_partition_scheme")):
+                                try:
+                                    if partition_source_metadata is None:
+                                        partition_source_metadata = self._source.inspect_partition_metadata()
+                                    self._target.reconcile_partition_scheme(ps, partition_source_metadata)
+                                    # Re-run the ordinary create/compare path so the
+                                    # reconciled scheme is accepted only if it now
+                                    # exactly matches source catalog metadata.
+                                    self._target.create_partition_scheme(ps)
+                                    partition_results[ps.name] = "reconciled"
+                                    continue
+                                except Exception as reconcile_exc:
+                                    partition_results[ps.name] = f"reconciliation_failed: {reconcile_exc}"
+                                    partition_reconcile_errors[ps.name] = str(reconcile_exc)
+                                    continue
                             partition_results[ps.name] = f"skipped: {exc}"
+                            partition_reconcile_errors[ps.name] = str(exc)
                     for pt in self._source.get_partitioned_tables():
                         try:
                             schema = self._source.get_schema(pt.table_name)
                             self._target.create_partitioned_table(schema, pt.partition_scheme_name, pt.partition_column)
-                            partition_results[pt.table_name] = "partitioned table created"
+                            partition_results[pt.table_name] = f"partitioned table created"
                         except Exception as exc:
                             partition_results[pt.table_name] = f"skipped: {exc}"
+                            partition_reconcile_errors[pt.table_name] = str(exc)
                 except AttributeError:
                     pass
             except Exception as exc:
                 partition_results["_error"] = str(exc)
+            if (
+                schema_reconciliation_enabled
+                and self._config.get("target", {}).get("engine") == "postgresql"
+                and partition_inventory_loaded
+                and hasattr(self._target, "reconcile_partitions")
+            ):
+                try:
+                    removed_partitions = self._target.reconcile_partitions(
+                        partitions,
+                        list(all_schemas.values()),
+                    )
+                    partition_results["_reconciled"] = {
+                        "removed": removed_partitions,
+                    }
+                except Exception as exc:
+                    partition_results["_reconcile_error"] = str(exc)
             result["phases"]["create_partitions"] = partition_results
+            if (
+                self._config.get("source", {}).get("engine") == "mssql"
+                and self._config.get("target", {}).get("engine") == "mssql"
+                and hasattr(self._source, "inspect_partition_metadata")
+                and hasattr(self._target, "inspect_partition_metadata")
+            ):
+                try:
+                    if partition_source_metadata is None:
+                        partition_source_metadata = self._source.inspect_partition_metadata()
+                    target_partition_metadata = self._target.inspect_partition_metadata()
+                    comparison = _mssql_partition_comparison(
+                        partition_source_metadata, target_partition_metadata
+                    )
+                    result["phases"]["partition_definition_validation"] = {
+                        "comparison_available": True,
+                        **comparison,
+                    }
+                    audit_log(
+                        phase="partition_definition_validation",
+                        status="matches" if comparison["definition_matches"] else "mismatch",
+                        details={"definition_matches": comparison["definition_matches"],
+                                 "mismatches": comparison["mismatches"]},
+                    )
+                    if not comparison["definition_matches"]:
+                        partition_definition_validation_passed = False
+                        failed_mismatch_objects: set[str] = set()
+                        function_mismatches = {
+                            str(item["object"]) for item in comparison["mismatches"]
+                            if item["kind"] == "partition_function"
+                        }
+                        for mismatch in comparison["mismatches"]:
+                            object_name = str(mismatch["object"])
+                            source_definition = mismatch.get("source") or {}
+                            related_function = (
+                                source_definition.get("partition_function_name")
+                                if mismatch["kind"] == "partition_scheme" else None
+                            )
+                            duplicate_scheme_mismatch = (
+                                mismatch["kind"] == "partition_scheme"
+                                and related_function in function_mismatches
+                            )
+                            reconciliation_error = partition_reconcile_errors.get(
+                                str(mismatch.get("table_name") or object_name)
+                            ) or partition_reconcile_errors.get(object_name)
+                            if reconciliation_error:
+                                mismatch["reconciliation_error"] = reconciliation_error
+                                mismatch["reason"] = (
+                                    f"{mismatch['reason']}; safe reconciliation was rejected: "
+                                    f"{reconciliation_error}"
+                                )
+                            elif not partition_reconciliation_enabled:
+                                mismatch["reason"] = (
+                                    f"{mismatch['reason']}; automatic reconciliation is disabled. "
+                                    "Target objects and data were preserved. Enable "
+                                    "migration.reconcile_mssql_partition_functions only for the "
+                                    "supported empty trailing DATE partition case, or reconcile manually."
+                                )
+                            reason = str(mismatch["reason"]).rstrip(". ")
+                            message = (
+                                f"Partition metadata mismatch for {object_name}: {reason}. "
+                                "Target partition objects and data were preserved."
+                            )
+                            if not duplicate_scheme_mismatch:
+                                self._record_object_failure(
+                                    result["phases"]["object_failures"], all_errors,
+                                    "partition_definition_validation", object_name, message,
+                                )
+                            failed_mismatch_objects.add(object_name)
+                            failed_objects.add(str(mismatch.get("table_name") or object_name))
+                            partition_results[f"{mismatch['kind']}:{object_name}"] = {
+                                "status": "mismatch",
+                                "definition_matches": False,
+                                "source": mismatch["source"],
+                                "target": mismatch["target"],
+                                "reason": message,
+                            }
+                        if self._stop_on_error:
+                            raise _PartitionDefinitionError(
+                                "Partition definition validation failed: "
+                                + ", ".join(sorted(failed_mismatch_objects))
+                            )
+                except _PartitionDefinitionError:
+                    raise
+                except Exception as exc:
+                    partition_definition_validation_passed = False
+                    message = f"Partition metadata comparison unavailable: {exc}"
+                    result["phases"]["partition_definition_validation"] = {
+                        "comparison_available": False,
+                        "definition_matches": None,
+                        "error": str(exc),
+                    }
+                    audit_log(
+                        phase="partition_definition_validation", status="unavailable",
+                        details={"comparison_available": False, "definition_matches": None,
+                                 "error": str(exc)},
+                    )
+                    self._record_object_failure(
+                        result["phases"]["object_failures"], all_errors,
+                        "partition_definition_validation", "<partition metadata>", message,
+                    )
+                    if self._stop_on_error:
+                        raise _PartitionDefinitionError(message) from exc
             self._update_status("create_partitions", 17, all_errors)
 
             # ---------- Phase 5: Migrate Data ----------
@@ -360,33 +639,72 @@ class MigrationOrchestrator:
             suspended_triggers = self._target.suspend_triggers_for_data_load(source_triggers)
             result["phases"]["trigger_data_load_handling"] = {
                 "suspended": [t.name for t in suspended_triggers],
-                "strategy": (
-                    "drop-and-recreate-after-data-load"
-                    if suspended_triggers
-                    else "fresh-target-no-triggers"
-                ),
+                "strategy": "disable-and-restore-after-data-load"
+                if suspended_triggers
+                else "fresh-target-no-triggers",
             }
             # Full mode is replacement synchronisation, not an incremental
             # upsert.  Clear every migrated target table before loading so
             # target-only rows (including rows from past trigger side effects)
             # cannot survive a successful run.  Connectors that do not define
             # replacement semantics retain the historical upsert-only behaviour.
-
-            # Determine FK-aware data load order BEFORE clearing/loading data
-            # so cycles are detected early and no data is modified.
-            schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
+            # Order and validate dependencies before clearing target data.
             data_load_order = order_data_load_objects(all_schemas, objects)
             result["phases"]["data_load_order"] = data_load_order
-
-            cleared_objects = self._target.clear_objects_for_full_sync(list(all_schemas))
-            result["phases"]["full_target_sync"] = {
-                "strategy": "clear-before-load",
-                "cleared": cleared_objects,
-            }
-
+            schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
+            schema_preparation_complete = (
+                not mssql_full_reconciliation
+                or (
+                    not failed_objects
+                    and set(all_schemas) == set(objects)
+                    and partition_definition_validation_passed
+                )
+            )
+            if schema_preparation_complete:
+                cleared_objects = self._target.clear_objects_for_full_sync(list(all_schemas))
+                result["phases"]["full_target_sync"] = {
+                    "strategy": "clear-before-load",
+                    "status": "success",
+                    "cleared": cleared_objects,
+                }
+            else:
+                # FULL sync must never delete a parent while one of its
+                # source-managed child tables failed schema preparation and
+                # is therefore absent from the connector's managed set. Keep
+                # the existing target data intact and report the incomplete
+                # precondition explicitly instead of attempting a partial
+                # replacement.
+                missing_schemas = [name for name in objects if name not in all_schemas]
+                result["phases"]["full_target_sync"] = {
+                    "strategy": "clear-before-load",
+                    "status": "skipped",
+                    "cleared": [],
+                    "reason": (
+                        "Source table schema preparation was incomplete; "
+                        "FULL replacement was skipped to preserve target data."
+                    ),
+                    "missing_schemas": missing_schemas,
+                }
+            if (
+                schema_reconciliation_enabled
+                and self._config.get("target", {}).get("engine") == "postgresql"
+            ):
+                try:
+                    result["phases"]["enum_reconciliation"] = (
+                        self._target.reconcile_postgresql_types(
+                            source_types,
+                            list(all_schemas.values()),
+                            postgres_source_views or [],
+                        )
+                    )
+                except Exception as exc:
+                    result["phases"]["enum_reconciliation"] = {"error": str(exc)}
+                    all_errors.append(f"ENUM reconciliation: {exc}")
             total_rows = self._estimate_total_rows(data_load_order, schema_map)
             processed_rows = 0
-            for idx, obj_name in enumerate(data_load_order, start=1):
+            for idx, obj_name in enumerate(
+                data_load_order if schema_preparation_complete else (), start=1
+            ):
                 schema = all_schemas[obj_name]
                 upsert_result = UpsertResult()
                 count: int | None = None
@@ -435,13 +753,28 @@ class MigrationOrchestrator:
                     "failure": max(upsert_result.failure_count, int(obj_name in failed_objects)),
                     "errors": upsert_result.errors,
                 }
+            if not schema_preparation_complete:
+                result["phases"]["data_load"] = {
+                    "status": "skipped",
+                    "reason": result["phases"]["full_target_sync"]["reason"],
+                    "loaded": [],
+                }
 
             # ---------- Phase 6+7+8: Indexes, FKs, Check Constraints ----------
             constraint_results: dict[str, str] = {}
             for obj_name, schema in all_schemas.items():
                 try:
-                    self._target.apply_constraints(schema)
-                    constraint_results[obj_name] = "success"
+                    constraint_errors = self._target.apply_constraints(schema)
+                    if isinstance(constraint_errors, list) and constraint_errors:
+                        constraint_results[obj_name] = "error: " + "; ".join(constraint_errors)
+                        for error in constraint_errors:
+                            self._record_object_failure(
+                                object_failures, all_errors, "apply_constraints",
+                                obj_name, error,
+                            )
+                        failed_objects.add(obj_name)
+                    else:
+                        constraint_results[obj_name] = "success"
                 except Exception as exc:
                     constraint_results[obj_name] = f"error: {exc}"
                     all_errors.append(str(exc))
@@ -472,10 +805,12 @@ class MigrationOrchestrator:
             try:
                 all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
                 for seq in all_sequences:
-                    if seq.owned_by:
+                    if seq.owned_by or self._config.get("target", {}).get("engine") == "postgresql":
                         try:
                             self._target.apply_sequence_ownership(seq)
-                            seq_owner_results[seq.name] = f"owned: {seq.owned_by}"
+                            seq_owner_results[seq.name] = (
+                                f"owned: {seq.owned_by}" if seq.owned_by else "unowned"
+                            )
                         except Exception as exc:
                             seq_owner_results[seq.name] = f"skipped: {exc}"
             except Exception as exc:
@@ -524,6 +859,12 @@ class MigrationOrchestrator:
                             seq_advance_results[tbl].append(f"{seq_qname}: advanced")
                         except Exception as exc:
                             seq_advance_results[tbl].append(f"{seq_qname}: skipped ({exc})")
+                    elif self._config.get("target", {}).get("engine") == "postgresql":
+                        try:
+                            self._target.restore_standalone_sequence_state(seq)
+                            seq_advance_results[seq.name] = ["standalone state restored"]
+                        except Exception as exc:
+                            seq_advance_results[seq.name] = [f"standalone state skipped ({exc})"]
             except Exception as exc:
                 seq_advance_results["_error"] = [str(exc)]
             result["phases"]["advance_sequences"] = seq_advance_results
@@ -532,7 +873,12 @@ class MigrationOrchestrator:
             # ---------- Phase 11: Views ----------
             view_results: dict[str, str] = {}
             try:
-                for view in self._source.list_views():
+                views_to_migrate = (
+                    postgres_source_views
+                    if postgres_source_views is not None
+                    else self._source.list_views()
+                )
+                for view in views_to_migrate:
                     try:
                         self._target.create_view(view)
                         view_results[view.name] = "created"
@@ -552,7 +898,10 @@ class MigrationOrchestrator:
             try:
                 for mv in self._source.list_materialized_views():
                     try:
-                        self._target.create_materialized_view(mv)
+                        if self._config.get("target", {}).get("engine") == "postgresql":
+                            self._target.reconcile_materialized_view(mv)
+                        else:
+                            self._target.create_materialized_view(mv)
                         self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
                         mv_results[mv.name] = "created+refreshed"
                     except Exception as exc:
@@ -576,8 +925,16 @@ class MigrationOrchestrator:
                         func_results[func_key] = "created"
                     except Exception as exc:
                         func_results[func_key] = f"skipped: {exc}"
+                        self._record_object_failure(
+                            object_failures, all_errors, "create_function", func_key, exc
+                        )
+                        failed_objects.add(func_key)
             except Exception as exc:
                 func_results["_error"] = str(exc)
+                self._record_object_failure(
+                    object_failures, all_errors, "list_functions", "<source>", exc
+                )
+                failed_objects.add("<source functions>")
             result["phases"]["functions"] = func_results
             self._update_status("functions", 80, all_errors)
 
@@ -594,8 +951,10 @@ class MigrationOrchestrator:
                         synonym_results[syn_key] = "created"
                     except Exception as exc:
                         synonym_results[syn_key] = f"skipped: {exc}"
+                        all_errors.append(f"synonym {syn_key}: {exc}")
             except Exception as exc:
                 synonym_results["_error"] = str(exc)
+                all_errors.append(f"synonym discovery: {exc}")
             result["phases"]["synonyms"] = synonym_results
             self._update_status("synonyms", 82, all_errors)
 
@@ -609,13 +968,34 @@ class MigrationOrchestrator:
                         else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
                     )
                     try:
-                        self._target.create_trigger(trigger)
-                        trigger_results[trigger_key] = "created"
+                        trigger_created = self._target.create_trigger(trigger)
+                        if trigger_created is False:
+                            message = "trigger parent table missing on target"
+                            trigger_results[trigger_key] = f"skipped: {message}"
+                            self._record_object_failure(
+                                object_failures, all_errors, "create_trigger", trigger_key, message
+                            )
+                            failed_objects.add(trigger_key)
+                        else:
+                            trigger_results[trigger_key] = "created"
                     except Exception as exc:
                         trigger_results[trigger_key] = f"skipped: {exc}"
+                        self._record_object_failure(
+                            object_failures, all_errors, "create_trigger", trigger_key, exc
+                        )
+                        failed_objects.add(trigger_key)
             except Exception as exc:
                 trigger_results["_error"] = str(exc)
+                self._record_object_failure(
+                    object_failures, all_errors, "list_triggers", "<source>", exc
+                )
+                failed_objects.add("<source triggers>")
             result["phases"]["triggers"] = trigger_results
+            if (
+                hasattr(self._target, "complete_trigger_data_load")
+                and all(value == "created" for value in trigger_results.values())
+            ):
+                self._target.complete_trigger_data_load()
             self._update_status("triggers", 85, all_errors)
 
             # ---------- Phase 15.5: Events (MySQL/MariaDB) ----------
@@ -634,8 +1014,10 @@ class MigrationOrchestrator:
 
             # ---------- Phase 16: Comments ----------
             comment_results: dict[str, str] = {}
+            source_comments: list[Any] = []
             try:
-                for comment in self._source.list_comments():
+                source_comments = list(self._source.list_comments())
+                for comment in source_comments:
                     comment_key = (
                         comment.object_name
                         if comment.schema_name == "public"
@@ -646,8 +1028,25 @@ class MigrationOrchestrator:
                         comment_results[comment_key] = "applied"
                     except Exception as exc:
                         comment_results[comment_key] = f"skipped: {exc}"
+                        all_errors.append(f"comment {comment_key}: {exc}")
             except Exception as exc:
                 comment_results["_error"] = str(exc)
+                all_errors.append(f"comment discovery: {exc}")
+            if (
+                schema_reconciliation_enabled
+                and self._config.get("target", {}).get("engine") == "postgresql"
+            ):
+                try:
+                    result["phases"]["column_comment_reconciliation"] = (
+                        self._target.reconcile_postgresql_column_comments(
+                            list(all_schemas.values()), source_comments
+                        )
+                    )
+                except Exception as exc:
+                    result["phases"]["column_comment_reconciliation"] = {
+                        "error": str(exc)
+                    }
+                    all_errors.append(f"Column comment reconciliation: {exc}")
             result["phases"]["comments"] = comment_results
             self._update_status("comments", 88, all_errors)
 
@@ -702,15 +1101,27 @@ class MigrationOrchestrator:
             try:
                 grants = list(self._source.list_grants())
                 # Ensure all grantee roles exist on target before applying grants
-                grantees = {g.grantee for g in grants}
-                for grantee in grantees:
-                    try:
-                        self._target.create_role_if_not_exists(grantee)
-                    except Exception as exc:
-                        grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
+                # Only for engines with role support (not MySQL)
+                target_engine = self._config.get("target", {}).get("engine", "")
+                if target_engine != "mysql":
+                    grantees = {g.grantee for g in grants}
+                    for grantee in grantees:
+                        try:
+                            self._target.create_role_if_not_exists(grantee)
+                        except Exception as exc:
+                            grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
                 for grant in grants:
                     if grant.object_type == "SCHEMA":
                         grant_key = f"{grant.object_name} TO {grant.grantee}"
+                    elif self._config.get("target", {}).get("engine") == "mysql":
+                        target_database = self._config.get("target", {}).get("connection", {}).get("database", "")
+                        if grant.object_type == "GLOBAL":
+                            target_object = "*.*"
+                        elif grant.object_type == "DATABASE":
+                            target_object = f"{target_database}.*"
+                        else:
+                            target_object = f"{target_database}.{grant.object_name.rsplit('.', 1)[-1]}"
+                        grant_key = f"{target_object} TO {grant.grantee}"
                     else:
                         grant_key = (
                             f"{grant.object_name} TO {grant.grantee}"
@@ -723,7 +1134,6 @@ class MigrationOrchestrator:
                     except Exception as exc:
                         grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
                         all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
-                        failed_objects.add(grant_key)
             except Exception as exc:
                 grant_results.append(f"_error: {exc}")
             result["phases"]["grants"] = grant_results
@@ -738,11 +1148,14 @@ class MigrationOrchestrator:
             result["phases"]["validation"] = validation
             if failed_objects:
                 result["status"] = "partial_success" if validation_objects else "failed"
+            elif all_errors:
+                result["status"] = "partial_success"
             else:
                 result["status"] = validation.get("status", "unknown")
             self._update_status("completed", 100, all_errors)
 
         except Exception as exc:
+            traceback.print_exc()
             result["status"] = "failed"
             result["error"] = str(exc)
             audit_log(phase="run_full", status="failed", details={"error": str(exc)})
@@ -751,9 +1164,13 @@ class MigrationOrchestrator:
                 self._notifier.notify({"phase": "run_full", "status": "failed", "details": {"error": str(exc)}})
         finally:
             try:
-                self._source.close()
+                if hasattr(self._target, "restore_suspended_triggers"):
+                    self._target.restore_suspended_triggers()
             finally:
-                self._target.close()
+                try:
+                    self._source.close()
+                finally:
+                    self._target.close()
 
         end_time = time.time()
         audit_log(phase="run_full", status="completed", details={
@@ -768,10 +1185,11 @@ class MigrationOrchestrator:
         config: dict[str, Any],
         resolver: Any = None,
     ) -> None:
-        resolver = resolver or self._secret_resolver
+        # Endpoint-specific resolvers are passed by run_full/run_cdc. Fall back
+        # to the global resolver for callers that do not provide one.
+        resolver = resolver if resolver is not None else self._secret_resolver
         if resolver is None:
             return
-        # password_secret lives under config["connection"], not at the top-level config
         connection_config = config.get("connection", config)
         if "password_secret" in connection_config:
             connector._config["password"] = resolver.resolve(connection_config["password_secret"])
@@ -1124,20 +1542,20 @@ class MigrationOrchestrator:
                     for pf in self._source.list_partition_functions():
                         try:
                             self._target.create_partition_function(pf)
-                            partition_results[pf.name] = "partition function created"
+                            partition_results[pf.name] = f"partition function created"
                         except Exception as exc:
                             partition_results[pf.name] = f"skipped: {exc}"
                     for ps in self._source.list_partition_schemes():
                         try:
                             self._target.create_partition_scheme(ps)
-                            partition_results[ps.name] = "partition scheme created"
+                            partition_results[ps.name] = f"partition scheme created"
                         except Exception as exc:
                             partition_results[ps.name] = f"skipped: {exc}"
                     for pt in self._source.get_partitioned_tables():
                         try:
                             schema = self._source.get_schema(pt.table_name)
                             self._target.create_partitioned_table(schema, pt.partition_scheme_name, pt.partition_column)
-                            partition_results[pt.table_name] = "partitioned table created"
+                            partition_results[pt.table_name] = f"partitioned table created"
                         except Exception as exc:
                             partition_results[pt.table_name] = f"skipped: {exc}"
                 except AttributeError:
@@ -1147,13 +1565,76 @@ class MigrationOrchestrator:
             result["phases"]["create_partitions"] = partition_results
             self._update_status("create_partitions", 16, all_errors)
 
+            if (
+                self._config.get("source", {}).get("engine") == "mssql"
+                and self._config.get("target", {}).get("engine") == "mssql"
+                and hasattr(self._source, "inspect_partition_metadata")
+                and hasattr(self._target, "inspect_partition_metadata")
+            ):
+                try:
+                    comparison = _mssql_partition_comparison(
+                        self._source.inspect_partition_metadata(),
+                        self._target.inspect_partition_metadata(),
+                    )
+                    result["phases"]["partition_definition_validation"] = {
+                        "comparison_available": True, **comparison,
+                    }
+                    audit_log(
+                        phase="partition_definition_validation",
+                        status="matches" if comparison["definition_matches"] else "mismatch",
+                        details={"definition_matches": comparison["definition_matches"],
+                                 "mismatches": comparison["mismatches"]},
+                    )
+                    for mismatch in comparison["mismatches"]:
+                        object_name = str(mismatch["object"])
+                        message = (
+                            f"Partition metadata mismatch for {object_name}: {mismatch['reason']}. "
+                            "Target partition objects and data were preserved; SQL Server partition "
+                            "rebuild is unsupported. Reconcile through an approved maintenance plan."
+                        )
+                        partition_results[f"{mismatch['kind']}:{object_name}"] = {
+                            "status": "mismatch", "definition_matches": False,
+                            "source": mismatch["source"], "target": mismatch["target"],
+                            "reason": message,
+                        }
+                        audit_log(
+                            phase="partition_definition_validation", status="mismatch",
+                            details={"object": object_name, "kind": mismatch["kind"],
+                                     "definition_matches": False, "source": mismatch["source"],
+                                     "target": mismatch["target"], "reason": message},
+                        )
+                        self._record_object_failure(
+                            result["phases"].setdefault("object_failures", []),
+                            all_errors, "partition_definition_validation", object_name, message,
+                        )
+                        failed_objects.add(str(mismatch.get("table_name") or object_name))
+                    if comparison["mismatches"] and self._stop_on_error:
+                        raise _PartitionDefinitionError(
+                            "Partition definition validation failed: " + ", ".join(
+                                sorted(str(item["object"]) for item in comparison["mismatches"])
+                            )
+                        )
+                except _PartitionDefinitionError:
+                    raise
+                except Exception as exc:
+                    message = f"Partition metadata comparison unavailable: {exc}"
+                    result["phases"]["partition_definition_validation"] = {
+                        "comparison_available": False, "definition_matches": None,
+                        "error": str(exc),
+                    }
+                    audit_log(
+                        phase="partition_definition_validation", status="unavailable",
+                        details={"comparison_available": False, "definition_matches": None,
+                                 "error": str(exc)},
+                    )
+                    all_errors.append(message)
+                    if self._stop_on_error:
+                        raise _PartitionDefinitionError(message) from exc
+
             # ---- Phase 5: Initial Data Sync ----
             schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
-
-            # Determine FK-aware data load order
             data_load_order = order_data_load_objects(all_schemas, objects)
             result["phases"]["data_load_order"] = data_load_order
-
             total_rows = self._estimate_total_rows(data_load_order, schema_map)
             processed_rows = 0
             for idx, obj_name in enumerate(data_load_order, start=1):
@@ -1428,11 +1909,6 @@ class MigrationOrchestrator:
             self._update_status("failed", 0, [str(exc)])
             if self._notifier is not None:
                 self._notifier.notify({"phase": "run_cdc", "status": "failed", "details": {"error": str(exc)}})
-        finally:
-            try:
-                self._source.close()
-            finally:
-                self._target.close()
 
         end_time = time.time()
         audit_log(phase="run_cdc", status="completed", details={"status": result.get("status", "unknown"), "duration_s": round(end_time - start_time, 2)})

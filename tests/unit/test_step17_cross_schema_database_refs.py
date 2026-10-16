@@ -69,7 +69,7 @@ def test_apply_constraints_creates_cross_schema_fk():
 def test_apply_constraints_skips_existing_fk_idempotent():
     target, cur = _build_target()
     # First execute returns the FK name as already existing.
-    cur.fetchall.return_value = [("FK_billing_customer_addresses_customers",)]
+    cur.fetchall.return_value = [("FK_billing_customer_addresses_customers", False, False)]
     schema = _customer_addresses_schema(
         foreign_keys=[
             ForeignKey(
@@ -86,6 +86,69 @@ def test_apply_constraints_skips_existing_fk_idempotent():
     executed = [str(c.args[0]) for c in cur.execute.call_args_list]
     fk_sqls = [s for s in executed if "FOREIGN KEY" in s]
     assert fk_sqls == [], f"Existing FK should be skipped, got: {fk_sqls}"
+
+
+def test_apply_constraints_revalidates_disabled_untrusted_source_fk():
+    target, cur = _build_target()
+    cur = target._conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.side_effect = [
+        [],  # unique constraints
+        [("FK_Orders_Customers", True, True)],  # existing FK state
+        [],  # CHECK constraints
+        [],  # DEFAULT constraints
+    ]
+    schema = _customer_addresses_schema(
+        foreign_keys=[ForeignKey(
+            name="FK_Orders_Customers", columns=["CustomerID"],
+            ref_table="Customers", ref_columns=["CustomerID"],
+            ref_schema="training",
+            is_disabled=False, is_not_trusted=False,
+        )]
+    )
+
+    errors = target.apply_constraints(schema)
+
+    statements = [str(call.args[0]) for call in cur.execute.call_args_list]
+    assert errors == []
+    assert (
+        'ALTER TABLE "billing"."customer_addresses" WITH CHECK CHECK CONSTRAINT '
+        '"FK_Orders_Customers"'
+    ) in statements
+    assert not any("ADD CONSTRAINT" in sql and "FK_Orders_Customers" in sql for sql in statements)
+    target._conn.commit.assert_called_once_with()
+
+
+def test_apply_constraints_reports_fk_revalidation_violation():
+    target, cur = _build_target()
+    cur = target._conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.side_effect = [
+        [],
+        [("FK_Orders_Customers", True, True)],
+        [],
+        [],
+    ]
+
+    def execute_side_effect(sql, *args, **kwargs):
+        if "WITH CHECK CHECK CONSTRAINT" in str(sql):
+            raise RuntimeError("The ALTER TABLE statement conflicted with the FOREIGN KEY constraint")
+
+    cur.execute.side_effect = execute_side_effect
+    schema = _customer_addresses_schema(
+        foreign_keys=[ForeignKey(
+            name="FK_Orders_Customers", columns=["CustomerID"],
+            ref_table="Customers", ref_columns=["CustomerID"],
+            ref_schema="training",
+            is_disabled=False, is_not_trusted=False,
+        )]
+    )
+
+    errors = target.apply_constraints(schema)
+
+    assert len(errors) == 1
+    assert "foreign key FK_Orders_Customers" in errors[0]
+    assert "conflicted with the FOREIGN KEY constraint" in errors[0]
+    target._conn.rollback.assert_called_once_with()
+    target._conn.commit.assert_not_called()
 
 
 def test_apply_constraints_composite_fk_groups_columns():

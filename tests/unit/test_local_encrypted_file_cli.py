@@ -5,8 +5,8 @@ import logging
 import pytest
 from cryptography.fernet import Fernet
 
-from core.secrets.factory import create_secret_provider
 from core.secrets.local_encrypted_file import LocalEncryptedFileProvider
+from core.secrets.factory import create_secret_provider
 from migration_platform import secrets_cli
 
 
@@ -115,7 +115,6 @@ def test_cli_keyring_init_set_list_verify_delete_and_reopen(tmp_path, monkeypatc
 
 def test_cli_no_options_uses_windows_local_store_and_keyring(tmp_path, monkeypatch, capsys):
     import keyring
-
     import core.secrets.local_encrypted_file as local_store
 
     keyring_values: dict[tuple[str, str], str] = {}

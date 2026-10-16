@@ -82,6 +82,34 @@ class PostgresSourceConnector(SourceConnector):
         self._conn = psycopg.connect(**_make_conn_kwargs(self._config))
         audit_log(phase="connect", status="success", details={"engine": "postgresql", "role": "source"})
 
+    def get_server_version(self) -> str | None:
+        """Return PostgreSQL server version string."""
+        if self._conn is None:
+            return None
+        try:
+            with self._conn.cursor() as cur:
+                cur.execute("SELECT version()")
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+        except Exception:
+            pass
+        return None
+
+    def close(self) -> None:
+        """Roll back any unfinished read transaction and release the connection."""
+        conn = self._conn
+        if conn is None:
+            return
+        try:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        finally:
+            self._conn = None
+
     # ------------------------------------------------------------------
     # Tables
     # ------------------------------------------------------------------

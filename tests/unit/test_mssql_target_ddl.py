@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import sys
 import os
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -227,9 +228,10 @@ def test_list_all_sequences_extracts_metadata_and_schema_scope():
     source, cur = _mock_sequence_source([
         (
             "seq_invoice_number", "sales", "int", 1000, 10, 1000, 1100,
-            0, 10, 1020, 1,
+            0, 10, 1020, 1, 1020, 0,
         )
     ])
+    cur.fetchone.return_value = (16,)
 
     sequences = source.list_all_sequences()
 
@@ -244,6 +246,9 @@ def test_list_all_sequences_extracts_metadata_and_schema_scope():
     assert seq.cache_size == 10
     assert seq.is_cached is True
     assert seq.last_value == 1020
+    assert seq.last_used_value == 1020
+    assert seq.last_used_value_available is True
+    assert seq.is_exhausted is False
     sql = cur.execute.call_args.args[0]
     params = cur.execute.call_args.args[1]
     assert "sys.sequences" in sql
@@ -255,6 +260,10 @@ def test_list_all_sequences_extracts_metadata_and_schema_scope():
 
 def test_create_sequence_preserves_definition_and_schema_qualification():
     target, cur = _build_target()
+    cur.fetchone.side_effect = [
+        None, (16,), None, None,
+        ("int", 1000, 10, 1000, 1100, False, True, 10, 1000, None, False),
+    ]
     seq = SequenceDef(
         name="seq_invoice_number",
         schema="sales",
@@ -266,7 +275,7 @@ def test_create_sequence_preserves_definition_and_schema_qualification():
         cycle=False,
         cache_size=10,
         is_cached=True,
-        last_value=1020,
+        last_used_value_available=True,
     )
 
     target.create_sequence(seq)
@@ -286,6 +295,10 @@ def test_create_sequence_preserves_definition_and_schema_qualification():
 
 def test_create_sequence_emits_no_cache_when_disabled():
     target, cur = _build_target()
+    cur.fetchone.side_effect = [
+        None, (16,), None, None,
+        ("bigint", 1, 1, 1, 9223372036854775807, False, False, None, 1, None, False),
+    ]
     seq = SequenceDef(
         name="seq_no_cache",
         schema="sales",
@@ -297,6 +310,7 @@ def test_create_sequence_emits_no_cache_when_disabled():
         cycle=False,
         cache_size=1,
         is_cached=False,
+        last_used_value_available=True,
     )
 
     target.create_sequence(seq)
@@ -310,12 +324,17 @@ def test_create_sequence_emits_no_cache_when_disabled():
     assert "CACHE 1" not in ddl
 
 
-def test_create_sequence_skips_when_already_exists():
+def test_create_sequence_reconciles_existing_runtime_state_to_source():
     target, cur = _build_target()
-    cur.fetchone.return_value = (1,)  # sequence already exists
+    cur.fetchone.side_effect = [
+        (16,),
+        ("int", 1000, 10, 1000, 1100, False, True, 10, 1050, 1050, False, 99),
+        (1020,),
+        ("int", 1000, 10, 1000, 1100, False, True, 10, 1020, 1020, False),
+    ]
     seq = SequenceDef(
         name="seq_invoice_number",
-        schema="sales",
+        schema="dbo",
         data_type="int",
         start_value=1000,
         increment=10,
@@ -324,23 +343,80 @@ def test_create_sequence_skips_when_already_exists():
         cycle=False,
         cache_size=10,
         is_cached=True,
+        last_value=1020,
+        last_used_value=1020,
+        last_used_value_available=True,
     )
     target.create_sequence(seq)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
     assert not any(s.upper().startswith("CREATE SEQUENCE") for s in executed)
-    target._conn.commit.assert_not_called()
+    assert not any(s.upper().startswith("DROP SEQUENCE") for s in executed)
+    assert any("RESTART WITH 1000" in s for s in executed)
+    assert any("WHILE @replayed < @replay_count" in s for s in executed)
+    target._conn.commit.assert_called_once()
+
+
+def test_create_sequence_recreates_start_mismatch_and_replays_source_state():
+    target, cur = _build_target()
+    cur.fetchone.side_effect = [
+        None,
+        (16,),
+        ("bigint", 1050, 1, -9223372036854775808, 9223372036854775807,
+         False, True, 10, 1050, 1050, False, 99),
+        (1004,),
+        ("bigint", 1000, 1, -9223372036854775808, 9223372036854775807,
+         False, True, 10, 1004, 1004, False),
+    ]
+    cur.fetchall.return_value = []
+    seq = SequenceDef(
+        name="Seq_OrderNumber", schema="training", data_type="bigint",
+        start_value=1000, increment=1, min_value=-9223372036854775808,
+        max_value=9223372036854775807, cycle=False, cache_size=10,
+        is_cached=True, last_value=1004, last_used_value=1004,
+        last_used_value_available=True,
+    )
+
+    target.create_sequence(seq)
+
+    executed = [str(call.args[0]) for call in cur.execute.call_args_list if call.args]
+    assert any(sql.startswith("DROP SEQUENCE") for sql in executed)
+    assert any(sql.startswith("CREATE SEQUENCE") and "START WITH 1000" in sql for sql in executed)
+    assert any("RESTART WITH 1000" in sql for sql in executed)
+    assert any("WHILE @replayed < @replay_count" in sql for sql in executed)
+    assert target._conn.commit.call_count == 1
+
+
+def test_create_sequence_with_matching_definition_and_state_is_idempotent():
+    target, cur = _build_target()
+    cur.fetchone.side_effect = [
+        None,
+        (16,),
+        ("bigint", 1000, 1, 1, 9999, False, True, 10, 1004, 1004, False, 99),
+        ("bigint", 1000, 1, 1, 9999, False, True, 10, 1004, 1004, False),
+    ]
+    seq = SequenceDef(
+        name="Seq_OrderNumber", schema="training", data_type="bigint",
+        start_value=1000, increment=1, min_value=1, max_value=9999,
+        cycle=False, cache_size=10, is_cached=True, last_value=1004,
+        last_used_value=1004, last_used_value_available=True,
+    )
+
+    target.create_sequence(seq)
+
+    executed = [str(call.args[0]) for call in cur.execute.call_args_list if call.args]
+    assert not any("ALTER SEQUENCE" in sql for sql in executed)
+    assert not any("DROP SEQUENCE" in sql for sql in executed)
+    assert not any("CREATE SEQUENCE" in sql for sql in executed)
+    target._conn.commit.assert_called_once()
 
 
 def test_create_sequence_rolls_back_and_reraises_on_failure():
     target, cur = _build_target()
-    # schema exists, sequence doesn't exist -> CREATE SEQUENCE (fails)
-    call_count = [0]
     def execute_side_effect(*args, **kwargs):
-        call_count[0] += 1
-        if call_count[0] == 2:  # Second call is CREATE SEQUENCE
+        if str(args[0]).upper().startswith("CREATE SEQUENCE"):
             raise RuntimeError("permission denied")
     cur.execute.side_effect = execute_side_effect
-    cur.fetchone.return_value = None  # sequence doesn't exist
+    cur.fetchone.side_effect = [(16,), None, None]  # version, target absent, type conflict absent
 
     seq = SequenceDef(
         name="seq_bad",
@@ -367,6 +443,7 @@ def test_create_sequence_rolls_back_and_reraises_on_failure():
 def _build_target_with_indexes() -> tuple[MSSQLTargetConnector, MagicMock]:
     cur = MagicMock()
     cur.fetchone.return_value = None
+    cur.fetchall.return_value = []
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
     conn.cursor.return_value.__exit__.return_value = False
@@ -375,6 +452,101 @@ def _build_target_with_indexes() -> tuple[MSSQLTargetConnector, MagicMock]:
     )
     target._conn = conn
     return target, cur
+
+
+def test_apply_constraints_replaces_mismatched_standalone_index_definition():
+    target, cur = _build_target_with_indexes()
+    cur.fetchall.side_effect = [
+        [(False, "([IsActive]=(1))", "Status", 1, False, False, False, False)],
+            [], [], [], [],
+    ]
+    schema = Schema(
+        name="customers", schema_name="training", columns=[], primary_key=[],
+        indexes=[Index(
+            name="IX_Customers_City", columns=["City"], unique=False,
+            included_columns=["FullName"], filter_definition=None,
+            ddl="CREATE INDEX IX_Customers_City ON [training].[customers] ([City]) INCLUDE ([FullName])",
+        )],
+    )
+
+    errors = target.apply_constraints(schema)
+
+    statements = [str(call.args[0]) for call in cur.execute.call_args_list]
+    assert not errors
+    assert any(sql == 'DROP INDEX "IX_Customers_City" ON "training"."customers"' for sql in statements)
+    assert any(sql.startswith("CREATE INDEX IX_Customers_City") for sql in statements)
+
+
+def test_full_reconciliation_drops_only_target_only_indexes_on_managed_table():
+    target, cur = _build_target_with_indexes()
+    cur.fetchall.return_value = [
+        ("IX_Task4_TargetOnly_Customers_City",),
+        ("IX_Customers_Email",),
+    ]
+    schema = Schema(
+        name="Customers", schema_name="training", columns=[], primary_key=[],
+        indexes=[Index(
+            name="IX_Customers_Email", columns=["Email"],
+            ddl="CREATE INDEX IX_Customers_Email ON [training].[Customers] ([Email])",
+        )],
+    )
+
+    with patch("core.connectors.mssql.target._mssql_table.create_table"), patch(
+        "core.connectors.mssql.target._mssql_table.reconcile_table_columns",
+        return_value={"dropped_columns": [], "altered_columns": []},
+    ):
+        target.reconcile_mssql_table(schema)
+
+    statements = [str(call.args[0]) for call in cur.execute.call_args_list]
+    assert 'DROP INDEX "IX_Task4_TargetOnly_Customers_City" ON "training"."Customers"' in statements
+    assert not any('DROP INDEX "IX_Customers_Email"' in sql for sql in statements)
+    assert any("OBJECT_ID(?)" in sql for sql in statements)
+    target._conn.commit.assert_called_once_with()
+
+
+def test_apply_constraints_never_drops_constraint_backed_index():
+    target, cur = _build_target_with_indexes()
+    cur.fetchall.side_effect = [
+        [(True, None, "CustomerID", 1, False, False, True, False)],
+            [], [], [], [],
+    ]
+    schema = Schema(
+        name="customers", schema_name="training", columns=[], primary_key=[],
+        indexes=[Index(
+            name="PK_Customers", columns=["CustomerID"], unique=False,
+            ddl="CREATE INDEX PK_Customers ON [training].[customers] ([CustomerID])",
+        )],
+    )
+
+    errors = target.apply_constraints(schema)
+
+    statements = [str(call.args[0]) for call in cur.execute.call_args_list]
+    assert len(errors) == 1
+    assert "backs a primary-key or unique constraint" in errors[0]
+    assert not any("DROP INDEX" in sql for sql in statements)
+    assert not any(sql.startswith("CREATE INDEX PK_Customers") for sql in statements)
+
+
+def test_apply_constraints_skips_matching_index_definition():
+    target, cur = _build_target_with_indexes()
+    cur.fetchall.side_effect = [
+        [(False, None, "City", 1, False, False, False, False)],
+            [], [], [], [],
+    ]
+    schema = Schema(
+        name="customers", schema_name="training", columns=[], primary_key=[],
+        indexes=[Index(
+            name="IX_Customers_City", columns=["City"],
+            ddl="CREATE INDEX IX_Customers_City ON [training].[customers] ([City])",
+        )],
+    )
+
+    errors = target.apply_constraints(schema)
+
+    statements = [str(call.args[0]) for call in cur.execute.call_args_list]
+    assert not errors
+    assert not any("DROP INDEX" in sql for sql in statements)
+    assert not any(sql.startswith("CREATE INDEX IX_Customers_City") for sql in statements)
 
 
 def test_apply_constraints_creates_normal_index():
@@ -392,7 +564,7 @@ def test_apply_constraints_creates_normal_index():
     )
     target.apply_constraints(schema)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list]
-    idx_sql = next(s for s in executed if "INDEX" in s.upper())
+    idx_sql = next(s for s in executed if s.lstrip().upper().startswith("CREATE "))
     assert "IX_sales_orders_customer_id" in idx_sql
     assert "sales" in idx_sql
     assert "orders" in idx_sql
@@ -414,7 +586,7 @@ def test_apply_constraints_creates_composite_asc_desc():
     )
     target.apply_constraints(schema)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list]
-    idx_sql = next(s for s in executed if "INDEX" in s.upper())
+    idx_sql = next(s for s in executed if s.lstrip().upper().startswith("CREATE "))
     assert "customer_id" in idx_sql
     assert "status" in idx_sql
 
@@ -434,7 +606,7 @@ def test_apply_constraints_creates_unique_index():
     )
     target.apply_constraints(schema)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list]
-    idx_sql = next(s for s in executed if "INDEX" in s.upper())
+    idx_sql = next(s for s in executed if s.lstrip().upper().startswith("CREATE "))
     assert "UNIQUE INDEX" in idx_sql
     assert "UX_billing_customer_addresses_postal_city" in idx_sql
 
@@ -454,7 +626,7 @@ def test_apply_constraints_creates_filtered_index():
     )
     target.apply_constraints(schema)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list]
-    idx_sql = next(s for s in executed if "INDEX" in s.upper())
+    idx_sql = next(s for s in executed if s.lstrip().upper().startswith("CREATE "))
     assert "WHERE" in idx_sql
     assert "PAID" in idx_sql
 
@@ -475,7 +647,7 @@ def test_apply_constraints_creates_include_index():
     )
     target.apply_constraints(schema)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list]
-    idx_sql = next(s for s in executed if "INDEX" in s.upper())
+    idx_sql = next(s for s in executed if s.lstrip().upper().startswith("CREATE "))
     assert "INCLUDE" in idx_sql
     assert "amount" in idx_sql
     assert "created_at" in idx_sql
@@ -496,7 +668,7 @@ def test_apply_constraints_executes_ddl_directly():
     )
     target.apply_constraints(schema)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list]
-    idx_sql = next(s for s in executed if "INDEX" in s.upper())
+    idx_sql = next(s for s in executed if s.lstrip().upper().startswith("CREATE "))
     assert "IF NOT EXISTS" not in idx_sql
 
 
@@ -528,6 +700,7 @@ def test_create_view_creates_schema_and_view():
         schema_name="sales",
         definition="SELECT customer_id, COUNT(*) AS order_count FROM \"sales\".\"orders\" GROUP BY customer_id",
     )
+    cur.fetchone.return_value = None
     target.create_view(view)
 
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
@@ -540,6 +713,7 @@ def test_create_view_creates_schema_and_view():
 
 def test_create_view_dbo_skips_schema_creation():
     target, cur = _build_target()
+    cur.fetchone.return_value = None
     view = ViewDefinition(
         name="v_order_totals",
         schema_name="dbo",
@@ -556,6 +730,7 @@ def test_create_view_dbo_skips_schema_creation():
 
 def test_create_view_none_schema_defaults_to_dbo():
     target, cur = _build_target()
+    cur.fetchone.return_value = None
     view = ViewDefinition(name="v_default", schema_name=None, definition="SELECT 1 AS one")
     target.create_view(view)
 
@@ -581,6 +756,7 @@ def test_create_view_strips_newline_separated_create_view_prefix():
             "FROM dbo.Customers AS c"
         ),
     )
+    cur.fetchone.return_value = None
     target.create_view(view)
 
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
@@ -599,6 +775,7 @@ def test_create_view_does_not_strip_as_inside_identifier():
         schema_name="dbo",
         definition="CREATE VIEW dbo.vw_OrderASAP AS SELECT 1 AS n",
     )
+    cur.fetchone.return_value = None
     target.create_view(view)
 
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
@@ -620,6 +797,7 @@ def test_create_view_strips_full_create_view_prefix():
         schema_name="sales",
         definition="CREATE VIEW sales.v_order_customer_summary AS SELECT o.order_id FROM sales.orders AS o",
     )
+    cur.fetchone.return_value = None
     target.create_view(view)
 
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
@@ -631,7 +809,8 @@ def test_create_view_strips_full_create_view_prefix():
 
 def test_create_view_rolls_back_and_reraises_on_failure():
     target, cur = _build_target()
-    cur.execute.side_effect = RuntimeError("invalid view definition")
+    cur.fetchone.return_value = None
+    cur.execute.side_effect = [None, RuntimeError("invalid view definition")]
     view = ViewDefinition(name="v_bad", schema_name="dbo", definition="NOT A VALID SELECT")
 
     with pytest.raises(RuntimeError):
@@ -641,6 +820,65 @@ def test_create_view_rolls_back_and_reraises_on_failure():
     assert any(s.upper().startswith("CREATE OR ALTER VIEW") for s in executed)
     target._conn.rollback.assert_called_once()
     target._conn.commit.assert_not_called()
+
+
+def test_schema_bound_indexed_view_recreated_with_unique_clustered_index():
+    target, cur = _build_target()
+    cur.fetchone.return_value = None
+    cur.fetchall.return_value = []
+    view = ViewDefinition(
+        name="schema_bound_aggregate", schema_name="training",
+        definition="SELECT [training].[Base].[Code], COUNT_BIG(*) AS [Rows] FROM [training].[Base] GROUP BY [training].[Base].[Code]",
+        is_schema_bound=True,
+        indexes=[Index(
+            name="CIX_schema_bound_aggregate", columns=["Code"], unique=True,
+            index_type="CLUSTERED",
+            ddl='CREATE UNIQUE CLUSTERED INDEX "CIX_schema_bound_aggregate" ON "training"."schema_bound_aggregate"("Code" ASC)',
+        )],
+    )
+    target.create_view(view)
+    statements = [str(call.args[0]) for call in cur.execute.call_args_list if call.args]
+    view_ddl = next(sql for sql in statements if sql.startswith("CREATE OR ALTER VIEW"))
+    index_ddl = next(sql for sql in statements if sql.startswith("CREATE UNIQUE CLUSTERED INDEX"))
+    assert "WITH SCHEMABINDING AS" in view_ddl
+    assert statements.index(view_ddl) < statements.index(index_ddl)
+    assert "ON \"training\".\"schema_bound_aggregate\"" in index_ddl
+    assert any("OBJECT_ID(?)" in sql and "sys.indexes" in sql for sql in statements)
+
+
+def test_mssql_source_discovery_preserves_schema_binding_and_view_index():
+    cur = MagicMock()
+    cur.fetchall.side_effect = [
+        [("schema_bound_aggregate", "training", "SELECT 1", True)],
+        [("CIX_schema_bound_aggregate", True, 1, 1, False, "Code")],
+    ]
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__.return_value = cur
+    conn.cursor.return_value.__exit__.return_value = False
+    source = MSSQLSourceConnector({"include_schemas": ["training"]})
+    source._conn = conn
+    [view] = source.list_views()
+    assert view.is_schema_bound is True
+    assert len(view.indexes) == 1
+    assert view.indexes[0].name == "CIX_schema_bound_aggregate"
+    assert view.indexes[0].index_type == "CLUSTERED"
+    assert view.indexes[0].unique is True
+    assert view.indexes[0].columns == ["Code"]
+    assert "CREATE UNIQUE CLUSTERED INDEX" in view.indexes[0].ddl
+
+
+def test_view_ddl_preserves_required_schema_binding_syntax():
+    target, cur = _build_target()
+    cur.fetchone.return_value = None
+    target.create_view(ViewDefinition(
+        name="v_bound", schema_name="training", definition="SELECT 1 AS value",
+        is_schema_bound=True,
+    ))
+    ddl = next(
+        str(call.args[0]) for call in cur.execute.call_args_list
+        if str(call.args[0]).startswith("CREATE OR ALTER VIEW")
+    )
+    assert ddl == "CREATE OR ALTER VIEW [training].[v_bound] WITH SCHEMABINDING AS SELECT 1 AS value"
 
 
 def _mock_source_with_functions(rows):
@@ -658,8 +896,8 @@ def test_list_functions_discovers_scalar_function_and_procedure():
     fn_def = "CREATE FUNCTION sales.fn_customer_order_count(@cust_id INT)\nRETURNS INT\nAS\nBEGIN\n  RETURN 1;\nEND"
     proc_def = "CREATE PROCEDURE sales.sp_get_customer_orders(@cust_id INT)\nAS\nBEGIN\n  SET NOCOUNT ON;\n  SELECT 1;\nEND"
     source, cur = _mock_source_with_functions([
-        ("sales", "fn_customer_order_count", fn_def),
-        ("sales", "sp_get_customer_orders", proc_def),
+        ("sales", "fn_customer_order_count", fn_def, "FN"),
+        ("sales", "sp_get_customer_orders", proc_def, "P"),
     ])
 
     funcs = source.list_functions()
@@ -668,15 +906,42 @@ def test_list_functions_discovers_scalar_function_and_procedure():
     assert funcs[0].name == "fn_customer_order_count"
     assert funcs[0].schema_name == "sales"
     assert funcs[0].ddl == fn_def
+    assert funcs[0].kind == "function"
     assert funcs[1].name == "sp_get_customer_orders"
     assert funcs[1].schema_name == "sales"
     assert funcs[1].ddl == proc_def
+    assert funcs[1].kind == "procedure"
     # Must query sys.objects + sys.sql_modules for FN, TF, IF, P types
     sql = cur.execute.call_args.args[0]
     assert "sys.objects" in sql
     assert "sys.sql_modules" in sql
     assert "'FN'" in sql
     assert "'P'" in sql
+
+
+def test_discovered_usp_get_customer_orders_keeps_procedure_kind_through_target_ddl():
+    proc_def = (
+        "-- source module header\n"
+        "CREATE PROCEDURE [legacy].[usp_GetCustomerOrders] AS "
+        "BEGIN SET NOCOUNT ON; SELECT 1; END"
+    )
+    source, _ = _mock_source_with_functions([
+        # sys.objects.type is a fixed-width catalog field; drivers may return
+        # its one-character procedure code padded to the declared width.
+        ("training", "usp_GetCustomerOrders", proc_def, "P "),
+    ])
+    discovered = source.list_functions()
+    assert len(discovered) == 1
+    assert discovered[0].kind == "procedure"
+
+    target, cur = _build_target()
+    cur.fetchone.return_value = None
+    target.create_function(discovered[0])
+    emitted = [str(call.args[0]) for call in cur.execute.call_args_list if call.args]
+    procedure_ddl = next(sql for sql in emitted if "CREATE OR ALTER PROCEDURE" in sql)
+    assert procedure_ddl.startswith("-- source module header\nCREATE OR ALTER PROCEDURE")
+    assert "[training].[usp_GetCustomerOrders]" in procedure_ddl
+    assert "CREATE OR ALTER FUNCTION" not in procedure_ddl
 
 
 def test_list_functions_uses_schema_filter_from_config():
@@ -691,6 +956,7 @@ def test_list_functions_uses_schema_filter_from_config():
 
 def test_create_function_emits_create_or_alter_function():
     target, cur = _build_target()
+    cur.fetchone.return_value = None
     func = FunctionDef(
         name="fn_customer_order_count",
         schema_name="sales",
@@ -702,15 +968,17 @@ def test_create_function_emits_create_or_alter_function():
     assert any(s.startswith("CREATE SCHEMA") for s in executed)
     ddl_sql = next(s for s in executed if "FUNCTION" in s.upper())
     assert ddl_sql.startswith("CREATE OR ALTER FUNCTION")
-    assert "sales.fn_customer_order_count" in ddl_sql
+    assert "[sales].[fn_customer_order_count]" in ddl_sql
     target._conn.commit.assert_called_once()
 
 
 def test_create_function_emits_create_or_alter_procedure():
     target, cur = _build_target()
+    cur.fetchone.return_value = None
     func = FunctionDef(
         name="sp_get_customer_orders",
         schema_name="sales",
+        kind="procedure",
         ddl="CREATE PROCEDURE sales.sp_get_customer_orders(@cust_id INT)\nAS\nBEGIN\n  SET NOCOUNT ON;\n  SELECT 1;\nEND",
     )
     target.create_function(func)
@@ -719,8 +987,52 @@ def test_create_function_emits_create_or_alter_procedure():
     assert any(s.startswith("CREATE SCHEMA") for s in executed)
     ddl_sql = next(s for s in executed if "PROCEDURE" in s.upper())
     assert ddl_sql.startswith("CREATE OR ALTER PROCEDURE")
-    assert "sales.sp_get_customer_orders" in ddl_sql
+    assert "[sales].[sp_get_customer_orders]" in ddl_sql
+    assert "[sales].[sp_get_customer_orders]" in ddl_sql
     target._conn.commit.assert_called_once()
+
+
+@pytest.mark.parametrize(("schema", "name", "kind", "source", "expected"), [
+    ("training", "fn_CalculateTax", "function", "CREATE FUNCTION training.fn_CalculateTax(@amount DECIMAL(10,2)) RETURNS DECIMAL(10,2) AS BEGIN RETURN 1; END", "CREATE OR ALTER FUNCTION [training].[fn_CalculateTax]"),
+    ("training", "fn_CustomerOrderStats", "function", "CREATE FUNCTION [training].[fn_CustomerOrderStats](@customer_id INT) RETURNS TABLE AS RETURN (SELECT 1 AS id)", "CREATE OR ALTER FUNCTION [training].[fn_CustomerOrderStats]"),
+    ("training", "usp_GetCustomerOrders", "procedure", "CREATE PROCEDURE training.usp_GetCustomerOrders AS BEGIN SET NOCOUNT ON; SELECT 1; END", "CREATE OR ALTER PROCEDURE [training].[usp_GetCustomerOrders]"),
+])
+def test_create_function_normalizes_catalogued_schema_name_and_object_type(schema, name, kind, source, expected):
+    target, cur = _build_target()
+    target.create_function(FunctionDef(name=name, schema_name=schema, kind=kind, ddl=source))
+    emitted = [str(call.args[0]) for call in cur.execute.call_args_list if call.args]
+    assert any(sql.startswith(expected) for sql in emitted)
+
+
+def test_create_function_normalizes_comment_prefixed_double_quoted_identifiers():
+    target, cur = _build_target()
+    ddl = (
+        "-- source comment mentioning CREATE FUNCTION must not be parsed as the header\n"
+        "/* outer comment /* nested comment */ remains a comment */\n"
+        'CREATE FUNCTION "old_schema"."old_fn"() RETURNS INT AS BEGIN RETURN 1; END'
+    )
+    target.create_function(FunctionDef(
+        name="fn_quoted",
+        schema_name="training",
+        kind="function",
+        ddl=ddl,
+    ))
+    emitted = [str(call.args[0]) for call in cur.execute.call_args_list if call.args]
+    function_ddl = next(sql for sql in emitted if "CREATE OR ALTER FUNCTION" in sql)
+    assert function_ddl.startswith(
+        "-- source comment mentioning CREATE FUNCTION must not be parsed as the header\n"
+        "/* outer comment /* nested comment */ remains a comment */\n"
+        "CREATE OR ALTER FUNCTION [training].[fn_quoted]"
+    )
+    assert "RETURNS INT AS BEGIN RETURN 1; END" in function_ddl
+
+
+def test_create_function_rejects_wrong_module_type():
+    target, cur = _build_target()
+    func = FunctionDef(name="usp_wrong", schema_name="training", kind="procedure", ddl="CREATE FUNCTION training.usp_wrong() RETURNS INT AS BEGIN RETURN 1; END")
+    with pytest.raises(ValueError, match="Expected CREATE PROCEDURE"):
+        target.create_function(func)
+    assert not any("CREATE OR ALTER" in str(call.args[0]) for call in cur.execute.call_args_list if call.args)
 
 
 def test_create_function_dbo_skips_schema_creation():
@@ -736,12 +1048,13 @@ def test_create_function_dbo_skips_schema_creation():
     assert not any(s.startswith("CREATE SCHEMA") for s in executed)
     ddl_sql = next(s for s in executed if "FUNCTION" in s.upper())
     assert ddl_sql.startswith("CREATE OR ALTER FUNCTION")
-    assert "dbo.fn_simple" in ddl_sql
+    assert "[dbo].[fn_simple]" in ddl_sql
 
 
 def test_create_function_rolls_back_and_reraises_on_failure():
     target, cur = _build_target()
-    cur.execute.side_effect = RuntimeError("dependency missing")
+    cur.fetchone.return_value = None
+    cur.execute.side_effect = [None, RuntimeError("dependency missing")]
     func = FunctionDef(
         name="fn_bad",
         schema_name="dbo",
@@ -1050,6 +1363,7 @@ def _build_partition_target() -> tuple[MSSQLTargetConnector, MagicMock]:
 
 def test_create_partition_function():
     target, cur = _build_partition_target()
+    cur.fetchall.return_value = []
     pf = PartitionFunctionDef(
         name="pf_sales_date",
         schema_name="dbo",
@@ -1076,7 +1390,7 @@ def test_create_partition_function():
 
 def test_create_partition_function_exists_skips():
     target, cur = _build_partition_target()
-    cur.fetchone.return_value = (1,)
+    cur.fetchall.return_value = [(True, "datetime2", None, 27, 7, datetime(2024, 1, 1), 2, 1)]
     pf = PartitionFunctionDef(name="pf_sales_date", boundaries=[datetime(2024, 1, 1)], range_desc="RANGE RIGHT")
     target.create_partition_function(pf)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
@@ -1086,6 +1400,7 @@ def test_create_partition_function_exists_skips():
 
 def test_create_partition_scheme():
     target, cur = _build_partition_target()
+    cur.fetchall.return_value = []
     ps = PartitionSchemeDef(
         name="ps_sales_date",
         schema_name="dbo",
@@ -1104,12 +1419,125 @@ def test_create_partition_scheme():
 
 def test_create_partition_scheme_exists_skips():
     target, cur = _build_partition_target()
-    cur.fetchone.return_value = (1,)
+    cur.fetchall.return_value = [("ps_sales_date", "pf_sales_date", "PRIMARY", 1, 1)]
     ps = PartitionSchemeDef(name="ps_sales_date", partition_function_name="pf_sales_date", filegroups=["PRIMARY"])
     target.create_partition_scheme(ps)
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
     assert not any("CREATE PARTITION SCHEME" in s for s in executed)
     target._conn.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "target_boundaries",
+    [
+        [datetime(2024, 1, 1), datetime(2025, 1, 1), datetime(2026, 1, 1)],
+        [datetime(2024, 1, 1)],
+    ],
+    ids=["extra-target-boundary", "missing-target-boundary"],
+)
+def test_partition_function_mismatch_fails_safely(target_boundaries):
+    target, cur = _build_partition_target()
+    cur.fetchall.return_value = [
+        (True, "datetime2", None, 27, 7, boundary, len(target_boundaries) + 1, ordinal)
+        for ordinal, boundary in enumerate(target_boundaries, start=1)
+    ]
+    pf = PartitionFunctionDef(
+        name="pf_sales_date", data_type="datetime2",
+        boundaries=[datetime(2024, 1, 1), datetime(2025, 1, 1)],
+        range_desc="RANGE RIGHT",
+    )
+    with pytest.raises(RuntimeError, match="differs from source definition"):
+        target.create_partition_function(pf)
+    assert not any("ALTER PARTITION FUNCTION" in str(c.args[0]) for c in cur.execute.call_args_list)
+    target._conn.commit.assert_not_called()
+
+
+def test_partition_scheme_mismatch_fails_safely():
+    target, cur = _build_partition_target()
+    cur.fetchall.return_value = [
+        ("ps_sales_date", "pf_other", "PRIMARY", 1, 1),
+        ("ps_sales_date", "pf_other", "FG2", 2, 2),
+    ]
+    ps = PartitionSchemeDef(
+        name="ps_sales_date", partition_function_name="pf_sales_date",
+        filegroups=["PRIMARY", "PRIMARY"],
+    )
+    with pytest.raises(RuntimeError, match="differs from source definition"):
+        target.create_partition_scheme(ps)
+    target._conn.commit.assert_not_called()
+
+
+def test_view_creation_replaces_dependency_free_procedure_conflict():
+    target, cur = _build_partition_target()
+    # sys.objects.type is CHAR(2); pyodbc returns its trailing padding.
+    cur.fetchone.side_effect = [(1,), (99, "P ", "SQL_STORED_PROCEDURE"), None]
+    cur.fetchall.return_value = []
+    view = ViewDefinition(name="Task4_Conflict_Test", schema_name="training", definition="SELECT 1 AS id")
+    target.create_view(view)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert any(s.startswith("DROP PROCEDURE [training].[Task4_Conflict_Test]") for s in executed)
+    assert any(s.startswith("CREATE OR ALTER VIEW [training].[Task4_Conflict_Test]") for s in executed)
+    target._conn.commit.assert_called_once()
+
+
+def test_view_creation_rejects_procedure_with_known_sql_dependency():
+    target, cur = _build_partition_target()
+    cur.fetchone.side_effect = [(1,), (99, "P ", "SQL_STORED_PROCEDURE"), None]
+    cur.fetchall.side_effect = [
+        [("training", "usp_uses_conflict", "SQL_STORED_PROCEDURE", False)],
+        [], [], [], [],
+    ]
+    view = ViewDefinition(name="Task4_Conflict_Test", schema_name="training", definition="SELECT 1 AS id")
+    with pytest.raises(RuntimeError, match="dependency review found: SQL dependency training.usp_uses_conflict"):
+        target.create_view(view)
+    executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
+    assert not any(s.startswith("DROP PROCEDURE") for s in executed)
+    assert not any(s.startswith("CREATE OR ALTER VIEW") for s in executed)
+    target._conn.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("kind", "target_type", "should_fail"),
+    [
+        ("procedure", "VIEW", True),
+        ("function", "SQL_STORED_PROCEDURE", True),
+        ("procedure", "SQL_STORED_PROCEDURE", False),
+    ],
+)
+def test_function_creation_checks_existing_object_type(kind, target_type, should_fail):
+    target, cur = _build_partition_target()
+    cur.fetchone.return_value = (target_type,)
+    expected = "PROCEDURE" if kind == "procedure" else "FUNCTION"
+    func = FunctionDef(
+        name="Task4_Routine", schema_name="training", kind=kind,
+        ddl=f"CREATE {expected} [training].[Task4_Routine] AS RETURN 1",
+    )
+    if should_fail:
+        with pytest.raises(RuntimeError, match="target contains"):
+            target.create_function(func)
+        assert not any("CREATE OR ALTER" in str(c.args[0]) for c in cur.execute.call_args_list)
+        target._conn.commit.assert_not_called()
+    else:
+        target.create_function(func)
+        assert any("CREATE OR ALTER PROCEDURE" in str(c.args[0]) for c in cur.execute.call_args_list)
+
+
+@pytest.mark.parametrize(
+    ("current", "maximum", "expected_restart"),
+    [(40, 50, 51), (51, 50, None), (80, 50, None)],
+    ids=["below-data-max", "equal-next-value", "target-ahead"],
+)
+def test_mssql_sequence_advancement_never_rewinds(current, maximum, expected_restart):
+    target, cur = _build_partition_target()
+    cur.fetchone.return_value = (current, 1, maximum)
+    target.advance_sequence("training.Seq_OrderNumber", "Orders", "OrderNumber", "training.Orders.OrderNumber")
+    statements = [str(call.args[0]) for call in cur.execute.call_args_list]
+    restarts = [s for s in statements if "RESTART WITH" in s]
+    if expected_restart is None:
+        assert not restarts
+    else:
+        assert restarts == [f'ALTER SEQUENCE "training"."Seq_OrderNumber" RESTART WITH {expected_restart}']
+    target._conn.commit.assert_called_once()
 
 
 def _partitioned_orders_schema() -> Schema:
@@ -1140,19 +1568,22 @@ def test_create_partitioned_table():
     target._conn.commit.assert_called_once()
 
 
-def test_create_partitioned_table_exists_skips():
+def test_create_partitioned_table_existing_unpartitioned_table_fails_safely():
     target, cur = _build_partition_target()
     cur.fetchone.return_value = (1,)
+    cur.fetchall.return_value = []
     schema = _partitioned_orders_schema()
-    target.create_partitioned_table(schema, "pf_sales_date", "order_date")
+    with pytest.raises(RuntimeError, match="not bound to partition scheme"):
+        target.create_partitioned_table(schema, "ps_sales_date", "order_date")
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
     assert not any("CREATE TABLE" in s for s in executed)
+    assert any("sys.partition_schemes" in s for s in executed)
     target._conn.commit.assert_not_called()
 
 
 def test_create_partition_function_rolls_back_and_reraises_on_failure():
     target, cur = _build_partition_target()
-    cur.fetchone.return_value = None  # function doesn't exist
+    cur.fetchall.return_value = []  # function doesn't exist
     cur.execute.side_effect = [None, RuntimeError("permission denied")]
     pf = PartitionFunctionDef(
         name="pf_bad",
@@ -1173,7 +1604,7 @@ def test_create_partition_function_rolls_back_and_reraises_on_failure():
 
 def test_create_partition_scheme_rolls_back_and_reraises_on_failure():
     target, cur = _build_partition_target()
-    cur.fetchone.return_value = None  # scheme doesn't exist
+    cur.fetchall.return_value = []  # scheme doesn't exist
     cur.execute.side_effect = [None, RuntimeError("permission denied")]
     ps = PartitionSchemeDef(
         name="ps_bad",
@@ -1215,7 +1646,7 @@ def test_create_partitioned_table_rolls_back_and_reraises_on_failure():
         target.create_partitioned_table(schema, "pf_sales_date", "order_date")
 
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
-    assert any("CREATE TABLE" in s and "pf_sales_date" in s for s in executed)
+    assert any("CREATE TABLE" in s for s in executed)
     target._conn.rollback.assert_called_once()
     target._conn.commit.assert_not_called()
 
@@ -1244,15 +1675,16 @@ def test_create_partitioned_table_fresh_target_bug():
     cur.reset_mock()
     target._conn.commit.reset_mock()
 
-    # Simulate Phase 4.5: partition function/scheme created, then create_partitioned_table called
-    # Note: create_partitioned_table checks INFORMATION_SCHEMA.TABLES, which will now return the table
+    # Simulate Phase 4.5 after regular-table creation. Existing table is reported
+    # as an explicit mismatch, and its data/object is left untouched.
     cur.fetchone.return_value = (1,)  # Table exists from Phase 4
-    target.create_partitioned_table(schema, "pf_sales_date", "order_date")
+    cur.fetchall.return_value = []
+    with pytest.raises(RuntimeError, match="not bound to partition scheme"):
+        target.create_partitioned_table(schema, "ps_sales_date", "order_date")
 
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
 
-    # BUG: No CREATE TABLE with ON partition_function is executed
-    # The table remains a regular table, not partitioned
+    # No replacement DDL is attempted; the mismatch is explicit and non-destructive.
     assert not any("CREATE TABLE" in s and "pf_sales_date" in s for s in executed)
     # No commit because create_partitioned_table skipped
     target._conn.commit.assert_not_called()
@@ -1267,9 +1699,9 @@ def test_create_partitioned_table_fresh_target_bug():
 def test_source_list_partition_functions():
     cur = MagicMock()
     cur.fetchall.return_value = [
-        ("pf_sales_date", "RANGE", True, datetime(2024, 1, 1), 1, "datetime2", None, None, None),
-        ("pf_sales_date", "RANGE", True, datetime(2025, 1, 1), 2, "datetime2", None, None, None),
-        ("pf_sales_date", "RANGE", True, datetime(2026, 1, 1), 3, "datetime2", None, None, None),
+        ("pf_sales_date", "RANGE", True, 4, datetime(2024, 1, 1), 1, "datetime2", None, None, None),
+        ("pf_sales_date", "RANGE", True, 4, datetime(2025, 1, 1), 2, "datetime2", None, None, None),
+        ("pf_sales_date", "RANGE", True, 4, datetime(2026, 1, 1), 3, "datetime2", None, None, None),
     ]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -1285,6 +1717,7 @@ def test_source_list_partition_functions():
     assert pf.data_type == "datetime2"
     assert pf.range_desc == "RANGE RIGHT"
     assert len(pf.boundaries) == 3
+    assert pf.fanout == 4
     assert pf.boundaries[0] == datetime(2024, 1, 1)
     assert pf.boundaries[1] == datetime(2025, 1, 1)
     assert pf.boundaries[2] == datetime(2026, 1, 1)
@@ -1292,8 +1725,9 @@ def test_source_list_partition_functions():
 
 def test_source_list_partition_schemes():
     cur = MagicMock()
-    cur.fetchall.return_value = [
-        ("ps_sales_date", "pf_sales_date", "PRIMARY"),
+    cur.fetchall.side_effect = [
+        [("ps_sales_date", "pf_sales_date")],
+        [("ps_sales_date", "pf_sales_date", "PRIMARY", 1, 1)],
     ]
     conn = MagicMock()
     conn.cursor.return_value.__enter__.return_value = cur
@@ -1334,6 +1768,7 @@ def test_source_get_partitioned_tables():
 
 def test_create_partition_function_boundary_string_handling():
     target, cur = _build_partition_target()
+    cur.fetchall.return_value = []
     pf = PartitionFunctionDef(
         name="pf_str",
         data_type="varchar(100)",
@@ -1347,9 +1782,6 @@ def test_create_partition_function_boundary_string_handling():
     assert "RANGE LEFT" in pf_ddl.upper()
     assert "'2024-01-01'" in pf_ddl
     assert "'2025-01-01'" in pf_ddl
-
-
-from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
@@ -1492,7 +1924,8 @@ def test_export_full_casts_sql_variant_columns():
 
     # Verify the SELECT includes CAST for the sql_variant column
     executed_sqls = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
-    select_sql = next(s for s in executed_sqls if s.strip().startswith("SELECT"))
+    # Find the data export SELECT (from the table, not sys.columns metadata query)
+    select_sql = next(s for s in executed_sqls if s.strip().startswith("SELECT") and "FROM" in s and "sys.columns" not in s)
     assert "CAST" in select_sql
     assert "sql_variant" not in select_sql  # no literal sql_variant in SELECT
     assert "variant_int" in select_sql
@@ -1619,11 +2052,11 @@ def _mock_source_with_grants(rows):
 
 def test_list_grants_discovers_database_schema_table_and_column():
     source, cur = _mock_source_with_grants([
-        ("CONNECT", "DATABASE", 0, 0, "migration_test_user", None, None, None, "mssql_migration_test"),
-        ("SELECT", "SCHEMA", 5, 0, "migration_test_reader", None, None, "sales", None),
-        ("SELECT", "OBJECT_OR_COLUMN", 100, 0, "migration_test_writer", "orders", None, "sales", None),
-        ("INSERT", "OBJECT_OR_COLUMN", 100, 0, "migration_test_writer", "orders", None, "sales", None),
-        ("UPDATE", "OBJECT_OR_COLUMN", 100, 2, "migration_test_writer", "orders", "amount", "sales", None),
+        ("CONNECT", "DATABASE", 0, 0, "migration_test_user", None, None, None, None, "mssql_migration_test"),
+        ("SELECT", "SCHEMA", 5, 0, "migration_test_reader", None, None, None, "sales", None),
+        ("SELECT", "OBJECT_OR_COLUMN", 100, 0, "migration_test_writer", "orders", "U", None, "sales", None),
+        ("INSERT", "OBJECT_OR_COLUMN", 100, 0, "migration_test_writer", "orders", "U", None, "sales", None),
+        ("UPDATE", "OBJECT_OR_COLUMN", 100, 2, "migration_test_writer", "orders", "U", "amount", "sales", None),
     ])
 
     grants = source.list_grants()
@@ -1695,8 +2128,8 @@ def test_list_grants_no_schemas_queries_all_non_system():
 
 def test_list_grants_groups_multiple_privileges_on_same_object():
     source, cur = _mock_source_with_grants([
-        ("SELECT", "SCHEMA", 5, 0, "my_role", None, None, "sales", None),
-        ("INSERT", "SCHEMA", 5, 0, "my_role", None, None, "sales", None),
+        ("SELECT", "SCHEMA", 5, 0, "my_role", None, None, None, "sales", None),
+        ("INSERT", "SCHEMA", 5, 0, "my_role", None, None, None, "sales", None),
     ])
 
     grants = source.list_grants()
@@ -1705,6 +2138,23 @@ def test_list_grants_groups_multiple_privileges_on_same_object():
     assert grants[0].privileges == "INSERT, SELECT"
     assert grants[0].object_type == "SCHEMA"
     assert grants[0].grantee == "my_role"
+
+
+def test_list_grants_preserves_function_and_procedure_object_types():
+    source, cur = _mock_source_with_grants([
+        ("EXECUTE", "OBJECT_OR_COLUMN", 201, 0, "routine_reader", "fn_CalculateTax", "FN", None, "training", None),
+        ("EXECUTE", "OBJECT_OR_COLUMN", 202, 0, "routine_reader", "usp_GetCustomerOrders", "P", None, "training", None),
+    ])
+
+    grants = source.list_grants()
+    by_name = {grant.object_name: grant for grant in grants}
+
+    assert by_name["fn_CalculateTax"].object_type == "FUNCTION"
+    assert by_name["fn_CalculateTax"].schema_name == "training"
+    assert by_name["usp_GetCustomerOrders"].object_type == "PROCEDURE"
+    assert by_name["usp_GetCustomerOrders"].schema_name == "training"
+    sql = cur.execute.call_args.args[0]
+    assert "obj.type AS object_type" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -2520,11 +2970,37 @@ def test_create_trigger_emits_create_or_alter_with_schema_qualified_name():
     trigger_ddl = next(s for s in executed if "CREATE OR ALTER TRIGGER" in s.upper())
     assert trigger_ddl.startswith("CREATE OR ALTER TRIGGER [sales].[tr_orders_audit]")
     # ON clause should be preserved
-    assert "ON sales.orders" in trigger_ddl
+    assert "ON [sales].[orders]" in trigger_ddl
     # ENABLE TRIGGER should be called since is_disabled is False
     enable_sql = next(s for s in executed if "ENABLE TRIGGER" in s.upper())
     assert "sales" in enable_sql and "orders" in enable_sql
     target._conn.commit.assert_called()
+
+
+def test_create_trigger_normalizes_comments_quotes_and_catalogued_parent_schema():
+    target, cur = _build_target_for_type()
+    cur.fetchone.side_effect = [("training",), ("orders",)]
+    trigger = TriggerDef(
+        name="tr_orders_audit",
+        table="orders",
+        schema_name="training",
+        table_schema="sales",
+        ddl=(
+            "-- source trigger comment\n"
+            'CREATE TRIGGER "old_schema"."old_trigger" ON "old_schema"."old_orders" '
+            "AFTER INSERT AS BEGIN SET NOCOUNT ON; END"
+        ),
+        is_disabled=False,
+    )
+
+    target.create_trigger(trigger)
+
+    emitted = [str(call.args[0]) for call in cur.execute.call_args_list if call.args]
+    trigger_ddl = next(sql for sql in emitted if "CREATE OR ALTER TRIGGER" in sql)
+    assert trigger_ddl.startswith(
+        "-- source trigger comment\nCREATE OR ALTER TRIGGER [training].[tr_orders_audit]"
+    )
+    assert "ON [sales].[orders] AFTER INSERT" in trigger_ddl
 
 
 def test_create_trigger_skips_when_parent_table_missing():
@@ -2539,10 +3015,11 @@ def test_create_trigger_skips_when_parent_table_missing():
         ddl="CREATE TRIGGER tr_missing ON sales.orders AFTER INSERT AS BEGIN SET NOCOUNT ON; END",
         is_disabled=False,
     )
-    target.create_trigger(trigger)
+    result = target.create_trigger(trigger)
 
     executed = [str(c.args[0]) for c in cur.execute.call_args_list if c.args]
     assert not any("CREATE TRIGGER" in s for s in executed)
+    assert result is False
     target._conn.commit.assert_not_called()
 
 

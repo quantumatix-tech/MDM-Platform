@@ -1,7 +1,6 @@
 source:
   engine: mysql
   secret_provider: local_encrypted_file
-
   connection:
     host: 127.0.0.1
     port: 3306
@@ -10,52 +9,40 @@ source:
     password_secret: mysql-source-password
     ssl: true
 
-
 target:
   engine: mysql
-  secret_provider: azure_keyvault
-
+  secret_provider: local_encrypted_file
   connection:
-    host: <your-azure-mysql-server>.mysql.database.azure.com
+    host: 127.0.0.1
     port: 3306
-    database: mysql_migration_target
-    username: mysql_admin
+    database: dms_existing_target_local
+    username: mysql_test
     password_secret: mysql-target-password
     ssl: true
-
 
 migration:
   mode: full
   batch_size: 1000
   reconcile_target_schema: true
 
-
 retry:
   max_retries: 3
   base_delay_seconds: 1.0
   max_delay_seconds: 30.0
 
-
 secrets:
-  provider: azure_keyvault
-
+  provider: local_encrypted_file
   local_encrypted_file:
     key_source: keyring
     keyring_service: migration-platform/secrets-key
     auto_create: false
 
-  azure_keyvault:
-    url: https://<your-key-vault-name>.vault.azure.net/
-
-
 alerting:
   notifier: none
-
 
 validation:
   mode: count
   sample_size: 1000
-
 
 logging:
   level: INFO

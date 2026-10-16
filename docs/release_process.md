@@ -222,3 +222,130 @@ bump:
 Because of these, **a green CI run is not currently a release gate**. Use
 `scripts/release_validation.py` as the gate instead, and treat CI as advisory
 until the integration host configuration is corrected.
+
+---
+
+## 6. Version Management
+
+Version Management adds runtime version capture, report embedding, compatibility
+matrix validation, and release validation automation. All Version Management
+tasks are complete and validated.
+
+### 6.1 Targeted Version Management test files
+
+Run these four test files when validating Version Management changes or before a
+release that modifies version-related code:
+
+| Test file | Purpose | When to run |
+|---|---|---|
+| `tests/unit/test_runtime_manifest.py` | Validates runtime manifest schema, captured metadata (app version, Python version, package versions, Git branch, DB engine versions), secret protection, and non-fatal DB version failures | Before release; after changes to `core/runtime_manifest.py` or report builder manifest integration |
+| `tests/unit/test_report_manifest.py` | Validates manifest is embedded in JSON (`runtime_manifest`, `platform_version`) and HTML reports (footer, accordion), and schema version consistency | Before release; after changes to `core/reporting/report_builder.py` |
+| `tests/unit/test_compatibility_matrix.py` | Validates `compatibility_matrix.yaml` structure, required fields, version consistency with `pyproject.toml`, and Markdown generation | Before release; after changes to `compatibility_matrix.yaml` or `scripts/generate_compatibility_matrix.py` |
+| `tests/unit/test_release_validation.py` | Validates version format, installed metadata match, CLI `--version`, wheel build, Git tag matching, and KNOWN_BASELINE_FAILURES enforcement | Before release; after changes to `scripts/release_validation.py` |
+
+Run all four together with:
+```bash
+pytest tests/unit/test_runtime_manifest.py tests/unit/test_report_manifest.py tests/unit/test_compatibility_matrix.py tests/unit/test_release_validation.py -v
+```
+
+### 6.2 Release validation: `python scripts/release_validation.py`
+
+This script is the **release gate** (replaces CI). It performs 22+ automated checks:
+
+- **Packaging**: editable install, version import, CLI `--version`, wheel build, wheel contents, clean-venv connector imports
+- **Version consistency**: `pyproject.toml` format, installed metadata match, `__version__` from metadata, `CHANGELOG.md` structure, Git tag peel
+- **Runtime prerequisites**: preflight interpreter check, `requires-python` enforcement
+- **Dependency consistency**: all runtime deps declared, no undeclared imports, dev extras have version floors
+- **Tests**: unit suite matches recorded baseline (408 passed, 4 known failures), no new failures, migration validation where credentials exist
+- **Report integrity**: JSON carries `platform_version`, HTML footer shows platform version
+
+Run after `pip install -e ".[dev]"` and before committing the release. Every check
+must pass. The script compares the unit suite against `KNOWN_BASELINE_FAILURES` —
+do not delete entries to force a pass; fix the underlying assertion instead.
+
+### 6.3 Runtime Manifest
+
+**Purpose**: Captures a complete snapshot of the execution environment at
+migration runtime for troubleshooting, audit, and reproducibility.
+
+**Captured metadata** (schema version `"1.0"`):
+- `application`: `name`, `version` (from installed metadata), `git_branch`
+- `python`: `version` (e.g., `"3.12.6"`), `executable` path
+- `packages`: key dependency versions (e.g., `pyodbc`, `psycopg2`, `mysql-connector-python`, `sqlalchemy`, `alembic`, `pydantic`, `pyyaml`, `jinja2`)
+- `database`: `source` and `target` engine versions (queried from connectors; optional, non-fatal on failure)
+
+**Report integration**:
+- JSON report: `runtime_manifest` object + top-level `platform_version`
+- HTML report: footer shows platform version; accordion with full manifest (hidden by default)
+
+**Secret protection**: Manifest captures **only versions and identifiers** — no
+passwords, connection strings, hostnames, usernames, or secrets. The secrets
+resolver in `core/secrets/env.py` is never invoked during manifest collection.
+
+**Troubleshooting use**: When a migration behaves unexpectedly, the manifest in
+the report answers: Which platform version ran? Which Python? Which driver
+versions? Which database engine versions? What Git commit/branch? This replaces
+guesswork with evidence.
+
+### 6.4 Git pre-commit commands for release commits
+
+Use these commands to verify the release commit contains **only intended
+changes**. Run in order before `git commit`:
+
+```bash
+# 1. Show a concise summary of all working-tree changes (staged + unstaged)
+git status --short
+```
+**What it checks**: Lists modified (`M`), added (`A`), deleted (`D`), renamed
+(`R`), untracked (`??`) files with short codes. Verifies no personal/untracked
+files will be accidentally staged.
+
+```bash
+# 2. Check for whitespace errors in unstaged changes
+git diff --check
+```
+**What it checks**: Detects trailing whitespace, spaces before tabs, and other
+whitespace issues in the working tree. Run before staging to catch formatting
+problems early.
+
+```bash
+# 3. Stage ONLY the intended files by explicit path
+git add pyproject.toml CHANGELOG.md <other intended files>
+```
+**What it checks**: Adds specific files to the index. Never use `git add .` or
+`git add -A` — the working tree contains untracked personal files that must
+never enter a release commit.
+
+```bash
+# 4. Check for whitespace errors in STAGED changes
+git diff --cached --check
+```
+**What it checks**: Same whitespace check as above, but on the **staged** diff
+(the exact commit content). Run after `git add` to ensure the commit itself is
+clean.
+
+```bash
+# 5. Show a summary of staged changes (insertions/deletions per file)
+git diff --cached --stat
+```
+**What it checks**: Confirms the staged changes match expectations — only the
+intended files, with reasonable line counts.
+
+```bash
+# 6. List ONLY the names of staged files
+git diff --cached --name-only
+```
+**What it checks**: Final verification of exactly which files are staged. Cross-
+reference with the intended file set.
+
+```bash
+# 7. Show the full staged diff for manual review
+git diff --cached
+```
+**What it checks**: Complete content review of the commit. Verify no secrets,
+no accidental deletions, no unrelated changes. This is the last gate before
+`git commit`.
+
+**When a developer should run these**: Before every release commit (Step 5 in
+the release procedure). For non-release commits, `git status --short` and
+`git diff --cached --name-only` are sufficient as a quick sanity check.

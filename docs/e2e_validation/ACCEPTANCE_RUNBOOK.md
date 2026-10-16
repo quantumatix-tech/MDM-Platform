@@ -172,6 +172,47 @@ This driver is an OS component, not a Python package. Install:
 - Windows: via SQL Server installer or Windows Update
 - Linux: `sudo apt-install msodbcsql18`
 
+### MySQL: "mysql CLI not found in PATH"
+
+The MySQL E2E setup script invokes the `mysql` CLI by command name (via `shutil.which`).
+If MySQL's `bin` directory is not present in the current shell's `PATH`, setup fails with:
+
+```text
+mysql CLI not found in PATH. Install MySQL client tools (https://dev.mysql.com/downloads/mysql/).
+```
+
+**Diagnose:**
+
+```powershell
+Get-Command mysql
+```
+
+**If not found**, verify the standard installation path (the exact path varies by MySQL version and install location):
+
+```powershell
+# Example for MySQL Server 8.0 on Windows
+$env:Path += ";C:\Program Files\MySQL\MySQL Server 8.0\bin"
+```
+
+**Verify:**
+
+```powershell
+mysql --version
+```
+
+**Rerun setup:**
+
+```powershell
+python tests/e2e/mysql/run_setup.py --config config/mysql_e2e_acceptance.yaml
+```
+
+**Notes:**
+
+- Do **not** hardcode the installation path into project code or config — the actual path differs by version and install location.
+- If `mysql.exe` is genuinely not installed, install the MySQL client tools and ensure the `bin` directory is available in `PATH`.
+- This is an environment/`PATH` issue during fixture loading, **not** a migration failure.
+- After correcting `PATH`, the MySQL E2E flow successfully completes **SETUP → MIGRATION → VALIDATION** (7 tables, 33 rows, 100% success).
+
 ### Trigger data mismatch (OrderAudit)
 
 The `OrderAudit` table is populated by an insert trigger. If row counts differ

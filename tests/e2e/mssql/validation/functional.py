@@ -24,9 +24,13 @@ from tests.e2e.mssql.validation.models import (
 class FunctionalValidator:
     """Runs safe functional checks against the target database."""
 
-    def __init__(self, conn: pyodbc.Connection, database_name: str = "") -> None:
+    def __init__(
+        self, conn: pyodbc.Connection, database_name: str = "", *,
+        expected_sequences: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         self._conn = conn
         self._db_name = database_name
+        self._expected_sequences = expected_sequences or {}
         self._report = ValidationReport(database=database_name)
 
     def validate(self) -> ValidationReport:
@@ -307,27 +311,68 @@ class FunctionalValidator:
         phase.duration_s = time.time() - t0
 
     def _validate_sequence(self) -> None:
-        """Verify the sequence can generate the next value."""
+        """Consume one controlled value and compare it with source next state."""
         phase = self._new_phase("functional_sequence")
         t0 = time.time()
+        source_state = self._expected_sequences.get("Seq_OrderNumber")
+        expected_next = None
+        source_exhausted = False
         try:
+            if source_state is not None:
+                source_exhausted = bool(source_state.get("is_exhausted"))
+                expected_next = _expected_sequence_next(source_state)
             result = self._execute(
                 "SELECT NEXT VALUE FOR training.Seq_OrderNumber"
             )
             val = result[0][0] if result else None
+            passed = val is not None and (
+                source_state is None or (not source_exhausted and int(val) == expected_next)
+            )
             phase.add_check(CheckResult(
                 name="sequence_next_value",
-                status=STATUS_PASS if val is not None else STATUS_FAIL,
-                expected="integer value",
+                status=STATUS_PASS if passed else STATUS_FAIL,
+                expected=(expected_next if source_state is not None else "integer value"),
                 actual=val,
-                message=f"Seq_OrderNumber NEXT VALUE = {val}",
+                message=(
+                    f"Seq_OrderNumber NEXT VALUE = {val}; source expected {expected_next}"
+                    if source_state is not None else f"Seq_OrderNumber NEXT VALUE = {val}"
+                ),
             ))
         except Exception as exc:  # noqa: BLE001
+            passed = source_state is not None and source_exhausted
             phase.add_check(CheckResult(
                 name="sequence_next_value",
-                status=STATUS_FAIL,
-                expected="next value",
+                status=STATUS_PASS if passed else STATUS_FAIL,
+                expected=("sequence exhausted" if passed else expected_next or "next value"),
                 actual=f"error: {exc}",
-                message=f"Cannot get next sequence value: {exc}",
+                message=(
+                    "Target sequence is exhausted as expected from source"
+                    if passed else f"Cannot get expected next sequence value: {exc}"
+                ),
             ))
         phase.duration_s = time.time() - t0
+
+
+def _expected_sequence_next(state: dict[str, Any]) -> int | None:
+    """Compute source's next value from catalog state without consuming it."""
+    if state.get("is_exhausted"):
+        return None
+    start = state.get("start_value")
+    increment = state.get("increment")
+    if not isinstance(start, int) or not isinstance(increment, int) or increment == 0:
+        raise ValueError("Source sequence metadata is incomplete or invalid")
+    if state.get("last_used_value_available"):
+        last = state.get("last_used_value")
+        if last is None:
+            return start
+    else:
+        last = state.get("current_value")
+        if last == start:
+            raise ValueError("Cannot determine source next value: last_used_value is unavailable")
+    next_value = int(last) + increment
+    minimum, maximum = state.get("minimum_value"), state.get("maximum_value")
+    if minimum <= next_value <= maximum:
+        return next_value
+    if state.get("is_cycling"):
+        return minimum if increment > 0 else maximum
+    return None

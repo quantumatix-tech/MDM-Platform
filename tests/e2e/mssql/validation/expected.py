@@ -193,6 +193,19 @@ TABLES: dict[str, ExpectedTable] = {
         pk_columns=["PartitionID", "OrderDate"],
         row_count=3,
     ),
+    # Present in the live Task 4 source fixture and required by the
+    # schema-bound indexed view. Its SQL Server generated PK name is
+    # intentionally not part of the contract.
+    "Task4_SourceIV_Base": ExpectedTable(
+        name="Task4_SourceIV_Base",
+        columns=[
+            ExpectedColumn("ID", "int", False),
+            ExpectedColumn("TestValue", "int", False),
+        ],
+        pk_name=None,
+        pk_columns=["ID"],
+        row_count=2,
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -259,7 +272,13 @@ INDEXES: dict[str, list[tuple[str, bool, list[str], list[str], bool]]] = {
 # ---------------------------------------------------------------------------
 # Views
 # ---------------------------------------------------------------------------
-VIEWS: list[str] = ["vw_CustomerOrders", "vw_ProductSales"]
+VIEWS: list[str] = ["vw_CustomerOrders", "vw_ProductSales", "Task4_SourceManaged_IV"]
+INDEXED_VIEWS: dict[str, tuple[str, list[str]]] = {
+    "Task4_SourceManaged_IV": ("CIX_Task4_SourceManaged_IV", ["ID"]),
+}
+TARGET_ONLY_INDEXED_VIEWS: dict[str, tuple[str, list[str]]] = {
+    "Task4_TargetOnly_IV": ("CIX_Task4_TargetOnly_IV", ["ID"]),
+}
 
 # ---------------------------------------------------------------------------
 # Functions: name -> type ('FN' scalar, 'IF' inline TVF, 'TF' table-valued)

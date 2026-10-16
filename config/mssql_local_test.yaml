@@ -3,7 +3,7 @@ source:
   connection:
     host: localhost
     port: 1533
-    database: mssql_migration_test
+    database: MigrationE2E_MSSQL_Source
     username: sa
     password_secret: mssql_source_pass
     ssl: false
@@ -13,7 +13,7 @@ target:
   connection:
     host: localhost
     port: 1533
-    database: mssql_migration_target
+    database: MigrationE2E_MSSQL_Target
     username: sa
     password_secret: mssql_target_pass
     ssl: false

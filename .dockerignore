@@ -1,0 +1,75 @@
+# Secrets, credentials, and environment-specific files
+.env
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+*.crt
+*.cer
+
+# Local Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git metadata (not needed in image; runtime_manifest captures what it can)
+.git/
+.gitignore
+.gitattributes
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Local config overrides (secrets live here)
+config/*.local.yaml
+config/*.local.yml
+
+# Documentation and notes not needed at runtime
+docs/
+README.md
+AGENTS.md
+CHANGELOG.md
+*.md
+
+# Docker itself
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# OS files
+.DS_Store
+Thumbs.db
