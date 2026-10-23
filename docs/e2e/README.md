@@ -45,8 +45,8 @@ python -m migration_platform --config config/postgresql_local_continer.yaml --mo
 ```
 Run ID: `c4405c596be5479fa82f2759299410c8` — 7 tables, 33 rows, 0 errors
 
-### MySQL (BLOCKED — NOT YET SUCCESSFUL)
-See [environment-setup.md](environment-setup.md) for current blockers and diagnostic steps.
+### MySQL (verified SUCCESS)
+See [environment-setup.md](environment-setup.md) for current status and diagnostic steps.
 
 ---
 
@@ -63,7 +63,7 @@ See [environment-setup.md](environment-setup.md) for current blockers and diagno
 | [PostgreSQL E2E Runbook](../postgresql/POSTGRESQL_E2E_RUNBOOK.md) | PostgreSQL E2E: service setup, host/firewall/pg_hba, validation |
 
 > **Note**: `MSSQL_E2E_RUNBOOK.md` and `POSTGRESQL_E2E_RUNBOOK.md` are the authoritative runbooks in their respective engine directories.
-> MySQL E2E is currently BLOCKED; see `docs/e2e/environment-setup.md` for blockers.
+> MySQL E2E is now VERIFIED (run `d82f18ae5bd34164a8409a2c74911d22`); see `docs/e2e/environment-setup.md`.
 
 ---
 
@@ -73,7 +73,7 @@ See [environment-setup.md](environment-setup.md) for current blockers and diagno
 |--------|----------------------|-------------------|--------|------|--------|
 | MSSQL | `config/mssql_local_test.yaml` | `905ce6fa6fc743e7b3e86c508448c1c7` | 9 | 28 | **VERIFIED** |
 | PostgreSQL | `config/postgresql_local_continer.yaml` | `c4405c596be5479fa82f2759299410c8` | 7 | 33 | **VERIFIED** |
-| MySQL | `config/mysql_local_usertest.yaml` | `938b096eee6c49978af4e624c08a8775` | 0 | 0 | **BLOCKED** |
+| MySQL | `config/mysql_local_02.yaml` | `d82f18ae5bd34164a8409a2c74911d22` | 7 | 33 | **VERIFIED** |
 
 > **Status Legend**:
 > - **VERIFIED** — Successful run with evidence on this laptop

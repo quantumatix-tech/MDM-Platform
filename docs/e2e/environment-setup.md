@@ -23,7 +23,7 @@ and [quickstart.md](quickstart.md) for portable setup instructions.
 |--------|-------------|-----------|-----------|
 | MSSQL | `config/mssql_local_test.yaml` | `mssql_migration_test` | `mssql_migration_target` |
 | PostgreSQL | `config/postgresql_local_continer.yaml` | `MigrationE2E_PostgreSQL_Source` | `MigrationE2E_PostgreSQL_Target` |
-| MySQL (blocked) | `config/mysql_local_usertest.yaml` | `MigrationE2E_MySQL_Source` | `MigrationE2E_MySQL_Target` |
+| MySQL | `config/mysql_local_02.yaml` | `MigrationE2E_MySQL_Source` | `migratione2e_mysql_target` |
 
 ### Secret Environment Variables (This Laptop)
 
@@ -36,7 +36,7 @@ $env:SECRET_mssql_target_pass = "<sa-password>"
 $env:SECRET_postgresql_e2e_source_pass = "<postgres-password>"
 $env:SECRET_postgresql_e2e_target_pass = "<postgres-password>"
 
-# MySQL (blocked)
+# MySQL (verified SUCCESS)
 $env:SECRET_mysql_e2e_source_pass = "<migration_e2e-password>"
 $env:SECRET_mysql_e2e_target_pass = "<migration_e2e-password>"
 ```
@@ -149,7 +149,7 @@ podman run --rm `
 |--------|--------|-------------|
 | MSSQL | **VERIFIED** | `905ce6fa6fc743e7b3e86c508448c1c7` |
 | PostgreSQL | **VERIFIED** | `c4405c596be5479fa82f2759299410c8` |
-| MySQL | **BLOCKED** | `938b096eee6c49978af4e624c08a8775` |
+| MySQL | **VERIFIED** | `d82f18ae5bd34164a8409a2c74911d22` |
 
 ## MySQL Blockers & Troubleshooting
 

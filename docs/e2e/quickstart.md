@@ -6,9 +6,9 @@
 |--------|----------------------|-------------|--------|------|--------|
 | MSSQL | `config/mssql_local_test.yaml` | `905ce6fa6fc743e7b3e86c508448c1c7` | 9 | 28 | **VERIFIED** |
 | PostgreSQL | `config/postgresql_local_continer.yaml` | `c4405c596be5479fa82f2759299410c8` | 7 | 33 | **VERIFIED** |
-| MySQL | `config/mysql_local_usertest.yaml` | `938b096eee6c49978af4e624c08a8775` | 0 | 0 | **BLOCKED** |
+| MySQL | `config/mysql_local_02.yaml` | `d82f18ae5bd34164a8409a2c74911d22` | 7 | 33 | **VERIFIED** |
 
-**Do not rerun MySQL.** Blockers: `sha256_password requires SSL`, `security_users` YAML misread, `mysql.user` access denied.
+**MySQL is now VERIFIED** (run `d82f18ae5bd34164a8409a2c74911d22`): 7 tables, 33 rows, 0 errors. See [environment-setup.md](environment-setup.md).
 
 > **Use portable config examples for new setups:** See `docs/e2e/config-examples/` for templates with placeholders.
 
@@ -63,7 +63,7 @@ python -m migration_platform --config config/my_mssql.yaml --mode full --no-live
 |--------|-------------|-----------|-----------|-----------------|
 | MSSQL | `config/mssql_local_test.yaml` | `mssql_migration_test` | `mssql_migration_target` | `SECRET_mssql_source_pass`, `SECRET_mssql_target_pass` |
 | PostgreSQL | `config/postgresql_local_continer.yaml` | `MigrationE2E_PostgreSQL_Source` | `MigrationE2E_PostgreSQL_Target` | `SECRET_postgresql_e2e_source_pass`, `SECRET_postgresql_e2e_target_pass` |
-| MySQL (blocked) | `config/mysql_local_usertest.yaml` | `MigrationE2E_MySQL_Source` | `MigrationE2E_MySQL_Target` | `SECRET_mysql_e2e_source_pass`, `SECRET_mysql_e2e_target_pass` |
+| MySQL | `config/mysql_local_02.yaml` | `MigrationE2E_MySQL_Source` | `migratione2e_mysql_target` | `SECRET_mysql_e2e_source_pass`, `SECRET_mysql_e2e_target_pass` |
 
 **Never put real passwords in YAML.** Use `SECRET_<name>` env vars (read by `secrets.provider: env`).
 

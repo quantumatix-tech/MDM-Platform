@@ -34,21 +34,26 @@
 - **PostgreSQL:** Check `listen_addresses = '*'` and `pg_hba.conf` host access rules.
 - **MySQL:** Authentication plugins (e.g., `sha256_password`, `caching_sha2_password`) affect SSL requirements. See MySQL-specific section below.
 
-## 5. MySQL: Local E2E Blockers vs Acceptance-Test Results
+## 5. MySQL: Local E2E and Acceptance-Test Results
 
-**Important distinction:** Historical local E2E results and acceptance-test results must be treated separately.
+**Important distinction:** Local E2E results and acceptance-test results must be treated separately.
 
-- **Local E2E (this laptop) — BLOCKED:** `config/mysql_local_usertest.yaml` with Run ID `938b096eee6c49978af4e624c08a8775` returned 0/0 success. **Confirmed blockers** (historical evidence):
-  1. `sha256_password requires SSL` — account needs SSL; host mismatch for localhost
-  2. `security_users` YAML not read by code (reads top-level, not nested)
-  3. Cannot read `mysql.user` — needs global SELECT or alternative approach
+- **Local E2E (this laptop) — VERIFIED (run `d82f18ae5bd34164a8409a2c74911d22`):** `config/mysql_local_02.yaml` completed with **SUCCESS**. 7/7 tables, 33/33 rows, 0 failed rows, 0 errors. Functions (`fn_GetOrderTotal`, `sp_UpdateProductStock`), trigger (`tr_AuditOrder`), comments, grants, and count validation all succeeded.
+
+  **Resolved historical issues (for context only):**
+  1. `sha256_password requires SSL` — resolved by using TLS with CA cert (`ssl: true`, `ca_path: /app/certs/mysql_ca.pem`)
+  2. `security_users` YAML not read by code — resolved in `migration_platform/__main__.py` and `core/connectors/mysql/objects/security.py` (merges/falls back to `migration.security_users`)
+  3. `mysql.user` access denied — resolved by using the `security_users` allowlist, avoiding the `mysql.user` query
+  4. `SHOW_ROUTINE` missing — resolved by granting `SHOW_ROUTINE` to the migration account
+  5. `log_bin_trust_function_creators = OFF` — resolved by `SET PERSIST log_bin_trust_function_creators = ON` (requires DBA approval)
 
 - **Acceptance E2E (Mode 2):** Accepts `root` user without SSL in the tested acceptance config (`config/mysql_e2e_acceptance.yaml`) and setup/migration/validation succeeded (7 tables, 33 rows, 100% success) once `mysql` CLI was in `PATH` (environment issue, not migration failure). The acceptance runbook documents this as an environment/`PATH` fix, not a code change.
 
 **When troubleshooting MySQL:**
-- Do not generalize the local E2E blockers to all MySQL deployments. Check which path (local E2E vs acceptance) and which config you are using.
-- For local non-TLS, ensure `ssl: false` is set; for `sha256_password`, SSL may still be required — this is engine-specific and may need certificate setup.
+- Do not generalize historical blockers to all MySQL deployments. Check which path (local E2E vs acceptance) and which config you are using.
+- For local TLS, ensure `ssl: true`, `ca_path`, `verify_cert`, and `verify_identity` are configured correctly.
 - If using acceptance fixtures, verify `mysql` CLI is in `PATH` (see acceptance runbook diagnostics).
+- `SET PERSIST log_bin_trust_function_creators = ON` is a prerequisite only where the target MySQL server has binary logging enabled and the setting is OFF. It requires DBA approval.
 
 ## 6. MSSQL & PostgreSQL Troubleshooting
 

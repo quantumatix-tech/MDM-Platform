@@ -375,7 +375,7 @@ podman run --rm localhost/migration-platform:0.2.3
 | Podman `host.docker.internal` equivalent | **NOT VERIFIED** | Gateway IP `172.17.0.1` assumed; may differ per host |
 | Rootless Podman networking | **NOT VERIFIED** | May require `podman machine` or host LAN IP |
 | `docker-compose.test.yml` for real migrations | **NOT SUITABLE** | Hardcoded test passwords; publishes ports that may conflict |
-| MySQL in container | **BLOCKED** | Same blockers as host: `sha256_password requires SSL`, `security_users` YAML misread, `mysql.user` access denied |
+| MySQL in container | **VERIFIED** | Run `d82f18ae5bd34164a8409a2c74911d22` — 7 tables, 33 rows, 0 errors |
 | Firewall rules for container egress | **NOT DOCUMENTED** | Host firewall may block container→host traffic |
 | SELinux / AppArmor | **NOT TESTED** | May require `:Z` or `:z` volume label on RHEL/Fedora |
 
