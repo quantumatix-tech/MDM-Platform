@@ -54,10 +54,16 @@ The application version is defined by the `version` field in `pyproject.toml`.
 
 ### Added
 
-- **MySQL local E2E finalized.** FULL migration completed successfully
-  (run `d82f18ae5bd34164a8409a2c74911d22`): 7 tables, 33 rows, 0 errors.
-  Functions (`fn_GetOrderTotal`, `sp_UpdateProductStock`), trigger
-  (`tr_AuditOrder`), comments, grants, and count validation all succeeded.
+- **MySQL local E2E finalized (Local Python).** FULL migration completed successfully
+  (run `fc54500c696f4cd792844858e7662284`): 7 tables, 33 rows, 0 errors,
+  duration 2.8s (config `mysql_local_01.yaml`, root user, no SSL). Podman
+  FULL E2E (run `d82f18ae5bd34164a8409a2c74911d22`): 7 tables, 33 rows,
+  0 errors, status success.
+- **PostgreSQL Podman E2E finalized.** FULL migration completed successfully
+  (run `3dc4381335974ff3a727f59d806421d0`): 7 tables, 33 rows, 0 errors,
+  100% success rate (config `psql_local_02.yaml`, host 172.24.48.1:55432,
+  ssl: false). Root cause: pg_hba.conf target database name case mismatch
+  and SSL disabled on server.
 - **PostgreSQL local E2E finalized.** FULL migration completed successfully
   (run `76e7c82824e741adba322dfae9625124`): 7 tables, 33 rows, 0 errors.
   All objects including functions, procedures, triggers, views, materialized
@@ -96,8 +102,8 @@ The application version is defined by the `version` field in `pyproject.toml`.
 ### Documentation
 
 - MySQL E2E status updated from BLOCKED to VERIFIED across all E2E docs.
-- PostgreSQL E2E run ID updated to verified run.
-- MSSQL E2E evidence documented; Podman/container path remains unverified.
+- PostgreSQL E2E run ID updated to verified run; Podman path now VERIFIED.
+- MSSQL E2E evidence documented (local + Podman both VERIFIED).
 
 ## [0.2.3] - 2026-10-05
 

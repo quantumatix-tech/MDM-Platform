@@ -69,14 +69,14 @@ See [environment-setup.md](environment-setup.md) for current status and diagnost
 
 ## Status Summary — Verified E2E Runs (This Laptop)
 
-| Engine | Execution Mode | Run ID | Tables | Rows | Status |
-|--------|---------------|--------|--------|------|--------|
-| MSSQL | Local Python | `905ce6fa6fc743e7b3e86c508448c1c7` | 9 | 28 | **VERIFIED** |
-| MSSQL | Podman | `cfe7efdb6b424786910402dd69f62eea` | 7 | 33 | **VERIFIED** |
-| MySQL | Podman | `d82f18ae5bd34164a8409a2c74911d22` | 7 | 33 | **VERIFIED** |
-| MySQL | Local Python | — | — | — | **NOT VERIFIED** |
-| PostgreSQL | Local Python | `76e7c82824e741adba322dfae9625124` | 7 | 33 | **VERIFIED** |
-| PostgreSQL | Podman | — | — | — | **NOT VERIFIED** |
+| Engine | Execution Mode | Run ID | Tables | Rows | Status | Report |
+|--------|---------------|--------|--------|------|--------|--------|
+| MySQL | Local Python | `fc54500c696f4cd792844858e7662284` | 7 | 33 | **VERIFIED** | `reports/fc54500c696f4cd792844858e7662284.json` |
+| MySQL | Podman | `d82f18ae5bd34164a8409a2c74911d22` | 7 | 33 | **VERIFIED** | `reports/d82f18ae5bd34164a8409a2c74911d22.json` |
+| PostgreSQL | Local Python | `76e7c82824e741adba322dfae9625124` | 7 | 33 | **VERIFIED** | `reports/76e7c82824e741adba322dfae9625124.json` |
+| PostgreSQL | Podman | `3dc4381335974ff3a727f59d806421d0` | 7 | 33 | **VERIFIED** | `reports/3dc4381335974ff3a727f59d806421d0.json` |
+| MSSQL | Local Python | `905ce6fa6fc743e7b3e86c508448c1c7` | 9 | 28 | **VERIFIED** | `reports/905ce6fa6fc743e7b3e86c508448c1c7.json` |
+| MSSQL | Podman | `cfe7efdb6b424786910402dd69f62eea` | 7 | 33 | **VERIFIED** | `reports/cfe7efdb6b424786910402dd69f62eea.json` |
 
 > **Status Legend**:
 > - **VERIFIED** — Successful run with evidence on this laptop

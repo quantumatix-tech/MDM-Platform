@@ -6,7 +6,7 @@ source:
     database: MigrationE2E_PostgreSQL_Source
     username: postgres
     password_secret: postgresql_e2e_source_pass
-    ssl: true
+    ssl: false
 
 target:
   engine: postgresql
@@ -16,7 +16,7 @@ target:
     database: migratione2e_postgresql_target
     username: postgres
     password_secret: postgresql_e2e_target_pass
-    ssl: true
+    ssl: false
 
     
 migration:
