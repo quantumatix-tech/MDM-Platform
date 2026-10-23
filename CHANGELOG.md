@@ -50,6 +50,50 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - The 4 pre-existing unit test failures (`test_cross_engine_type_safety.py` ×2,
   `test_mysql_datatypes.py` ×2) are unchanged by this work.
 
+## [0.3.0] - 2026-10-23
+
+### Added
+
+- **MySQL local E2E finalized.** FULL migration completed successfully
+  (run `d82f18ae5bd34164a8409a2c74911d22`): 7 tables, 33 rows, 0 errors.
+  Functions (`fn_GetOrderTotal`, `sp_UpdateProductStock`), trigger
+  (`tr_AuditOrder`), comments, grants, and count validation all succeeded.
+- **PostgreSQL local E2E finalized.** FULL migration completed successfully
+  (run `76e7c82824e741adba322dfae9625124`): 7 tables, 33 rows, 0 errors.
+  All objects including functions, procedures, triggers, views, materialized
+  views, sequences, comments, and grants migrated and validated.
+
+### Changed
+
+- **MySQL security allowlist fix.** `migration.security_users` is now merged
+  from the `migration:` config section into the source connection config
+  (`migration_platform/__main__.py`) and `security_user_allowlist()` falls back
+  to `config.migration.security_users` (`core/connectors/mysql/objects/security.py`).
+  This avoids unnecessary `mysql.user` metadata queries when an allowlist is
+  configured.
+- **MySQL routine/trigger NULL DDL guards.** `_show_create()` in both source
+  and target connectors now raises an actionable error when `SHOW CREATE`
+  returns a NULL definition, naming the missing `SHOW_ROUTINE` privilege.
+- **MySQL orchestrator error isolation.** Definer-prerequisite discovery
+  (`list_events`, `list_functions`, `get_all_triggers`) is wrapped in
+  try/except so errors are recorded without aborting before the phases that
+  report them.
+- **MySQL error messages improved.** All NULL-DDL errors now include the
+  exact `GRANT SHOW_ROUTINE` SQL for the DBA.
+
+### Fixed
+
+- **MySQL trigger creation.** Resolved by `SET PERSIST
+  log_bin_trust_function_creators = ON` on the target server (DBA-approved).
+- **PostgreSQL E2E.** Verified working with `config/psql_local_01.yaml`
+  (host 127.0.0.1, port 55432, ssl: false). No code changes were required.
+
+### Documentation
+
+- MySQL E2E status updated from BLOCKED to VERIFIED across all E2E docs.
+- PostgreSQL E2E run ID updated to verified run.
+- Machine-specific values labeled as historical/environment-specific.
+
 ## [0.2.3] - 2026-10-05
 
 ### Added

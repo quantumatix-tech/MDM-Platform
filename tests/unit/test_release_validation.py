@@ -27,7 +27,7 @@ class TestVersionValidation:
         pyproject = REPO_ROOT / "pyproject.toml"
         data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         version = data["project"]["version"]
-        assert version == "0.2.3"
+        assert version == "0.3.0"
         assert version.count(".") == 2
         assert all(p.isdigit() for p in version.split("."))
 

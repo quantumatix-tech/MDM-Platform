@@ -1,5 +1,5 @@
 compatibility_matrix:
-  application_version: 0.2.3
+  application_version: 0.3.0
   recorded_at: '2026-10-06'
   recorded_by: migration-platform-team
   entries:

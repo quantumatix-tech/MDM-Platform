@@ -39,17 +39,7 @@ DIST_NAME = "migration-platform"
 # base-class capability assertion). They predate this release and are recorded
 # here so a NEW failure is still detected. Do not delete entries to make a run
 # pass -- fix the underlying assertion instead.
-KNOWN_BASELINE_FAILURES = (
-    "tests/unit/test_cross_engine_type_safety.py::"
-    "test_cross_engine_mapped_type_is_used_in_generated_ddl"
-    "[MySQLTargetConnector-mysql-INT]",
-    "tests/unit/test_cross_engine_type_safety.py::"
-    "test_cross_engine_mapped_type_is_used_in_generated_ddl"
-    "[MSSQLTargetConnector-mssql-BIGINT]",
-    "tests/unit/test_mysql_datatypes.py::"
-    "test_mysql_target_has_no_role_capabilities_and_classifies_denials",
-    "tests/unit/test_mysql_datatypes.py::test_mysql_common_orchestrator_has_no_role_migration_path",
-)
+KNOWN_BASELINE_FAILURES = ()
 
 _results: list[tuple[str, bool, str]] = []
 
