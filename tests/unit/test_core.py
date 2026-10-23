@@ -176,6 +176,25 @@ class TestMySQLTargetSchemaReconciliation:
         assert target.finalize_schema_reconciliations.call_count == 0
 
 
+class TestMySQLSecurityDiscoveryUnavailable:
+    def test_security_users_pre_objects_reports_discovery_error_and_continues(self):
+        from core.connectors.mysql._models import MySQLSecurityMetadataNotVisible
+
+        orchestrator, source, target = TestMySQLTargetSchemaReconciliation._orchestrator(
+            {"source": {"engine": "mysql"}, "target": {"engine": "mysql"}}
+        )
+        source.list_users.side_effect = MySQLSecurityMetadataNotVisible(
+            "MySQL account metadata is not visible to the migration account"
+        )
+
+        result = orchestrator.run_full()
+
+        assert result["phases"]["security_users_pre_objects"]["_error"] == (
+            "MySQL account metadata is not visible to the migration account"
+        )
+        # Migration continues past the security prerequisite phase.
+        assert "schemas" in result["phases"]
+
 class TestBug2StatusFromValidation:
     def test_status_not_hardcoded(self):
         source = MagicMock(spec=SourceConnector)

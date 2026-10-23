@@ -62,6 +62,11 @@ def create_function(
     :class:`MySQLRoutineCreationPolicyError` and re-raised from the
     original error.
     """
+    if function.ddl is None:
+        raise RuntimeError(
+            f"Cannot create {function.kind.upper()} {function.name}: "
+            "source routine definition is NULL"
+        )
     try:
         with conn.cursor() as cur:
             cur.execute(f"DROP {function.kind.upper()} IF EXISTS {_q(function.name)}")

@@ -266,11 +266,29 @@ class MigrationOrchestrator:
                 and self._config.get("target", {}).get("engine") == "mysql"
             )
             if mysql_definer_dependency:
-                from core.connectors.mysql import _mysql_definer_identity
+                from core.connectors.mysql import (
+                    _mysql_definer_identity,
+                    MySQLSecurityMetadataNotVisible,
+                )
 
-                source_events = list(self._source.list_events())
-                source_routines = list(self._source.list_functions())
-                source_triggers = list(self._source.get_all_triggers())
+                try:
+                    source_events = list(self._source.list_events())
+                except Exception as exc:
+                    mysql_user_results["_error"] = f"event discovery: {exc}"
+                    all_errors.append(f"event discovery: {exc}")
+                    source_events = []
+                try:
+                    source_routines = list(self._source.list_functions())
+                except Exception as exc:
+                    mysql_user_results["_error"] = f"routine discovery: {exc}"
+                    all_errors.append(f"routine discovery: {exc}")
+                    source_routines = []
+                try:
+                    source_triggers = list(self._source.get_all_triggers())
+                except Exception as exc:
+                    mysql_user_results["_error"] = f"trigger discovery: {exc}"
+                    all_errors.append(f"trigger discovery: {exc}")
+                    source_triggers = []
 
                 # MySQL stored objects may refer to source accounts in their
                 # DEFINER clause. Create those accounts before any dependent
@@ -283,7 +301,17 @@ class MigrationOrchestrator:
                     )
                     if identity is not None
                 }
-                for user in self._source.list_users():
+                try:
+                    discovered_users = self._source.list_users()
+                except MySQLSecurityMetadataNotVisible as exc:
+                    mysql_user_results["_error"] = str(exc)
+                    all_errors.append(f"source account discovery: {exc}")
+                    discovered_users = []
+                except Exception as exc:
+                    mysql_user_results["_error"] = str(exc)
+                    all_errors.append(f"source account discovery: {exc}")
+                    discovered_users = []
+                for user in discovered_users:
                     host = getattr(user, "host", None)
                     if (user.name, host) not in required_definers:
                         continue

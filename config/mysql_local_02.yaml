@@ -2,30 +2,30 @@
 source:
   engine: mysql
   connection:
-    host: 172.24.48.1
+    host: mysql-host.local
     port: 33062
     database: MigrationE2E_MySQL_Source
-    username: root
+    username: migration_e2e
     password_secret: mysql_e2e_source_pass
     ssl: true
     tls:
       enabled: true
-      ca_path: /etc/ssl/certs/ca-certificates.crt
+      ca_path: /app/certs/mysql_ca.pem
       verify_cert: true
       verify_identity: true
 
 target:
   engine: mysql
   connection:
-    host: 172.24.48.1
+    host: mysql-host.local
     port: 33062
     database: migratione2e_mysql_target
-    username: root
+    username: migration_e2e
     password_secret: mysql_e2e_target_pass
     ssl: true
     tls:
       enabled: true
-      ca_path: /etc/ssl/certs/ca-certificates.crt
+      ca_path: /app/certs/mysql_ca.pem
       verify_cert: true
       verify_identity: true
     source_engine: mysql
@@ -35,7 +35,9 @@ migration:
   mode: full
   batch_size: 1000
   include_schemas: []
-
+  security_users:
+    - user: migration_e2e
+      host: "192.168.1.28"
 secrets:
   provider: env
 

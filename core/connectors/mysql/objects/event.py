@@ -127,6 +127,11 @@ def create_event(
                         f"{event.execute_at}; it is due or within the {safety_lead_seconds}-second "
                         "safety window at target creation. It was not replaced."
                     )
+            if event.ddl is None:
+                raise RuntimeError(
+                    f"Cannot create event {event.name}: "
+                    "source event definition is NULL"
+                )
             cur.execute(f"DROP EVENT IF EXISTS {_q(event.name)}")
             cur.execute(rewrite_definer(event.ddl))
             conn.commit()

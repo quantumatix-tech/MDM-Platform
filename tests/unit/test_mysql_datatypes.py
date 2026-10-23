@@ -634,20 +634,64 @@ def test_mysql_table_grant_rolls_back_and_raises_on_target_failure():
 
 
 def test_mysql_list_users_preserves_host_and_allowlist_selects_only_users():
-    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
-    cursor.fetchall.return_value = [("security_test_user", "%")]
-    connection = MagicMock(); connection.cursor.return_value = cursor
+    connection = MagicMock(); connection.cursor.return_value = MagicMock()
     source = MySQLSourceConnector({
         "database": "source",
         "security_users": [{"user": "security_test_user", "host": "%"}],
     }); source._conn = connection
 
     assert source.list_users() == [UserDef(name="security_test_user", host="%")]
-    sql = cursor.execute.call_args.args[0]
-    assert "SELECT User,Host" in sql
-    assert "authentication_string" not in sql
-    assert "plugin" not in sql
-    assert "read_role" not in repr(source.list_users())
+    # Configured accounts are migrated without querying mysql.user.
+    connection.cursor.return_value.execute.assert_not_called()
+
+
+def test_mysql_list_users_allowlist_from_migration_section():
+    connection = MagicMock(); connection.cursor.return_value = MagicMock()
+    source = MySQLSourceConnector({
+        "database": "source",
+        "migration": {"security_users": [{"user": "app_user", "host": "%"}]},
+    }); source._conn = connection
+
+    assert source.list_users() == [UserDef(name="app_user", host="%")]
+    connection.cursor.return_value.execute.assert_not_called()
+    connection = MagicMock(); connection.cursor.return_value = MagicMock()
+    source = MySQLSourceConnector({
+        "database": "source",
+        "security_users": [
+            {"user": "root", "host": "localhost"},
+            {"user": "app_user", "host": "%"},
+        ],
+    }); source._conn = connection
+
+    assert source.list_users() == [UserDef(name="app_user", host="%")]
+    connection.cursor.return_value.execute.assert_not_called()
+
+
+def test_mysql_list_users_without_allowlist_access_denied_reports_not_visible():
+    from core.connectors.mysql._models import MySQLSecurityMetadataNotVisible
+
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.execute.side_effect = Exception(
+        "1142 (42000): SELECT command denied to user 'migration_e2e'@'Nitesh' for table 'user'"
+    )
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({"database": "source"}); source._conn = connection
+
+    with pytest.raises(
+        MySQLSecurityMetadataNotVisible,
+        match="not visible to the migration account",
+    ):
+        source.list_users()
+
+
+def test_mysql_list_users_without_allowlist_returns_unlocked_accounts():
+    cursor = MagicMock(); cursor.__enter__.return_value = cursor; cursor.__exit__.return_value = False
+    cursor.fetchall.return_value = [("app_user", "10.%")]
+    connection = MagicMock(); connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({"database": "source"}); source._conn = connection
+
+    assert source.list_users() == [UserDef(name="app_user", host="10.%")]
+    assert "account_locked='N'" in cursor.execute.call_args.args[0]
 
 
 def test_mysql_list_users_without_allowlist_filters_locked_accounts():
@@ -737,6 +781,50 @@ def test_mysql_global_grants_are_not_discovered_without_explicit_user_selection(
     source = MySQLSourceConnector({"database": "source"}); source._conn = connection
 
     assert source.list_grants() == []
+
+
+def test_mysql_create_function_rejects_null_ddl_with_clear_error():
+    target, cursor, connection = _target()
+    func = FunctionDef(name="fn_null", kind="function", ddl=None, schema_name="db")
+
+    with pytest.raises(RuntimeError, match="source routine definition is NULL"):
+        target.create_function(func)
+    cursor.execute.assert_not_called()
+
+
+def test_mysql_create_function_creates_with_valid_ddl():
+    target, cursor, connection = _target()
+    func = FunctionDef(name="fn_GetOrderTotal", kind="function",
+                       ddl="CREATE DEFINER=`root`@`localhost` FUNCTION fn_GetOrderTotal() RETURNS INT RETURN 1",
+                       schema_name="db")
+    target.create_function(func)
+    cursor.execute.assert_any_call("DROP FUNCTION IF EXISTS `fn_GetOrderTotal`")
+    cursor.execute.assert_any_call(
+        "CREATE DEFINER=`root`@`localhost` FUNCTION fn_GetOrderTotal() RETURNS INT RETURN 1"
+    )
+    connection.commit.assert_called()
+
+
+def test_mysql_create_trigger_rejects_null_ddl_with_clear_error():
+    target, cursor, connection = _target()
+    trigger = TriggerDef(name="tr_null", table="orders", ddl=None, schema_name="db")
+
+    with pytest.raises(RuntimeError, match="source trigger definition is NULL"):
+        target.create_trigger(trigger)
+    cursor.execute.assert_not_called()
+
+
+def test_mysql_create_trigger_creates_with_valid_ddl():
+    target, cursor, connection = _target()
+    trigger = TriggerDef(name="tr_AuditOrder", table="orders",
+                         ddl="CREATE DEFINER=`root`@`localhost` TRIGGER tr_AuditOrder BEFORE INSERT ON orders FOR EACH ROW SET NEW.id=1",
+                         schema_name="db")
+    target.create_trigger(trigger)
+    cursor.execute.assert_any_call("DROP TRIGGER IF EXISTS `tr_AuditOrder`")
+    cursor.execute.assert_any_call(
+        "CREATE DEFINER=`root`@`localhost` TRIGGER tr_AuditOrder BEFORE INSERT ON orders FOR EACH ROW SET NEW.id=1"
+    )
+    connection.commit.assert_called()
 
 
 def test_mysql_user_allowlist_filters_existing_table_grants_without_regression():

@@ -123,7 +123,15 @@ def main():
     if target_type not in TARGET_CONNECTORS:
         raise SystemExit(f"Unknown target engine: {target_type!r}. Available: {list(TARGET_CONNECTORS)}")
 
-    source = instantiate_connector(SOURCE_CONNECTORS[source_type], source_cfg.get("connection", {}))
+    source_connection = dict(source_cfg.get("connection", {}))
+    # security_users may be declared under migration: rather than under
+    # source.connection:; merge it so the source connector can apply the
+    # account allowlist without querying mysql.user.
+    if "security_users" not in source_connection:
+        migration_security_users = config.get("migration", {}).get("security_users")
+        if migration_security_users is not None:
+            source_connection["security_users"] = migration_security_users
+    source = instantiate_connector(SOURCE_CONNECTORS[source_type], source_connection)
     target_connection = dict(target_cfg.get("connection", {}))
     target_connection["source_engine"] = source_type
     target = instantiate_connector(TARGET_CONNECTORS[target_type], target_connection)

@@ -60,6 +60,11 @@ def create_trigger(
     :class:`MySQLRoutineCreationPolicyError` and re-raised from the
     original error.
     """
+    if trigger.ddl is None:
+        raise RuntimeError(
+            f"Cannot create trigger {trigger.name}: "
+            "source trigger definition is NULL"
+        )
     try:
         with conn.cursor() as cur:
             cur.execute(f"DROP TRIGGER IF EXISTS {_q(trigger.name)}")

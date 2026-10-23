@@ -299,4 +299,16 @@ def test_mysql_source_show_create_preserves_source_definer_for_target_rewrite():
     source = MySQLSourceConnector({"database": "source"})
     source._conn = connection
 
-    assert source._show_create("FUNCTION", "word_count") == ddl
+def test_mysql_source_show_create_raises_on_null_definition():
+    cursor = MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.__exit__.return_value = False
+    cursor.column_names = ["Function", "sql_mode", "Create Function", "character_set_client"]
+    cursor.fetchone.return_value = ("word_count", "", None, "utf8mb4")
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    source = MySQLSourceConnector({"database": "source"})
+    source._conn = connection
+
+    with pytest.raises(RuntimeError, match="NULL definition"):
+        source._show_create("FUNCTION", "word_count")

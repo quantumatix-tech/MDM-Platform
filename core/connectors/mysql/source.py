@@ -138,7 +138,15 @@ class MySQLSourceConnector(SourceConnector):
             row = cur.fetchone()
             for index, column_name in enumerate(cur.column_names):
                 if "create" in column_name.lower() or "original statement" in column_name.lower():
-                    return row[index]
+                    ddl = row[index]
+                    if ddl is None:
+                        raise RuntimeError(
+                            f"SHOW CREATE {kind} {name} returned a NULL definition. "
+                            "The migration account likely lacks the SHOW_ROUTINE privilege (MySQL 8.0.20+) "
+                            "needed to read stored routine definitions. Grant with: "
+                            "GRANT SHOW_ROUTINE ON *.* TO 'migration_e2e'@'%';"
+                        )
+                    return ddl
             raise RuntimeError(f"SHOW CREATE {kind} did not return a DDL column")
 
     def list_views(self) -> list[ViewDefinition]:

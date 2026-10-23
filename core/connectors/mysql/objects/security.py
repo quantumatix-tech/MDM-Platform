@@ -58,6 +58,10 @@ def _grantee_key(grantee: str) -> tuple[str, str] | None:
 def security_user_allowlist(config: dict[str, Any]) -> set[tuple[str, str]] | None:
     """Return configured user identities, or None for automatic discovery."""
     configured = config.get("security_users")
+    if configured is None:
+        # Some configs place security_users under the migration section
+        # rather than the connection section; check both locations.
+        configured = config.get("migration", {}).get("security_users")
     if not configured:
         return None
     result: set[tuple[str, str]] = set()
@@ -72,41 +76,42 @@ def security_user_allowlist(config: dict[str, Any]) -> set[tuple[str, str]] | No
 
 
 def list_users(conn: Any, config: dict[str, Any]) -> list[UserDef]:
-    """Return unlocked MySQL accounts selected by the user allowlist policy.
+    """Return MySQL accounts selected by the user allowlist policy.
 
-    Locked accounts are excluded. Authentication plugins and password
-    material are deliberately omitted.
+    Authentication plugins and password material are deliberately omitted.
+
+    When ``migration.security_users`` is configured, those accounts are
+    returned directly without querying ``mysql.user``: the operator has
+    explicitly named the accounts to migrate, so the migration account
+    needs no catalog-level visibility into ``mysql.user``. Locked-account
+    filtering cannot be applied without catalog access and is intentionally
+    skipped on this path; ``CREATE USER IF NOT EXISTS`` is idempotent.
+
+    When no allowlist is configured, automatic discovery queries
+    ``mysql.user`` and surfaces authorization failures as
+    :exc:`MySQLSecurityMetadataNotVisible` for the caller to report.
     """
     requested = security_user_allowlist(config)
     if requested is not None and not requested:
         return []
+    if requested is not None:
+        return [
+            UserDef(name=user, host=host)
+            for user, host in sorted(requested)
+            if not _is_system_account((user, host))
+        ]
     try:
         with conn.cursor() as cur:
-            if requested is None:
-                cur.execute(
-                    "SELECT User,Host FROM mysql.user "
-                    "WHERE User NOT IN ('root','mysql.sys','mysql.session','mysql.infoschema','mysqlxsys') "
-                    "AND User<>'' AND account_locked='N' ORDER BY User,Host"
-                )
-            else:
-                predicates = " OR ".join("(User=%s AND Host=%s)" for _ in requested)
-                params = tuple(value for identity in sorted(requested) for value in identity)
-                cur.execute(
-                    f"SELECT User,Host FROM mysql.user WHERE ({predicates}) AND account_locked='N' ORDER BY User,Host",
-                    params,
-                )
+            cur.execute(
+                "SELECT User,Host FROM mysql.user "
+                "WHERE User NOT IN ('root','mysql.sys','mysql.session','mysql.infoschema','mysqlxsys') "
+                "AND User<>'' AND account_locked='N' ORDER BY User,Host"
+            )
             rows = cur.fetchall()
     except Exception as exc:
         raise MySQLSecurityMetadataNotVisible(
             "MySQL account metadata is not visible to the migration account"
         ) from exc
-
-    found = {(row[0], row[1]) for row in rows}
-    if requested is not None:
-        missing = requested - found
-        if missing:
-            labels = ", ".join(f"{user}@{host}" for user, host in sorted(missing))
-            raise RuntimeError(f"Configured MySQL user is missing or not visible: {labels}")
 
     return [
         UserDef(name=user, host=host)
