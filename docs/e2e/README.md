@@ -72,7 +72,7 @@ See [environment-setup.md](environment-setup.md) for current status and diagnost
 | Engine | Config (This Laptop) | Last Verified Run | Tables | Rows | Status |
 |--------|----------------------|-------------------|--------|------|--------|
 | MSSQL | `config/mssql_local_test.yaml` | `905ce6fa6fc743e7b3e86c508448c1c7` | 9 | 28 | **VERIFIED** |
-| PostgreSQL | `config/postgresql_local_continer.yaml` | `c4405c596be5479fa82f2759299410c8` | 7 | 33 | **VERIFIED** |
+| PostgreSQL | `config/postgresql_local_continer.yaml` | `76e7c82824e741adba322dfae9625124` | 7 | 33 | **VERIFIED** |
 | MySQL | `config/mysql_local_02.yaml` | `d82f18ae5bd34164a8409a2c74911d22` | 7 | 33 | **VERIFIED** |
 
 > **Status Legend**:
