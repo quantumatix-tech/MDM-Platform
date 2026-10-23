@@ -61,7 +61,10 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - **PostgreSQL local E2E finalized.** FULL migration completed successfully
   (run `76e7c82824e741adba322dfae9625124`): 7 tables, 33 rows, 0 errors.
   All objects including functions, procedures, triggers, views, materialized
-  views, sequences, comments, and grants migrated and validated.
+- **MSSQL E2E verified (historical).** Local FULL E2E (run
+  `905ce6fa6fc743e7b3e86c508448c1c7`): 9 tables, 28 rows, 0 errors,
+  status success. Execution method: local Python (platform version 0.2.3).
+  Podman/container E2E for MSSQL is NOT VERIFIED.
 
 ### Changed
 
@@ -92,7 +95,7 @@ The application version is defined by the `version` field in `pyproject.toml`.
 
 - MySQL E2E status updated from BLOCKED to VERIFIED across all E2E docs.
 - PostgreSQL E2E run ID updated to verified run.
-- Machine-specific values labeled as historical/environment-specific.
+- MSSQL E2E evidence documented; Podman/container path remains unverified.
 
 ## [0.2.3] - 2026-10-05
 
