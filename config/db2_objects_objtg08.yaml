@@ -1,0 +1,49 @@
+# Reconstructed from validated E2E evidence (run b93dc7dbc29b479ab1561953b82b07fe)
+# Source: OBJSC01, Target: OBJTG08, Schema: OBJTEST
+# NOTE: This is a LOCAL-ONLY test config. Do not commit.
+# Reconstructed from documented settings; not byte-for-byte identical to original.
+
+alerting:
+  notifier: none
+logging:
+  file: logs/db2_e2e_cleanroom.log
+  level: INFO
+migration:
+  batch_size: 1000
+  include_schemas:
+  - OBJTEST
+  mode: full
+secrets:
+  provider: env
+source:
+  connection:
+    database: OBJSC01
+    driver: IBM DB2 ODBC DRIVER - DB2COPY1
+    host: 127.0.0.1
+    password_secret: db2_source_pass_cleanroom
+    port: 25000
+    username: db2admin
+  engine: db2
+target:
+  connection:
+    database: OBJTG08
+    driver: IBM DB2 ODBC DRIVER - DB2COPY1
+    host: 127.0.0.1
+    password_secret: db2_target_pass_cleanroom
+    port: 25000
+    source_engine: db2
+    username: db2admin
+  engine: db2
+validation:
+  mode: count
+  sample_size: 100
+  strict_grant_parity: false
+security_executor:
+  engine: db2
+  connection:
+    database: OBJTG08
+    host: 127.0.0.1
+    port: 25000
+    username: ADMIN
+    password_secret: db2_admin_pass
+    driver: IBM DB2 ODBC DRIVER - DB2COPY1

@@ -149,6 +149,36 @@ def _svg_bar_chart(table_stats: dict[str, dict], max_width: int = 420) -> str:
 </svg>"""
 
 
+def _count_phase(val: Any) -> int:
+    """Count of discrete items reported by a phase value."""
+    if isinstance(val, dict):
+        return len(val)
+    if isinstance(val, list):
+        return len(val)
+    return 0
+
+
+def _phase_label(val: Any) -> str:
+    """Human-readable short label for a phase value."""
+    if isinstance(val, dict):
+        status = val.get("status") or val.get("strategy") or "ok"
+        count = _count_phase(val)
+        return f"{status} ({count} item{'s' if count != 1 else ''})"
+    if isinstance(val, list):
+        return f"{len(val)} item{'s' if len(val) != 1 else ''}"
+    if isinstance(val, str):
+        return val[:90]
+    return str(val)
+
+
+def _is_skipped(val: Any) -> bool:
+    if isinstance(val, dict):
+        return str(val.get("status", "")).lower() == "skipped" or "skipped" in str(val.get("reason", "")).lower()
+    if isinstance(val, str):
+        return "skipped" in val.lower()
+    return False
+
+
 class ReportBuilder:
     def __init__(
         self,
@@ -189,6 +219,203 @@ class ReportBuilder:
         return report
 
     # ------------------------------------------------------------------
+    # HTML section helpers
+    # ------------------------------------------------------------------
+    def _kv_section(self, title: str, icon: str, items: list[tuple[str, str]]) -> str:
+        if not items:
+            return ""
+        rows = "".join(
+            f'<tr><td class="td-table">{k}</td><td class="td-num">{v}</td></tr>' for k, v in items
+        )
+        return f"""<section class="section">
+        <h2 class="section-title">{icon} {title}</h2>
+        <table class="data-table"><thead><tr><th>Object</th><th style="text-align:right">Count</th></tr></thead>
+        <tbody>{rows}</tbody></table>
+      </section>"""
+
+    def _detail_section(self, title: str, icon: str, detail_html: str) -> str:
+        if not detail_html:
+            return ""
+        return f"""<section class="section">
+        <h2 class="section-title">{icon} {title}</h2>
+        <div style="overflow-x:auto">{detail_html}</div>
+      </section>"""
+
+    def _phase_table(self, key: str, phases: dict[str, Any]) -> str:
+        val = phases.get(key)
+        if val is None:
+            return ""
+        rows = ""
+        if isinstance(val, dict):
+            for k, v in val.items():
+                rows += f'<tr><td class="td-table">{k}</td><td class="td-num">{v}</td></tr>'
+        elif isinstance(val, list):
+            for item in val:
+                rows += f'<tr><td class="td-table">{item}</td><td class="td-num">—</td></tr>'
+        else:
+            rows += f'<tr><td class="td-table">value</td><td class="td-num">{val}</td></tr>'
+        if not rows:
+            rows = '<tr><td colspan=2 style="text-align:center;color:#4b5563">None</td></tr>'
+        return f"""<table class="data-table"><thead><tr><th>Object</th><th style="text-align:right">Status</th></tr></thead>
+        <tbody>{rows}</tbody></table>"""
+
+    def _schemas_section(self, phases: dict[str, Any]) -> str:
+        schemas = phases.get("schemas", {})
+        if not schemas:
+            return ""
+        items = [(str(k), str(v)) for k, v in schemas.items()]
+        return self._kv_section("Schemas", "📐", items)
+
+    def _custom_types_section(self, phases: dict[str, Any]) -> str:
+        types = phases.get("custom_types", {})
+        if not types:
+            return ""
+        items = [(str(k), str(v)) for k, v in types.items()]
+        return self._kv_section("Custom Types (UDTs)", "🔷", items)
+
+    def _views_mqts_aliases_section(self, phases: dict[str, Any]) -> str:
+        blocks = []
+        views = phases.get("views")
+        if views:
+            blocks.append(("Views", "👁", self._phase_table("views", phases)))
+        mqts = phases.get("materialized_views")
+        if mqts:
+            blocks.append(("Materialized Query Tables", "📸", self._phase_table("materialized_views", phases)))
+        aliases = phases.get("aliases")
+        if aliases:
+            blocks.append(("Aliases", "🔗", self._phase_table("aliases", phases)))
+        if not blocks:
+            return ""
+        detail = ""
+        for title, icon, table in blocks:
+            detail += f"<h4 style='margin:1rem 0 0.4rem;color:#818cf8'>{icon} {title}</h4>{table}"
+        return self._detail_section("Views, MQTs & Aliases", "👁", detail)
+
+    def _sequences_section(self, phases: dict[str, Any]) -> str:
+        blocks = []
+        create_seqs = phases.get("create_sequences")
+        if create_seqs:
+            blocks.append(("Sequences Created", "🔢", self._phase_table("create_sequences", phases)))
+        advance_seqs = phases.get("advance_sequences")
+        if advance_seqs:
+            blocks.append(("Sequences Advanced", "⏭", self._phase_table("advance_sequences", phases)))
+        if not blocks:
+            return ""
+        detail = ""
+        for title, icon, table in blocks:
+            detail += f"<h4 style='margin:1rem 0 0.4rem;color:#818cf8'>{icon} {title}</h4>{table}"
+        return self._detail_section("Sequences & Identity Columns", "🔢", detail)
+
+    def _constraints_section(self, phases: dict[str, Any]) -> str:
+        constraints = phases.get("apply_constraints")
+        if not constraints:
+            return ""
+        items = [(str(k), str(v)) for k, v in constraints.items()]
+        return self._kv_section("Indexes, PKs, FKs & Constraints", "🔗", items)
+
+    def _partitions_section(self, phases: dict[str, Any]) -> str:
+        partitions = phases.get("create_partitions")
+        if not partitions:
+            return ""
+        items = [(str(k), str(v)) for k, v in partitions.items()]
+        return self._kv_section("Partitioned Tables", "🗂", items)
+
+    def _routines_triggers_section(self, phases: dict[str, Any]) -> str:
+        blocks = []
+        funcs = phases.get("functions")
+        if funcs:
+            blocks.append(("Functions & Procedures", "⚙", self._phase_table("functions", phases)))
+        triggers = phases.get("triggers")
+        if triggers:
+            blocks.append(("Triggers", "⚡", self._phase_table("triggers", phases)))
+        if not blocks:
+            return ""
+        detail = ""
+        for title, icon, table in blocks:
+            detail += f"<h4 style='margin:1rem 0 0.4rem;color:#818cf8'>{icon} {title}</h4>{table}"
+        return self._detail_section("Functions, Procedures & Triggers", "⚙", detail)
+
+    def _grants_section(self, phases: dict[str, Any]) -> str:
+        grants = phases.get("grants")
+        if not grants:
+            return ""
+        if isinstance(grants, dict):
+            items = [(str(k), str(v)) for k, v in grants.items()]
+        else:
+            items = [(str(g), "—") for g in grants]
+        return self._kv_section("Grants", "🛡", items)
+
+    def _validation_section(self, phases: dict[str, Any]) -> str:
+        validation = phases.get("validation", {})
+        if not validation:
+            return ""
+        checks = validation.get("checks", {})
+        v_mode = validation.get("mode", "")
+        v_status = validation.get("status", "")
+        rows_val = ""
+        total = 0
+        matched = 0
+        for obj, check in checks.items():
+            match = bool(check.get("match", False))
+            src_c = check.get("source_count", "—")
+            tgt_c = check.get("target_count", "—")
+            total += 1
+            if match:
+                matched += 1
+            rows_val += f"""<tr>
+          <td class="td-table">{obj}</td>
+          <td class="td-num">{src_c}</td>
+          <td class="td-num">{tgt_c}</td>
+          <td><span class="badge-small {'badge-success' if match else 'badge-error'}">{'MATCH' if match else 'MISMATCH'}</span></td>
+        </tr>"""
+        summary = f"{matched}/{total} checks passed"
+        val_html = f"""<section class="section">
+        <h2 class="section-title">✅ Validation <span class="section-sub">({v_mode})</span></h2>
+        <div style="font-size:0.88rem;color:var(--muted);margin-bottom:0.5rem">Status: {v_status} &nbsp;•&nbsp; {summary}</div>
+        <table class="data-table"><thead><tr><th>Table</th><th style="text-align:right">Source</th><th style="text-align:right">Target</th><th>Result</th></tr></thead>
+        <tbody>{rows_val or '<tr><td colspan=4 style="text-align:center;color:#4b5563">No validation data</td></tr>'}</tbody></table>
+      </section>"""
+        return val_html
+
+    def _full_sync_section(self, phases: dict[str, Any]) -> str:
+        fts = phases.get("full_target_sync")
+        data = phases.get("data")
+        if not fts and not data:
+            return ""
+        lines = []
+        if isinstance(fts, dict):
+            lines.append(f"<div>Strategy: {fts.get('strategy', '—')}</div>")
+            lines.append(f"<div>Status: <span class='badge-{'success' if fts.get('status')=='success' else 'error'}'>{fts.get('status', '—')}</span></div>")
+            cleared = fts.get("cleared")
+            if cleared is not None:
+                lines.append(f"<div>Cleared objects: {len(cleared) if isinstance(cleared, list) else cleared}</div>")
+            if fts.get("reason"):
+                lines.append(f"<div>Reason: {fts['reason']}</div>")
+        if isinstance(data, dict):
+            lines.append(f"<div>Data load status: {data.get('status', '—')}</div>")
+            lines.append(f"<div>Total source rows: {data.get('total_rows', '—')}</div>")
+            lines.append(f"<div>Loaded rows: {data.get('success', '—')}</div>")
+            lines.append(f"<div>Failed rows: {data.get('failure', '—')}</div>")
+        detail = "".join(f"<div style='margin:0.25rem 0'>{l}</div>" for l in lines)
+        return self._detail_section("FULL Replacement Status", "📦", detail)
+
+    def _skipped_section(self, phases: dict[str, Any]) -> str:
+        entries: list[tuple[str, str]] = []
+        for key, val in phases.items():
+            if key in ("data", "validation", "full_target_sync"):
+                continue
+            if _is_skipped(val):
+                entries.append((key, _phase_label(val)))
+        if not entries:
+            return ""
+        rows = "".join(f'<tr><td class="td-table">{k}</td><td>{v}</td></tr>' for k, v in entries)
+        return f"""<section class="section">
+        <h2 class="section-title">⏭ Skipped / Unsupported Operations <span class="section-sub">(explicit reasons)</span></h2>
+        <table class="data-table"><thead><tr><th>Phase</th><th>Reason</th></tr></thead>
+        <tbody>{rows}</tbody></table>
+      </section>"""
+
+    # ------------------------------------------------------------------
     # HTML
     # ------------------------------------------------------------------
     def build_html(self) -> str:
@@ -212,6 +439,18 @@ class ReportBuilder:
             total_src += src
             total_suc += suc
             total_fail += fail
+
+        # ---- Object category counts ----
+        schemas_count = _count_phase(phases.get("schemas"))
+        custom_types_count = _count_phase(phases.get("custom_types"))
+        views_count = _count_phase(phases.get("views"))
+        mqts_count = _count_phase(phases.get("materialized_views"))
+        sequences_count = _count_phase(phases.get("create_sequences")) + _count_phase(
+            phases.get("advance_sequences")
+        )
+        functions_count = _count_phase(phases.get("functions"))
+        triggers_count = _count_phase(phases.get("triggers"))
+        grants_count = _count_phase(phases.get("grants"))
 
         success_rate = f"{int(total_suc / total_src * 100)}%" if total_src > 0 else "—"
 
@@ -499,6 +738,46 @@ class ReportBuilder:
       <div class="card-label">Duration</div>
       <div class="card-value" style="font-size:1.5rem">{duration}</div>
     </div>
+    <div class="summary-card blue">
+      <div class="card-icon">📐</div>
+      <div class="card-label">Schemas</div>
+      <div class="card-value">{schemas_count}</div>
+    </div>
+    <div class="summary-card green">
+      <div class="card-icon">🔷</div>
+      <div class="card-label">Custom Types</div>
+      <div class="card-value">{custom_types_count}</div>
+    </div>
+    <div class="summary-card purple">
+      <div class="card-icon">👁</div>
+      <div class="card-label">Views</div>
+      <div class="card-value">{views_count}</div>
+    </div>
+    <div class="summary-card amber">
+      <div class="card-icon">📸</div>
+      <div class="card-label">MQTs</div>
+      <div class="card-value">{mqts_count}</div>
+    </div>
+    <div class="summary-card blue">
+      <div class="card-icon">🔢</div>
+      <div class="card-label">Sequences</div>
+      <div class="card-value">{sequences_count}</div>
+    </div>
+    <div class="summary-card purple">
+      <div class="card-icon">⚙</div>
+      <div class="card-label">Functions/Procs</div>
+      <div class="card-value">{functions_count}</div>
+    </div>
+    <div class="summary-card amber">
+      <div class="card-icon">⚡</div>
+      <div class="card-label">Triggers</div>
+      <div class="card-value">{triggers_count}</div>
+    </div>
+    <div class="summary-card green">
+      <div class="card-icon">🛡</div>
+      <div class="card-label">Grants</div>
+      <div class="card-value">{grants_count}</div>
+    </div>
   </div>
 
   <!-- Charts -->
@@ -516,6 +795,34 @@ class ReportBuilder:
 
   <!-- Validation -->
   {val_html}
+
+  <!-- Schemas & Custom Types -->
+  {self._schemas_section(phases)}
+  {self._custom_types_section(phases)}
+
+  <!-- Views, MQTs & Aliases -->
+  {self._views_mqts_aliases_section(phases)}
+
+  <!-- Sequences & Identity Columns -->
+  {self._sequences_section(phases)}
+
+  <!-- Indexes, PKs, FKs & Constraints -->
+  {self._constraints_section(phases)}
+
+  <!-- Partitioned Tables -->
+  {self._partitions_section(phases)}
+
+  <!-- Functions, Procedures & Triggers -->
+  {self._routines_triggers_section(phases)}
+
+  <!-- Grants -->
+  {self._grants_section(phases)}
+
+  <!-- FULL Replacement Status -->
+  {self._full_sync_section(phases)}
+
+  <!-- Skipped / Unsupported Operations -->
+  {self._skipped_section(phases)}
 
   <!-- Phase Details (accordion) -->
   <section class="section">

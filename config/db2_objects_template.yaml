@@ -1,0 +1,52 @@
+# Reusable Db2 Migration Configuration Template
+# Copy this file to config/db2_client.yaml and fill in your values.
+# All password values are resolved from environment variables (SECRET_<name>).
+# Includes optional security_executor section for role self-grants (SQL0554N avoidance).
+
+source:
+  engine: db2
+  connection:
+    host: <source_host>           # REQUIRED: Db2 source hostname or IP
+    port: 25000                   # OPTIONAL: default 25000 (Db2 LUW default)
+    database: <source_database>   # REQUIRED: source database name
+    username: <source_user>       # REQUIRED: source connection user
+    password_secret: db2_source_pass  # REQUIRED: env var name (without SECRET_ prefix)
+    driver: IBM DB2 ODBC DRIVER - DB2COPY1  # REQUIRED: ODBC driver name
+target:
+  engine: db2
+  connection:
+    host: <target_host>           # REQUIRED: Db2 target hostname or IP
+    port: 25000                   # OPTIONAL: default 25000
+    database: <target_database>   # REQUIRED: target database name (must be empty)
+    username: <target_user>       # REQUIRED: target connection user
+    password_secret: db2_target_pass  # REQUIRED: env var name (without SECRET_ prefix)
+    driver: IBM DB2 ODBC DRIVER - DB2COPY1  # REQUIRED: ODBC driver name
+    source_engine: db2            # REQUIRED: must be "db2" for Db2-to-Db2
+# Optional security executor for role self-grants (avoids SQL0554N).
+# Uncomment and configure if your source contains role memberships to migrate.
+# The security executor must be a separate principal (ADMIN) holding SECADM on the target.
+security_executor:
+  engine: db2
+  connection:
+    database: <target_database>   # REQUIRED: must match target database
+    host: <target_host>           # REQUIRED: must match target host
+    port: 25000                   # OPTIONAL: default 25000
+    username: <admin_user>        # REQUIRED: separate SECADM principal (not the migration user)
+    password_secret: db2_admin_pass  # REQUIRED: env var name for admin user
+    driver: IBM DB2 ODBC DRIVER - DB2COPY1  # REQUIRED: ODBC driver name
+migration:
+  mode: full                      # REQUIRED: "full" (default)
+  batch_size: 1000                # OPTIONAL: default 1000
+  include_schemas:                # REQUIRED: list of schemas to migrate
+    - <schema_name>
+secrets:
+  provider: env                   # REQUIRED: "env" (default)
+validation:
+  mode: count                     # OPTIONAL: "count" (default)
+  sample_size: 100                # OPTIONAL: default 100
+  strict_grant_parity: false      # OPTIONAL: default false (true = fail on grant differences)
+alerting:
+  notifier: none                  # OPTIONAL: "none" (default)
+logging:
+  file: logs/db2_client.log       # OPTIONAL: default logs/db2_client.log
+  level: INFO                     # OPTIONAL: default INFO
