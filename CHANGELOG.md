@@ -50,6 +50,78 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - The 4 pre-existing unit test failures (`test_cross_engine_type_safety.py` ×2,
   `test_mysql_datatypes.py` ×2) are unchanged by this work.
 
+## [0.4.0] - 2026-11-19
+
+### Added
+
+- **Db2 LUW connector integration.** Complete IBM Db2 LUW source and target
+  connectors under `core/connectors/db2/`, registered in the platform connector
+  registry (`db2` engine). Object modules: schemas, tables (ordinary +
+  range-partitioned), distinct and structured UDTs, aliases, indexes, primary
+  keys, foreign keys, UNIQUE/CHECK constraints, views, MQTs, triggers, SQL
+  functions/procedures, table/column comments, DEFAULT/generated columns,
+  identity columns, standalone sequences, grants.
+- **Db2 FULL migration orchestration.** `core/orchestration/db2_full.py` with
+  fail-closed repeat-FULL guard (runs before any target mutation), transactional
+  data load (DELETE/INSERT share one transaction, commit after count
+  validation), partition preflight before first mutation, empty-target
+  protection, identity restart safety (RESTART WITH MAX+increment).
+- **Role creation and role membership migration.** Roles discovered from
+  `SYSCAT.ROLES`/`SYSCAT.ROLEAUTH`, created via `CREATE ROLE`, memberships
+  granted via `GRANT ROLE`. Runs on a separate security executor connection
+  (SECADM) to avoid SQL0554N self-grant restriction. Single atomic executor
+  transaction with independent commit/rollback; `target._conn` never committed
+  early for role work.
+- **Structured UDT migration.** `CREATE TYPE ... AS (...) INSTANTIABLE REF
+  USING INTEGER MODE DB2SQL` with attribute discovery from `SYSCAT.ATTRIBUTES`.
+- **Alias/synonym migration.** `CREATE ALIAS ... FOR ...` with idempotent
+  conflict detection.
+- **Security executor connection.** Configured under `security_executor` in
+  YAML. Validated at startup: same target database, distinct identity from
+  migration user, SECADM authority in `SYSCAT.DBAUTH`.
+- **Three tracked Db2 configs.** `config/db2.example.yaml` (reusable public
+  example), `config/db2_objects_objtg08.yaml` (successful local acceptance),
+  `config/db2_objects_template.yaml` (reusable template with security
+  executor).
+- **Comprehensive Db2 unit tests.** 48 new test files covering role
+  transaction (visibility, durability, rollback, no early commit), full
+  atomicity, empty-target onboarding, phase 1-3 FK/object/role tests, safety
+  gate, preflight, and more.
+
+### Changed
+
+- `core/connectors/__init__.py` — Registered DB2SourceConnector/DB2TargetConnector.
+- `migration_platform/__main__.py` — Added db2 to SOURCE_CONNECTORS/TARGET_CONNECTORS
+  registries; added security executor connection setup and validation.
+- `core/orchestrator.py` — Added Db2 FULL migration dispatch path.
+- `core/reporting/report_builder.py` — Reporting enhancements.
+
+### Documentation
+
+- `docs/db2/README.md` — Index, quick start, config index, verification scripts.
+- `docs/db2/DB2_SETUP_AND_MIGRATION_GUIDE.md` — Onboarding, prerequisites,
+  minimum privileges, security executor, SQL0554N explanation, password secret
+  configuration, transaction behavior, empty-target protection, onboarding
+  checklist.
+- `docs/db2/DB2_OBJECT_SUPPORT_MATRIX.md` — Roles and structured UDTs moved
+  from NOT IMPLEMENTED/PARTIALLY SUPPORTED to SUPPORTED with evidence.
+- `docs/db2/DB2_TECHNICAL_REFERENCE.md` — Tested environment, architecture,
+  permissions, object-specific notes (roles, structured UDTs, aliases),
+  safety/recovery, troubleshooting (including SQL0554N, SQL0604N, SQL0206N),
+  acceptance evidence for run 33f9fadbeeb149bab34dc13980d0613c.
+
+### Tests
+
+- Unit tests: 1269 passed, 0 failed (includes 7 new role transaction tests).
+- Ruff: clean on all changed files.
+
+### Live E2E Acceptance
+
+- Run `33f9fadbeeb149bab34dc13980d0613c`: OBJSC01 → OBJTG08, IBM Db2 LUW
+  11.5.9, schema OBJTEST, FULL migration SUCCESS, 1 table, 2/2 rows,
+  100% success, 0 migration errors.
+
+
 ## [0.3.0] - 2026-10-23
 
 ### Added
