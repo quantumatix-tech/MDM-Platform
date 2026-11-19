@@ -36,6 +36,10 @@ from core.connectors.cosmos_mongo import (
     CosmosMongoTargetConnector,
     CosmosMongoCDCEngine,
 )
+from core.connectors.db2 import (
+    DB2SourceConnector,
+    DB2TargetConnector,
+)
 
 __all__ = [
     "SourceConnector",
@@ -63,6 +67,8 @@ __all__ = [
     "MSSQLCDCEngine",
     "CosmosMongoTargetConnector",
     "CosmosMongoCDCEngine",
+    "DB2SourceConnector",
+    "DB2TargetConnector",
     "create_cdc_engine",
 ]
 

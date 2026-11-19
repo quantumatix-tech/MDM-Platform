@@ -186,6 +186,11 @@ class MigrationOrchestrator:
 
         all_errors: list[str] = []
 
+        is_db2 = (
+            self._config.get("source", {}).get("engine") == "db2"
+            and self._config.get("target", {}).get("engine") == "db2"
+        )
+
         def _run_phase(name: str, fn: Any, progress: int, critical: bool = False) -> Any:
             """Run a migration phase, log result, update progress."""
             try:
@@ -225,7 +230,10 @@ class MigrationOrchestrator:
             result["phases"]["ensure_database"] = "success"
             self._update_status("ensure_database", 4, [])
 
-            objects = self._source.list_objects()
+            if self._config.get("source", {}).get("engine") == "db2":
+                objects = [f"{sch}.{tbl}" for sch, tbl in self._source.list_objects_with_schema()]
+            else:
+                objects = self._source.list_objects()
             result["phases"]["discover"] = {"objects": objects}
 
             # Identify partitioned tables to exclude from Phase 4 (created in Phase 4.5 instead)
@@ -328,57 +336,73 @@ class MigrationOrchestrator:
                 result["phases"]["security_users_pre_objects"] = mysql_user_results
                 self._update_status("security_users_pre_objects", 4, all_errors)
             # ---------- Phase 2: Schemas ----------
-            schema_results: dict[str, str] = {}
-            try:
-                for s in self._source.list_schemas():
+            if self._config.get("source", {}).get("engine") == "db2":
+                schema_results: dict[str, str] = []
+                include = self._config.get("migration", {}).get("include_schemas") or []
+                all_schemas = self._source.list_schemas()
+                target_schemas = [s for s in all_schemas if not include or str(s).strip().upper() in {str(i).strip().upper() for i in include}]
+                for s in target_schemas:
                     try:
-                        self._target.create_schema(s)
-                        schema_results[s.name] = "created"
+                        self._target.create_schema_if_missing(s)
+                        schema_results.append({"schema": s, "status": "created"})
                     except Exception as exc:
-                        schema_results[s.name] = f"skipped: {exc}"
-                        all_errors.append(f"schema {s.name}: {exc}")
-            except Exception as exc:
-                schema_results["_error"] = str(exc)
-                all_errors.append(f"schema discovery: {exc}")
-            result["phases"]["schemas"] = schema_results
+                        schema_results.append({"schema": s, "status": f"skipped: {exc}"})
+                        all_errors.append(f"schema {s}: {exc}")
+                result["phases"]["schemas"] = {r["schema"]: r["status"] for r in schema_results}
+            else:
+                schema_results: dict[str, str] = {}
+                try:
+                    for s in self._source.list_schemas():
+                        try:
+                            self._target.create_schema(s)
+                            schema_results[s.name] = "created"
+                        except Exception as exc:
+                            schema_results[s.name] = f"skipped: {exc}"
+                            all_errors.append(f"schema {s.name}: {exc}")
+                except Exception as exc:
+                    schema_results["_error"] = str(exc)
+                    all_errors.append(f"schema discovery: {exc}")
+                result["phases"]["schemas"] = schema_results
             self._update_status("schemas", 8, all_errors)
 
             # ---------- Phase 3: Custom Types ----------
-            type_results: dict[str, str] = {}
-            source_types: list[Any] = []
-            try:
-                source_types = list(self._source.list_types())
-                for t in source_types:
-                    try:
-                        self._target.create_type(t)
-                        type_results[t.name] = f"created ({t.kind})"
-                    except Exception as exc:
-                        type_results[t.name] = f"skipped: {exc}"
-                        all_errors.append(f"type {t.name}: {exc}")
-            except Exception as exc:
-                type_results["_error"] = str(exc)
-                all_errors.append(f"type discovery: {exc}")
-            result["phases"]["custom_types"] = type_results
+            if not is_db2:
+                type_results: dict[str, str] = {}
+                source_types: list[Any] = []
+                try:
+                    source_types = list(self._source.list_types())
+                    for t in source_types:
+                        try:
+                            self._target.create_type(t)
+                            type_results[t.name] = f"created ({t.kind})"
+                        except Exception as exc:
+                            type_results[t.name] = f"skipped: {exc}"
+                            all_errors.append(f"type {t.name}: {exc}")
+                except Exception as exc:
+                    type_results["_error"] = str(exc)
+                    all_errors.append(f"type discovery: {exc}")
+                result["phases"]["custom_types"] = type_results
             self._update_status("custom_types", 10, all_errors)
 
             # ---------- Phase 3.5: Create Sequences (before tables need them) ----------
-            seq_create_results: dict[str, str] = {}
-            try:
-                all_sequences = self._source.list_all_sequences()
-                for seq in all_sequences:
-                    try:
-                        self._target.create_sequence(seq)
-                        seq_create_results[seq.name] = "created"
-                    except Exception as exc:
-                        seq_create_results[seq.name] = f"skipped: {exc}"
-                        all_errors.append(f"sequence {seq.name}: {exc}")
-            except AttributeError:
-                # Non-PostgreSQL sources don't have list_all_sequences — skip silently
-                pass
-            except Exception as exc:
-                seq_create_results["_error"] = str(exc)
-                all_errors.append(f"sequence discovery: {exc}")
-            result["phases"]["create_sequences"] = seq_create_results
+            if not is_db2:
+                seq_create_results: dict[str, str] = {}
+                try:
+                    all_sequences = self._source.list_all_sequences()
+                    for seq in all_sequences:
+                        try:
+                            self._target.create_sequence(seq)
+                            seq_create_results[seq.name] = "created"
+                        except Exception as exc:
+                            seq_create_results[seq.name] = f"skipped: {exc}"
+                            all_errors.append(f"sequence {seq.name}: {exc}")
+                except AttributeError:
+                    # Non-PostgreSQL sources don't have list_all_sequences â€” skip silently
+                    pass
+                except Exception as exc:
+                    seq_create_results["_error"] = str(exc)
+                    all_errors.append(f"sequence discovery: {exc}")
+                result["phases"]["create_sequences"] = seq_create_results
             self._update_status("create_sequences", 12, all_errors)
 
             # ---------- Phase 4: Create Tables ----------
@@ -408,7 +432,11 @@ class MigrationOrchestrator:
             result["phases"]["object_failures"] = object_failures
             for obj_name in objects:
                 try:
-                    schema = self._source.get_schema(obj_name)
+                    if self._config.get("source", {}).get("engine") == "db2" and "." in obj_name:
+                        sch_name, tbl_name = obj_name.split(".", 1)
+                        schema = self._source.get_schema(tbl_name, schema_name=sch_name)
+                    else:
+                        schema = self._source.get_schema(obj_name)
                     schema_name = schema.schema_name or "dbo"
                     if (schema_name, obj_name) in partitioned_table_keys:
                         # Partitioned tables are created in Phase 4.5 with partition scheme applied
@@ -428,7 +456,8 @@ class MigrationOrchestrator:
                             )
                         reconciliation_results[obj_name] = outcome
                     else:
-                        self._target.create_object_if_missing(schema)
+                        if not is_db2:
+                            self._target.create_object_if_missing(schema)
                     all_schemas[obj_name] = schema
                 except Exception as exc:
                     failed_objects.add(obj_name)
@@ -688,6 +717,17 @@ class MigrationOrchestrator:
                     and partition_definition_validation_passed
                 )
             )
+            if schema_preparation_complete and self._config.get("source", {}).get("engine") == "db2" and self._config.get("target", {}).get("engine") == "db2":
+                from core.orchestration.db2_full import run_db2_full_replacement
+                replacement = run_db2_full_replacement(self, result)
+                if isinstance(replacement, dict) and replacement.get("status") != "success":
+                    raise RuntimeError(replacement.get("error", "Db2 FULL replacement failed"))
+                # DB2 replacement owns full_target_sync and every object-type
+                # phase; do not overwrite them with a hardcoded success, which
+                # would claim replacement ran when it did not. Mark preparation
+                # complete so the generic data-load / full_target_sync paths
+                # below are skipped for Db2.
+                schema_preparation_complete = False
             if schema_preparation_complete:
                 cleared_objects = self._target.clear_objects_for_full_sync(list(all_schemas))
                 result["phases"]["full_target_sync"] = {
@@ -695,7 +735,7 @@ class MigrationOrchestrator:
                     "status": "success",
                     "cleared": cleared_objects,
                 }
-            else:
+            elif not is_db2:
                 # FULL sync must never delete a parent while one of its
                 # source-managed child tables failed schema preparation and
                 # is therefore absent from the connector's managed set. Keep
@@ -731,16 +771,21 @@ class MigrationOrchestrator:
             total_rows = self._estimate_total_rows(data_load_order, schema_map)
             processed_rows = 0
             for idx, obj_name in enumerate(
-                data_load_order if schema_preparation_complete else (), start=1
+                data_load_order if (schema_preparation_complete and not (self._config.get("source", {}).get("engine") == "db2" and self._config.get("target", {}).get("engine") == "db2")) else (), start=1
             ):
                 schema = all_schemas[obj_name]
                 upsert_result = UpsertResult()
                 count: int | None = None
                 try:
-                    count = self._source.get_object_count(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
-                    rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
+                    if self._config.get("source", {}).get("engine") == "db2" and "." in obj_name:
+                        _sch, _tbl = obj_name.split(".", 1)
+                        count = self._source.get_object_count(_tbl, schema_name=_sch)
+                        rows = self._source.export_full(_tbl, schema_name=_sch)
+                    else:
+                        count = self._source.get_object_count(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
+                        rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
                     for chunk in self._chunked(rows, self._batch_size):
-                        chunk_result = self._target.upsert_batch(obj_name, iter(chunk), schema)
+                        chunk_result = self._target.upsert_batch(_tbl if (self._config.get("source", {}).get("engine") == "db2" and "." in obj_name) else obj_name, iter(chunk), schema)
                         upsert_result.success_count += chunk_result.success_count
                         upsert_result.failure_count += chunk_result.failure_count
                         upsert_result.errors.extend(chunk_result.errors)
@@ -781,7 +826,7 @@ class MigrationOrchestrator:
                     "failure": max(upsert_result.failure_count, int(obj_name in failed_objects)),
                     "errors": upsert_result.errors,
                 }
-            if not schema_preparation_complete:
+            if not schema_preparation_complete and not is_db2:
                 result["phases"]["data_load"] = {
                     "status": "skipped",
                     "reason": result["phases"]["full_target_sync"]["reason"],
@@ -847,123 +892,128 @@ class MigrationOrchestrator:
             self._update_status("apply_sequence_ownership", 65, all_errors)
 
             # ---------- Phase 10: Row-Level Security ----------
-            rls_results: dict[str, Any] = {}
-            try:
-                for obj_name, schema in all_schemas.items():
-                    if schema.rls_enabled:
-                        rls_results[obj_name] = []
-                        for policy in self._source.get_rls_policies(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None):
-                            try:
-                                self._target.apply_rls_policy(policy)
-                                rls_results[obj_name].append(f"{policy.name}: created")
-                            except Exception as exc:
-                                rls_results[obj_name].append(f"{policy.name}: skipped ({exc})")
-            except Exception as exc:
-                rls_results["_error"] = str(exc)
-            result["phases"]["row_level_security"] = rls_results
+            if not is_db2:
+                rls_results: dict[str, Any] = {}
+                try:
+                    for obj_name, schema in all_schemas.items():
+                        if schema.rls_enabled:
+                            rls_results[obj_name] = []
+                            for policy in self._source.get_rls_policies(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None):
+                                try:
+                                    self._target.apply_rls_policy(policy)
+                                    rls_results[obj_name].append(f"{policy.name}: created")
+                                except Exception as exc:
+                                    rls_results[obj_name].append(f"{policy.name}: skipped ({exc})")
+                except Exception as exc:
+                    rls_results["_error"] = str(exc)
+                result["phases"]["row_level_security"] = rls_results
             self._update_status("row_level_security", 63, all_errors)
 
             # ---------- Phase 10: Advance Sequences (set to max(col)+1 after data load) ----------
-            seq_advance_results: dict[str, list[str]] = {}
-            try:
-                all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
-                for seq in all_sequences:
-                    if seq.owned_by:
-                        # owned_by may be either "table.column" (legacy) or
-                        # "schema.table.column" (now produced by the source
-                        # connector for non-public schemas).
-                        parts = seq.owned_by.rsplit(".", 2)
-                        if len(parts) == 3:
-                            seq_schema, tbl, col = parts
-                        elif len(parts) == 2:
-                            seq_schema, tbl, col = "public", parts[0], parts[1]
-                        else:
-                            continue
-                        if tbl not in seq_advance_results:
-                            seq_advance_results[tbl] = []
-                        seq_qname = seq.name if seq_schema == "public" else f"{seq_schema}.{seq.name}"
-                        try:
-                            self._target.advance_sequence(seq_qname, tbl, col, seq.owned_by)
-                            seq_advance_results[tbl].append(f"{seq_qname}: advanced")
-                        except Exception as exc:
-                            seq_advance_results[tbl].append(f"{seq_qname}: skipped ({exc})")
-                    elif self._config.get("target", {}).get("engine") == "postgresql":
-                        try:
-                            self._target.restore_standalone_sequence_state(seq)
-                            seq_advance_results[seq.name] = ["standalone state restored"]
-                        except Exception as exc:
-                            seq_advance_results[seq.name] = [f"standalone state skipped ({exc})"]
-            except Exception as exc:
-                seq_advance_results["_error"] = [str(exc)]
-            result["phases"]["advance_sequences"] = seq_advance_results
+            if not is_db2:
+                seq_advance_results: dict[str, list[str]] = {}
+                try:
+                    all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
+                    for seq in all_sequences:
+                        if seq.owned_by:
+                            # owned_by may be either "table.column" (legacy) or
+                            # "schema.table.column" (now produced by the source
+                            # connector for non-public schemas).
+                            parts = seq.owned_by.rsplit(".", 2)
+                            if len(parts) == 3:
+                                seq_schema, tbl, col = parts
+                            elif len(parts) == 2:
+                                seq_schema, tbl, col = "public", parts[0], parts[1]
+                            else:
+                                continue
+                            if tbl not in seq_advance_results:
+                                seq_advance_results[tbl] = []
+                            seq_qname = seq.name if seq_schema == "public" else f"{seq_schema}.{seq.name}"
+                            try:
+                                self._target.advance_sequence(seq_qname, tbl, col, seq.owned_by)
+                                seq_advance_results[tbl].append(f"{seq_qname}: advanced")
+                            except Exception as exc:
+                                seq_advance_results[tbl].append(f"{seq_qname}: skipped ({exc})")
+                        elif self._config.get("target", {}).get("engine") == "postgresql":
+                            try:
+                                self._target.restore_standalone_sequence_state(seq)
+                                seq_advance_results[seq.name] = ["standalone state restored"]
+                            except Exception as exc:
+                                seq_advance_results[seq.name] = [f"standalone state skipped ({exc})"]
+                except Exception as exc:
+                    seq_advance_results["_error"] = [str(exc)]
+                result["phases"]["advance_sequences"] = seq_advance_results
             self._update_status("advance_sequences", 66, all_errors)
 
             # ---------- Phase 11: Views ----------
-            view_results: dict[str, str] = {}
-            try:
-                views_to_migrate = (
-                    postgres_source_views
-                    if postgres_source_views is not None
-                    else self._source.list_views()
-                )
-                for view in views_to_migrate:
-                    try:
-                        self._target.create_view(view)
-                        view_results[view.name] = "created"
-                    except Exception as exc:
-                        view_results[view.name] = f"error: {exc}"
-                        all_errors.append(str(exc))
-                        # Track the failure so the run status cannot report
-                        # success while the object is missing on the target.
-                        failed_objects.add(view.name)
-            except Exception as exc:
-                view_results["_error"] = str(exc)
-            result["phases"]["views"] = view_results
+            if not is_db2:
+                view_results: dict[str, str] = {}
+                try:
+                    views_to_migrate = (
+                        postgres_source_views
+                        if postgres_source_views is not None
+                        else self._source.list_views()
+                    )
+                    for view in views_to_migrate:
+                        try:
+                            self._target.create_view(view)
+                            view_results[view.name] = "created"
+                        except Exception as exc:
+                            view_results[view.name] = f"error: {exc}"
+                            all_errors.append(str(exc))
+                            # Track the failure so the run status cannot report
+                            # success while the object is missing on the target.
+                            failed_objects.add(view.name)
+                except Exception as exc:
+                    view_results["_error"] = str(exc)
+                result["phases"]["views"] = view_results
             self._update_status("views", 70, all_errors)
 
             # ---------- Phase 12: Materialized Views ----------
-            mv_results: dict[str, str] = {}
-            try:
-                for mv in self._source.list_materialized_views():
-                    try:
-                        if self._config.get("target", {}).get("engine") == "postgresql":
-                            self._target.reconcile_materialized_view(mv)
-                        else:
-                            self._target.create_materialized_view(mv)
-                        self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
-                        mv_results[mv.name] = "created+refreshed"
-                    except Exception as exc:
-                        mv_results[mv.name] = f"error: {exc}"
-                        all_errors.append(str(exc))
-            except Exception as exc:
-                mv_results["_error"] = str(exc)
-            result["phases"]["materialized_views"] = mv_results
+            if not is_db2:
+                mv_results: dict[str, str] = {}
+                try:
+                    for mv in self._source.list_materialized_views():
+                        try:
+                            if self._config.get("target", {}).get("engine") == "postgresql":
+                                self._target.reconcile_materialized_view(mv)
+                            else:
+                                self._target.create_materialized_view(mv)
+                            self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
+                            mv_results[mv.name] = "created+refreshed"
+                        except Exception as exc:
+                            mv_results[mv.name] = f"error: {exc}"
+                            all_errors.append(str(exc))
+                except Exception as exc:
+                    mv_results["_error"] = str(exc)
+                result["phases"]["materialized_views"] = mv_results
             self._update_status("materialized_views", 75, all_errors)
 
             # ---------- Phase 13: Functions & Stored Procedures ----------
-            func_results: dict[str, str] = {}
-            try:
-                for func in self._source.list_functions():
-                    func_key = (
-                        func.name if func.schema_name == "public"
-                        else f"{func.schema_name}.{func.name}"
-                    )
-                    try:
-                        self._target.create_function(func)
-                        func_results[func_key] = "created"
-                    except Exception as exc:
-                        func_results[func_key] = f"skipped: {exc}"
-                        self._record_object_failure(
-                            object_failures, all_errors, "create_function", func_key, exc
+            if not is_db2:
+                func_results: dict[str, str] = {}
+                try:
+                    for func in self._source.list_functions():
+                        func_key = (
+                            func.name if func.schema_name == "public"
+                            else f"{func.schema_name}.{func.name}"
                         )
-                        failed_objects.add(func_key)
-            except Exception as exc:
-                func_results["_error"] = str(exc)
-                self._record_object_failure(
-                    object_failures, all_errors, "list_functions", "<source>", exc
-                )
-                failed_objects.add("<source functions>")
-            result["phases"]["functions"] = func_results
+                        try:
+                            self._target.create_function(func)
+                            func_results[func_key] = "created"
+                        except Exception as exc:
+                            func_results[func_key] = f"skipped: {exc}"
+                            self._record_object_failure(
+                                object_failures, all_errors, "create_function", func_key, exc
+                            )
+                            failed_objects.add(func_key)
+                except Exception as exc:
+                    func_results["_error"] = str(exc)
+                    self._record_object_failure(
+                        object_failures, all_errors, "list_functions", "<source>", exc
+                    )
+                    failed_objects.add("<source functions>")
+                result["phases"]["functions"] = func_results
             self._update_status("functions", 80, all_errors)
 
             # ---------- Phase 14: Synonyms ----------
@@ -987,43 +1037,44 @@ class MigrationOrchestrator:
             self._update_status("synonyms", 82, all_errors)
 
             # ---------- Phase 15: Triggers ----------
-            trigger_results: dict[str, str] = {}
-            try:
-                for trigger in self._source.get_all_triggers():
-                    trigger_key = (
-                        f"{trigger.table}.{trigger.name}"
-                        if trigger.schema_name == "public"
-                        else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
-                    )
-                    try:
-                        trigger_created = self._target.create_trigger(trigger)
-                        if trigger_created is False:
-                            message = "trigger parent table missing on target"
-                            trigger_results[trigger_key] = f"skipped: {message}"
+            if not is_db2:
+                trigger_results: dict[str, str] = {}
+                try:
+                    for trigger in self._source.get_all_triggers():
+                        trigger_key = (
+                            f"{trigger.table}.{trigger.name}"
+                            if trigger.schema_name == "public"
+                            else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
+                        )
+                        try:
+                            trigger_created = self._target.create_trigger(trigger)
+                            if trigger_created is False:
+                                message = "trigger parent table missing on target"
+                                trigger_results[trigger_key] = f"skipped: {message}"
+                                self._record_object_failure(
+                                    object_failures, all_errors, "create_trigger", trigger_key, message
+                                )
+                                failed_objects.add(trigger_key)
+                            else:
+                                trigger_results[trigger_key] = "created"
+                        except Exception as exc:
+                            trigger_results[trigger_key] = f"skipped: {exc}"
                             self._record_object_failure(
-                                object_failures, all_errors, "create_trigger", trigger_key, message
+                                object_failures, all_errors, "create_trigger", trigger_key, exc
                             )
                             failed_objects.add(trigger_key)
-                        else:
-                            trigger_results[trigger_key] = "created"
-                    except Exception as exc:
-                        trigger_results[trigger_key] = f"skipped: {exc}"
-                        self._record_object_failure(
-                            object_failures, all_errors, "create_trigger", trigger_key, exc
-                        )
-                        failed_objects.add(trigger_key)
-            except Exception as exc:
-                trigger_results["_error"] = str(exc)
-                self._record_object_failure(
-                    object_failures, all_errors, "list_triggers", "<source>", exc
-                )
-                failed_objects.add("<source triggers>")
-            result["phases"]["triggers"] = trigger_results
-            if (
-                hasattr(self._target, "complete_trigger_data_load")
-                and all(value == "created" for value in trigger_results.values())
-            ):
-                self._target.complete_trigger_data_load()
+                except Exception as exc:
+                    trigger_results["_error"] = str(exc)
+                    self._record_object_failure(
+                        object_failures, all_errors, "list_triggers", "<source>", exc
+                    )
+                    failed_objects.add("<source triggers>")
+                result["phases"]["triggers"] = trigger_results
+                if (
+                    hasattr(self._target, "complete_trigger_data_load")
+                    and all(value == "created" for value in trigger_results.values())
+                ):
+                    self._target.complete_trigger_data_load()
             self._update_status("triggers", 85, all_errors)
 
             # ---------- Phase 15.5: Events (MySQL/MariaDB) ----------
@@ -1041,130 +1092,133 @@ class MigrationOrchestrator:
                 result["phases"]["events"] = event_results
 
             # ---------- Phase 16: Comments ----------
-            comment_results: dict[str, str] = {}
-            source_comments: list[Any] = []
-            try:
-                source_comments = list(self._source.list_comments())
-                for comment in source_comments:
-                    comment_key = (
-                        comment.object_name
-                        if comment.schema_name == "public"
-                        else f"{comment.schema_name}.{comment.object_name}"
-                    )
-                    try:
-                        self._target.apply_comment(comment)
-                        comment_results[comment_key] = "applied"
-                    except Exception as exc:
-                        comment_results[comment_key] = f"skipped: {exc}"
-                        all_errors.append(f"comment {comment_key}: {exc}")
-            except Exception as exc:
-                comment_results["_error"] = str(exc)
-                all_errors.append(f"comment discovery: {exc}")
-            if (
-                schema_reconciliation_enabled
-                and self._config.get("target", {}).get("engine") == "postgresql"
-            ):
+            if not is_db2:
+                comment_results: dict[str, str] = {}
+                source_comments: list[Any] = []
                 try:
-                    result["phases"]["column_comment_reconciliation"] = (
-                        self._target.reconcile_postgresql_column_comments(
-                            list(all_schemas.values()), source_comments
+                    source_comments = list(self._source.list_comments())
+                    for comment in source_comments:
+                        comment_key = (
+                            comment.object_name
+                            if comment.schema_name == "public"
+                            else f"{comment.schema_name}.{comment.object_name}"
                         )
-                    )
+                        try:
+                            self._target.apply_comment(comment)
+                            comment_results[comment_key] = "applied"
+                        except Exception as exc:
+                            comment_results[comment_key] = f"skipped: {exc}"
+                            all_errors.append(f"comment {comment_key}: {exc}")
                 except Exception as exc:
-                    result["phases"]["column_comment_reconciliation"] = {
-                        "error": str(exc)
-                    }
-                    all_errors.append(f"Column comment reconciliation: {exc}")
-            result["phases"]["comments"] = comment_results
+                    comment_results["_error"] = str(exc)
+                    all_errors.append(f"comment discovery: {exc}")
+                if (
+                    schema_reconciliation_enabled
+                    and self._config.get("target", {}).get("engine") == "postgresql"
+                ):
+                    try:
+                        result["phases"]["column_comment_reconciliation"] = (
+                            self._target.reconcile_postgresql_column_comments(
+                                list(all_schemas.values()), source_comments
+                            )
+                        )
+                    except Exception as exc:
+                        result["phases"]["column_comment_reconciliation"] = {
+                            "error": str(exc)
+                        }
+                        all_errors.append(f"Column comment reconciliation: {exc}")
+                result["phases"]["comments"] = comment_results
             self._update_status("comments", 88, all_errors)
 
             # ---------- Phase: Users, Roles & Role Memberships (Step 14) ----------
-            security_results: dict[str, str] = {}
-            # MySQL has no database-role object model, so the shared role path
-            # must not be driven for a MySQL source.
-            source_has_roles = self._config.get("source", {}).get("engine") != "mysql"
-            try:
-                if source_has_roles:
-                    for role in self._source.list_roles():
+            if not is_db2:
+                security_results: dict[str, str] = {}
+                # MySQL has no database-role object model, so the shared role path
+                # must not be driven for a MySQL source.
+                source_has_roles = self._config.get("source", {}).get("engine") != "mysql"
+                try:
+                    if source_has_roles:
+                        for role in self._source.list_roles():
+                            try:
+                                self._target.create_role_if_not_exists(role.name)
+                                security_results[f"role:{role.name}"] = "created"
+                            except Exception as exc:
+                                security_results[f"role:{role.name}"] = f"skipped: {exc}"
+                    for user in self._source.list_users():
+                        host = getattr(user, "host", None)
+                        label = f"{user.name}@{host}" if host is not None else user.name
+                        if f"USER {label}" in mysql_user_results:
+                            # Already created ahead of object DDL for its DEFINER ref.
+                            security_results[f"user:{label}"] = mysql_user_results[f"USER {label}"]
+                            continue
                         try:
-                            self._target.create_role_if_not_exists(role.name)
-                            security_results[f"role:{role.name}"] = "created"
+                            if host is None:
+                                self._target.create_user_if_not_exists(user.name)
+                            else:
+                                self._target.create_user_if_not_exists(user.name, host)
+                            security_results[f"user:{label}"] = "created"
                         except Exception as exc:
-                            security_results[f"role:{role.name}"] = f"skipped: {exc}"
-                for user in self._source.list_users():
-                    host = getattr(user, "host", None)
-                    label = f"{user.name}@{host}" if host is not None else user.name
-                    if f"USER {label}" in mysql_user_results:
-                        # Already created ahead of object DDL for its DEFINER ref.
-                        security_results[f"user:{label}"] = mysql_user_results[f"USER {label}"]
-                        continue
-                    try:
-                        if host is None:
-                            self._target.create_user_if_not_exists(user.name)
-                        else:
-                            self._target.create_user_if_not_exists(user.name, host)
-                        security_results[f"user:{label}"] = "created"
-                    except Exception as exc:
-                        security_results[f"user:{label}"] = f"skipped: {exc}"
-                if source_has_roles:
-                    for membership in self._source.list_role_memberships():
-                        try:
-                            self._target.create_role_membership(
-                                membership.member_name, membership.role_name
-                            )
-                            security_results[
-                                f"membership:{membership.member_name}->{membership.role_name}"
-                            ] = "created"
-                        except Exception as exc:
-                            security_results[
-                                f"membership:{membership.member_name}->{membership.role_name}"
-                            ] = f"skipped: {exc}"
-            except Exception as exc:
-                security_results["_error"] = str(exc)
-            result["phases"]["security"] = security_results
+                            security_results[f"user:{label}"] = f"skipped: {exc}"
+                    if source_has_roles:
+                        for membership in self._source.list_role_memberships():
+                            try:
+                                self._target.create_role_membership(
+                                    membership.member_name, membership.role_name
+                                )
+                                security_results[
+                                    f"membership:{membership.member_name}->{membership.role_name}"
+                                ] = "created"
+                            except Exception as exc:
+                                security_results[
+                                    f"membership:{membership.member_name}->{membership.role_name}"
+                                ] = f"skipped: {exc}"
+                except Exception as exc:
+                    security_results["_error"] = str(exc)
+                result["phases"]["security"] = security_results
             self._update_status("security", 89, all_errors)
 
             # ---------- Phase 16: Grants ----------
-            grant_results: list[str] = []
-            try:
-                grants = list(self._source.list_grants())
-                # Ensure all grantee roles exist on target before applying grants
-                # Only for engines with role support (not MySQL)
-                target_engine = self._config.get("target", {}).get("engine", "")
-                if target_engine != "mysql":
-                    grantees = {g.grantee for g in grants}
-                    for grantee in grantees:
-                        try:
-                            self._target.create_role_if_not_exists(grantee)
-                        except Exception as exc:
-                            grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
-                for grant in grants:
-                    if grant.object_type == "SCHEMA":
-                        grant_key = f"{grant.object_name} TO {grant.grantee}"
-                    elif self._config.get("target", {}).get("engine") == "mysql":
-                        target_database = self._config.get("target", {}).get("connection", {}).get("database", "")
-                        if grant.object_type == "GLOBAL":
-                            target_object = "*.*"
-                        elif grant.object_type == "DATABASE":
-                            target_object = f"{target_database}.*"
+            if not is_db2:
+                grant_results: list[str] = []
+                try:
+                    grants = list(self._source.list_grants())
+                    # Ensure all grantee roles exist on target before applying grants
+                    # Only for engines with role support (not MySQL)
+                    target_engine = self._config.get("target", {}).get("engine", "")
+                    if target_engine != "mysql":
+                        grantees = {g.grantee for g in grants}
+                        for grantee in grantees:
+                            try:
+                                self._target.create_role_if_not_exists(grantee)
+                            except Exception as exc:
+                                grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
+                    for grant in grants:
+                        if grant.object_type == "SCHEMA":
+                            grant_key = f"{grant.object_name} TO {grant.grantee}"
+                        elif self._config.get("target", {}).get("engine") == "mysql":
+                            target_database = self._config.get("target", {}).get("connection", {}).get("database", "")
+                            if grant.object_type == "GLOBAL":
+                                target_object = "*.*"
+                            elif grant.object_type == "DATABASE":
+                                target_object = f"{target_database}.*"
+                            else:
+                                target_object = f"{target_database}.{grant.object_name.rsplit('.', 1)[-1]}"
+                            grant_key = f"{target_object} TO {grant.grantee}"
                         else:
-                            target_object = f"{target_database}.{grant.object_name.rsplit('.', 1)[-1]}"
-                        grant_key = f"{target_object} TO {grant.grantee}"
-                    else:
-                        grant_key = (
-                            f"{grant.object_name} TO {grant.grantee}"
-                            if grant.schema_name == "public"
-                            else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
-                        )
-                    try:
-                        self._target.apply_grant(grant)
-                        grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
-                    except Exception as exc:
-                        grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
-                        all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
-            except Exception as exc:
-                grant_results.append(f"_error: {exc}")
-            result["phases"]["grants"] = grant_results
+                            grant_key = (
+                                f"{grant.object_name} TO {grant.grantee}"
+                                if grant.schema_name == "public"
+                                else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+                            )
+                        try:
+                            self._target.apply_grant(grant)
+                            grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
+                        except Exception as exc:
+                            grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
+                            all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
+                except Exception as exc:
+                    grant_results.append(f"_error: {exc}")
+                result["phases"]["grants"] = grant_results
             self._update_status("grants", 91, all_errors)
 
             # ---------- Phase 17: Validate ----------
@@ -1172,14 +1226,30 @@ class MigrationOrchestrator:
             validation_objects = [
                 obj_name for obj_name in all_schemas if obj_name not in failed_objects
             ]
-            validation = self.validate(validation_objects, schema_map=schema_map)
-            result["phases"]["validation"] = validation
-            if failed_objects:
-                result["status"] = "partial_success" if validation_objects else "failed"
-            elif all_errors:
-                result["status"] = "partial_success"
+            is_db2 = self._config.get("source", {}).get("engine") == "db2" and self._config.get("target", {}).get("engine") == "db2"
+            if is_db2:
+                validation = result.get("phases", {}).get("validation")
+                if not isinstance(validation, dict) or not validation.get("checks"):
+                    raise RuntimeError("Db2 FULL validation checks missing")
+                if validation.get("status") != "success" or not all(
+                    isinstance(check, dict) and check.get("match") is True
+                    for check in validation["checks"].values()
+                ):
+                    raise RuntimeError("Db2 FULL validation failed")
+                # Db2 replacement owns the run and sets result["status"];
+                # make the success explicit here once the validation guard
+                # passes so the final status is never missing or inherited.
+                result["status"] = "success"
             else:
-                result["status"] = validation.get("status", "unknown")
+                validation = self.validate(validation_objects, schema_map=schema_map)
+                result["phases"]["validation"] = validation
+            if not is_db2:
+                if failed_objects:
+                    result["status"] = "partial_success" if validation_objects else "failed"
+                elif all_errors:
+                    result["status"] = "partial_success"
+                else:
+                    result["status"] = validation.get("status", "unknown")
             self._update_status("completed", 100, all_errors)
 
         except Exception as exc:
@@ -1224,12 +1294,12 @@ class MigrationOrchestrator:
 
     def _apply_schema_scope(self, source: Any) -> None:
         """
-        STEP 3B — propagate ``migration.include_schemas`` from the top-level
+        STEP 3B â€” propagate ``migration.include_schemas`` from the top-level
         config down to the source connector before ``connect()`` is called.
 
         Backward compatible: if ``migration.include_schemas`` is not set,
         the connector falls back to its own default (``["public"]``), which
-        preserves every pre-existing PostgreSQL → PostgreSQL behavior.
+        preserves every pre-existing PostgreSQL â†’ PostgreSQL behavior.
         """
         include_schemas = self._config.get("migration", {}).get("include_schemas")
         if include_schemas is None:
@@ -1263,17 +1333,17 @@ class MigrationOrchestrator:
         opt-in is required before the method:
           1. Reads postgresql.conf path from the database
           2. Patches/adds  wal_level = logical  in that file
-          3. Restarts the PostgreSQL service (tries pg_ctl → net stop/start → systemctl)
+          3. Restarts the PostgreSQL service (tries pg_ctl â†’ net stop/start â†’ systemctl)
           4. Reconnects the source connector and verifies the change
           5. Raises RuntimeError with manual instructions if auto-restart fails
         """
-        # ── 1. Check current value ────────────────────────────────────────────
+        # â”€â”€ 1. Check current value â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         try:
             with self._source._conn.cursor() as cur:
                 cur.execute("SHOW wal_level")
                 wal_level = cur.fetchone()[0]
         except Exception:
-            # If source is not PostgreSQL (MySQL, MSSQL etc.) this will fail — skip silently
+            # If source is not PostgreSQL (MySQL, MSSQL etc.) this will fail â€” skip silently
             return
 
         if wal_level == "logical":
@@ -1298,7 +1368,7 @@ class MigrationOrchestrator:
                 "the Migration Platform to restart the source PostgreSQL service."
             )
 
-        # ── 2. Find postgresql.conf ───────────────────────────────────────────
+        # â”€â”€ 2. Find postgresql.conf â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         try:
             with self._source._conn.cursor() as cur:
                 cur.execute("SHOW config_file")
@@ -1309,7 +1379,7 @@ class MigrationOrchestrator:
                 "Please manually set  wal_level = logical  and restart PostgreSQL."
             ) from exc
 
-        # ── 3. Patch postgresql.conf ──────────────────────────────────────────
+        # â”€â”€ 3. Patch postgresql.conf â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         try:
             text = config_file.read_text(encoding="utf-8")
             # Replace any existing wal_level line (commented or not)
@@ -1320,24 +1390,24 @@ class MigrationOrchestrator:
                 flags=re.MULTILINE,
             )
             if n == 0:
-                # Line not found at all — append it
+                # Line not found at all â€” append it
                 new_text = text.rstrip() + "\nwal_level = logical\t\t\t# auto-set by migration-platform\n"
             config_file.write_text(new_text, encoding="utf-8")
             audit_log(phase="preflight_cdc", status="config_patched",
                       details={"config_file": str(config_file), "replacements": n})
         except PermissionError as exc:
             raise RuntimeError(
-                f"Cannot write to {config_file} — permission denied.\n"
+                f"Cannot write to {config_file} â€” permission denied.\n"
                 "Run this command as Administrator, or manually add:\n"
                 "  wal_level = logical\n"
                 f"to {config_file} and restart PostgreSQL."
             ) from exc
 
-        # ── 4. Restart PostgreSQL ─────────────────────────────────────────────
+        # â”€â”€ 4. Restart PostgreSQL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         data_dir = config_file.parent
         self._restart_postgresql(data_dir)
 
-        # ── 5. Reconnect and verify ───────────────────────────────────────────
+        # â”€â”€ 5. Reconnect and verify â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         time.sleep(3)   # brief pause for service to fully start
         try:
             self._source.connect()
@@ -1368,7 +1438,7 @@ class MigrationOrchestrator:
         """
         errors: list[str] = []
 
-        # ── Method 1: pg_ctl (works if we have OS access to the data dir) ─────
+        # â”€â”€ Method 1: pg_ctl (works if we have OS access to the data dir) â”€â”€â”€â”€â”€
         pg_bin = data_dir.parent / "bin"
         pg_ctl = pg_bin / ("pg_ctl.exe" if platform.system() == "Windows" else "pg_ctl")
         if pg_ctl.exists():
@@ -1385,7 +1455,7 @@ class MigrationOrchestrator:
             except Exception as exc:
                 errors.append(f"pg_ctl: {exc}")
 
-        # ── Method 2: Windows — net stop / net start ─────────────────────────
+        # â”€â”€ Method 2: Windows â€” net stop / net start â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if platform.system() == "Windows":
             for svc in ["postgresql-x64-18", "postgresql-x64-17", "postgresql-x64-16",
                         "postgresql-x64-15", "postgresql"]:
@@ -1401,7 +1471,7 @@ class MigrationOrchestrator:
                 except Exception as exc:
                     errors.append(f"net stop/start {svc}: {exc}")
 
-        # ── Method 3: Linux — systemctl ───────────────────────────────────────
+        # â”€â”€ Method 3: Linux â€” systemctl â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if platform.system() == "Linux":
             for svc in ["postgresql", "postgresql-18", "postgresql-17",
                         "postgresql-16", "postgresql-15"]:
@@ -1418,14 +1488,14 @@ class MigrationOrchestrator:
                 except Exception as exc:
                     errors.append(f"systemctl {svc}: {exc}")
 
-        # ── All methods failed ────────────────────────────────────────────────
+        # â”€â”€ All methods failed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         audit_log(phase="preflight_cdc", status="restart_failed",
                   details={"errors": errors})
         win_cmd = "Restart-Service postgresql-x64-18   # Run PowerShell as Administrator"
         linux_cmd = "sudo systemctl restart postgresql"
         raise RuntimeError(
             "Could not restart PostgreSQL automatically.\n"
-            "postgresql.conf has been updated — please restart PostgreSQL manually:\n"
+            "postgresql.conf has been updated â€” please restart PostgreSQL manually:\n"
             f"  Windows: {win_cmd}\n"
             f"  Linux:   {linux_cmd}\n"
             f"Attempted methods failed with: {'; '.join(errors)}"
@@ -1667,11 +1737,16 @@ class MigrationOrchestrator:
             processed_rows = 0
             for idx, obj_name in enumerate(data_load_order, start=1):
                 schema = all_schemas[obj_name]
-                count = self._source.get_object_count(obj_name, schema.schema_name if hasattr(schema, "schema_name") else None)
-                rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
+                if self._config.get("source", {}).get("engine") == "db2" and "." in obj_name:
+                    _sch, _tbl = obj_name.split(".", 1)
+                    count = self._source.get_object_count(_tbl, schema_name=_sch)
+                    rows = self._source.export_full(_tbl, schema_name=_sch)
+                else:
+                    count = self._source.get_object_count(obj_name, schema.schema_name if hasattr(schema, "schema_name") else None)
+                    rows = self._source.export_full(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None)
                 upsert_result = UpsertResult()
                 for chunk in self._chunked(rows, self._batch_size):
-                    chunk_result = self._target.upsert_batch(obj_name, iter(chunk), schema)
+                    chunk_result = self._target.upsert_batch(_tbl if (self._config.get("source", {}).get("engine") == "db2" and "." in obj_name) else obj_name, iter(chunk), schema)
                     upsert_result.success_count += chunk_result.success_count
                     upsert_result.failure_count += chunk_result.failure_count
                     upsert_result.errors.extend(chunk_result.errors)
@@ -1969,7 +2044,7 @@ class MigrationOrchestrator:
             if not check.get("match", False):
                 all_passed = False
 
-        results["status"] = "success" if all_passed else "mismatch"
+        results["status"] = "success" if (all_passed and bool(results["checks"])) else ("failed" if not results["checks"] else "mismatch")
         return results
 
     def rollback(self) -> dict[str, Any]:
@@ -2059,3 +2134,6 @@ class MigrationOrchestrator:
         result["errors"] = all_errors
         audit_log(phase="cdc_loop", status="completed", details=result)
         return result
+
+
+

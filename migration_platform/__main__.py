@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.audit_logger import configure_file_logging, get_run_id
 from core.connectors import (
     CosmosMongoTargetConnector,
+    DB2SourceConnector,
+    DB2TargetConnector,
     MongoSourceConnector,
     MongoTargetConnector,
     MSSQLSourceConnector,
@@ -43,6 +45,7 @@ SOURCE_CONNECTORS = {
     "mongodb": MongoSourceConnector,
     "mysql": MySQLSourceConnector,
     "mssql": MSSQLSourceConnector,
+    "db2": DB2SourceConnector,
 }
 
 TARGET_CONNECTORS = {
@@ -51,6 +54,7 @@ TARGET_CONNECTORS = {
     "mysql": MySQLTargetConnector,
     "mssql": MSSQLTargetConnector,
     "cosmos_mongo": CosmosMongoTargetConnector,
+    "db2": DB2TargetConnector,
 }
 
 
@@ -136,6 +140,42 @@ def main():
     target_connection["source_engine"] = source_type
     target = instantiate_connector(TARGET_CONNECTORS[target_type], target_connection)
 
+    # Optional security executor for self-grants (SQL0554N avoidance)
+    security_executor_conn = None
+    sec_cfg = config.get("security_executor", {})
+    if sec_cfg:
+        sec_type = sec_cfg.get("engine", target_type)
+        sec_connection = dict(sec_cfg.get("connection", {}))
+        sec_connection["source_engine"] = source_type
+        sec_connector = instantiate_connector(TARGET_CONNECTORS.get(sec_type, TARGET_CONNECTORS[target_type]), sec_connection)
+        # Resolve password_secret using the existing secret provider
+        from core.secrets import create_secret_provider
+        sec_resolver = create_secret_provider(config)
+        if "password_secret" in sec_connection:
+            sec_connector._config["password"] = sec_resolver.resolve(sec_connection["password_secret"])
+        sec_connector.connect()
+        security_executor_conn = getattr(sec_connector, "_conn", None)
+        if security_executor_conn is None or not hasattr(security_executor_conn, "cursor"):
+            raise SystemExit("Security executor connection failed: _conn is None")
+        with security_executor_conn.cursor() as _c:
+            _c.execute("SELECT CURRENT SERVER, SESSION_USER FROM SYSIBM.SYSDUMMY1")
+            _row = _c.fetchone()
+            _db = str(_row[0]).strip().upper() if _row else ""
+            _user = str(_row[1]).strip().upper() if _row else ""
+            _c.execute("SELECT SECURITYADMAUTH FROM SYSCAT.DBAUTH WHERE GRANTEE = SESSION_USER AND GRANTEETYPE = 'U'")
+            _auth = _c.fetchone()
+        # Validate target database
+        _target_db = str(target_connection.get("database", "")).strip().upper()
+        if _target_db and _db != _target_db:
+            raise SystemExit(f"Security executor connected to wrong database: {_db} != {_target_db}")
+        # Validate distinct identity (must differ from migration user)
+        _migration_user = str(target_connection.get("username", "")).strip().upper()
+        if _user == _migration_user:
+            raise SystemExit(f"Security executor must differ from migration user: {_user}")
+        # Validate SECADM
+        if not _auth or str(_auth[0]).strip().upper() not in ("Y", "G"):
+            raise SystemExit("Security executor lacks SECADM authority")
+
     # ---- Audit log to file (suppress stdout noise when rich is active) ----
     use_live_ui = not args.no_live_ui
     log_path = configure_file_logging(log_dir="logs", suppress_stdout=use_live_ui)
@@ -156,6 +196,9 @@ def main():
     reporter = _CompoundReporter([status_server, progress_display])
 
     orchestrator = MigrationOrchestrator(source, target, config, status_server=reporter)
+    orchestrator._security_executor_conn = security_executor_conn
+    if security_executor_conn is not None:
+        orchestrator._security_executor_connector = sec_connector
 
     start_time = time.time()
 
@@ -257,8 +300,8 @@ def main():
     # This means http://localhost:{port}/reports/ remains accessible
     # until the user explicitly stops it.
     print(f"\n  Report server is running at http://{local_ip}:{args.port}/")
-    print(f"  Share that URL with your team to view all migration reports.")
-    print(f"  Press Ctrl+C to stop the server.\n")
+    print("  Share that URL with your team to view all migration reports.")
+    print("  Press Ctrl+C to stop the server.\n")
 
     try:
         status_server.run()   # blocks until Ctrl+C
@@ -268,3 +311,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
