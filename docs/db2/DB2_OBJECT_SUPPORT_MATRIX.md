@@ -1,46 +1,61 @@
 # Db2 Object Support Matrix
 
-| Object Type | Discovery | Target DDL | Data Handling | Validation | Unit Test | Live E2E | Support Status | Evidence / Limitation |
-|-------------|-----------|------------|---------------|------------|-----------|----------|----------------|----------------------|
-| Schemas | ✅ `schema.py` | ✅ `schema.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Ordinary tables | ✅ `table.py` | ✅ `ddl.py` | ✅ `loader.py` | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Range-partitioned tables | ✅ `partition.py` | ✅ `ddl.py` | ✅ `loader.py` | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Columns / data types | ✅ `table.py` | ✅ `ddl.py` | ✅ | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Distinct UDTs | ✅ `udt_alias.py` | ✅ `target_udt_alias.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Structured UDTs | ✅ `udt_alias.py` | ✅ `target_udt_alias.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run 33f9... (OBJTEST.ADDRESS_TYPE, METATYPE=R) |
-| DEFAULT columns | ✅ `table.py:90-218` | ✅ `ddl.py:16-130` | N/A | ✅ `check_default.py` | ✅ | ✅ | ✅ | SUPPORTED | 8/8 matched |
-| Generated columns | ✅ `table.py` | ✅ `ddl.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Identity columns | ✅ `identity.py` | ✅ `ddl.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | RESTART WITH MAX+increment |
-| Identity (increment=0) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | NOT SUPPORTED | Collision risk |
-| Standalone sequences | ✅ `sequence.py` | ✅ `target_sequence.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Primary keys | ✅ `constraint.py` | ✅ `target_constraint.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Foreign keys | ✅ `foreign_key.py` | ✅ `target_foreign_key.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| UNIQUE constraints | ✅ `constraint.py` | ✅ `target_constraint.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| CHECK constraints | ✅ `constraint.py` | ✅ `target_constraint.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Indexes | ✅ `index.py` | ✅ `target_index.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Views | ✅ `view.py` | ✅ `target_view.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| MQTs | ✅ `mqt.py` | ✅ `target_mqt.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Deferred refresh |
-| Aliases | ✅ `udt_alias.py` | ✅ `target_udt_alias.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run 33f9... (EMP_SYNONYM alias) |
-| SQL functions | ✅ `routine.py` | ✅ `target_routine.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| SQL procedures | ✅ `routine.py` | ✅ `target_routine.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Triggers | ✅ `trigger.py` | ✅ `target_trigger.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | 2/2 valid+enabled |
-| Table/column comments | ✅ `comment.py` | ✅ `comment.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run b93dc... |
-| Grants | ✅ `grant.py` | ✅ `target_grant.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Ownership-generated = informational |
-| Roles and role memberships | ✅ `role.py` | ✅ `target_role.py` | N/A | ✅ | ✅ | ✅ | ✅ | SUPPORTED | Run 33f9... (MIG_READ_ROLE, SECADM executor) |
-| Synonyms | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | NOT IMPLEMENTED | Db2 aliases cover this use case |
-| Composite/cyclic FKs | ⚠️ | ⚠️ | N/A | ⚠️ | ⚠️ | ⚠️ | ⚠️ | NOT LIVE-TESTED | Not specifically tested |
-| CDC/incremental | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | OUT OF SCOPE | Intentionally excluded from this release |
+## A. Verified / Supported Object Capabilities
+
+| Object | Implementation | Unit Tests | Live E2E | Status | Evidence |
+|--------|---------------|------------|----------|--------|----------|
+| Schemas | `schema.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` (9 tables, 22 rows, 0 errors) |
+| Ordinary tables | `table.py`, `ddl.py`, `loader.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Range-partitioned tables | `partition.py`, `ddl.py`, `loader.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Columns / data types | `table.py`, `ddl.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Distinct UDTs | `udt_alias.py`, `target_udt_alias.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Structured UDTs | `udt_alias.py`, `target_udt_alias.py` | ✅ | ✅ | SUPPORTED | Run `33f9fadbeeb149bab34dc13980d0613c` (OBJTEST.ADDRESS_TYPE, METATYPE=R) |
+| DEFAULT columns | `table.py`, `ddl.py`, `check_default.py` | ✅ | ✅ | SUPPORTED | 8/8 matched |
+| Generated columns | `table.py`, `ddl.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Identity columns (normal increment) | `identity.py`, `ddl.py` | ✅ | ✅ | SUPPORTED | RESTART WITH MAX+increment |
+| Standalone sequences | `sequence.py`, `target_sequence.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Primary keys | `constraint.py`, `target_constraint.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Foreign keys (single-column) | `foreign_key.py`, `target_foreign_key.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| UNIQUE constraints | `constraint.py`, `target_constraint.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| CHECK constraints | `constraint.py`, `target_constraint.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Indexes | `index.py`, `target_index.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Views | `view.py`, `target_view.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| MQTs | `mqt.py`, `target_mqt.py` | ✅ | ✅ | SUPPORTED | Deferred refresh |
+| Db2 Aliases (synonym use case) | `udt_alias.py`, `target_udt_alias.py` | ✅ | ✅ | SUPPORTED | Run `33f9fadbeeb149bab34dc13980d0613c` (EMP_SYNONYM alias) |
+| SQL functions | `routine.py`, `target_routine.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| SQL procedures | `routine.py`, `target_routine.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Triggers | `trigger.py`, `target_trigger.py` | ✅ | ✅ | SUPPORTED | 2/2 valid+enabled |
+| Table/column comments | `comment.py` | ✅ | ✅ | SUPPORTED | Run `b93dc7dbc29b479ab1561953b82b07fe` |
+| Grants | `grant.py`, `target_grant.py` | ✅ | ✅ | SUPPORTED | Ownership-generated = informational |
+| Roles and role memberships | `role.py`, `target_role.py` | ✅ | ✅ | SUPPORTED | Run `33f9fadbeeb149bab34dc13980d0613c` (MIG_READ_ROLE) |
+
+## B. Implemented But Acceptance Pending
+
+| Object | Implementation | Unit Tests | Live E2E | Status | Evidence / Limitation |
+|--------|---------------|------------|----------|--------|----------------------|
+| Foreign keys (composite / multi-column) | `foreign_key.py`, `target_foreign_key.py` | ✅ | NOT VERIFIED | CODE PRESENT / LIVE E2E NOT VERIFIED | Multi-column FK discovery and DDL generation exist via `SYSCAT.KEYCOLUSE`; FK ordering unit-tested. No specific live multi-column FK E2E evidence in report JSONs. |
+
+## C. Known Limitations / Future Scope
+
+| Item | Category | Evidence / Limitation |
+|------|----------|----------------------|
+| Foreign keys (cyclic) | NOT SUPPORTED | `db2_fk_order.py` detects dependency cycles and raises `ValueError("Foreign key dependency cycle detected")`. Cyclic FKs are rejected — not migrated. Future implementation plan documented in `DB2_TECHNICAL_REFERENCE.md` section 8a (deferred constraint creation after data load; not implemented in 0.4.0). |
+| Identity increment=0 | NOT SUPPORTED BY CODE | Code computes `nxt = MAX + increment`; increment=0 yields `nxt = MAX` causing collision (verified by unit test `test_increment_zero_rejected`). Code does not explicitly reject increment=0 at discovery/DDL time. Db2 LUW `INCREMENT BY 0` rejection claim is unverified — do not state it as fact. |
+| CDC / incremental migration | OUT OF SCOPE | Intentionally excluded from this Db2 release. Requires Db2 CDC infrastructure. |
+| Least-privilege permissions | NOT LIVE VERIFIED | Tested setup used DBADM/SECADM. Proposed narrower privileges (CREATEIN, SELECT/INSERT/UPDATE/DELETE, USAGE, EXECUTE) are not verified. Security deployment limitation, not an object type. |
 
 ### Legend
-- ✅ Implemented and verified
-- ❌ Not implemented
-- ⚠️ Implemented but not specifically tested
 
-### PENDING FEATURE DECISIONS
+| Symbol | Meaning |
+|--------|---------|
+| ✅ | Implemented and verified by unit test and/or live E2E evidence |
+| ❌ | Not implemented / not supported |
+| NOT VERIFIED | Code exists but no specific live E2E evidence |
 
-| Feature | Functional Req | Technical Feasibility | Security Impact | Effort/Risk | Recommendation |
-|---------|---------------|----------------------|-----------------|-------------|----------------|
-| CDC incremental | Real-time sync | Feasible (Db2 CDC) | Medium | High/High | Defer to separate phase |
-| Composite/cyclic FKs | Multi-column FKs | Feasible | Low | Medium/Medium | Implement if needed |
-| Increment=0 identity | Support zero-increment | Not feasible (collision) | None | N/A/N/A | Reject |
-| Least-privilege setup | Narrower target privileges | Feasible | Medium | Medium/Medium | Proposed, not verified; DBADM/SECADM tested |
+### Evidence References
+
+- **Run `33f9fadbeeb149bab34dc13980d0613c`** (OBJSC01 → OBJTG08): FULL migration SUCCESS, 1 table, 2/2 rows, 0 migration errors. Verified: OBJTEST.ADDRESS_TYPE structured UDT (METATYPE=R), OBJTEST.EMP_SYNONYM alias, MIG_READ_ROLE role membership.
+- **Run `b93dc7dbc29b479ab1561953b82b07fe`** (E2ESRC02 → E2ETGT07): 9 tables, 22 rows, 0 mismatches, 0 errors, report JSON status="success".
+- **Run `96980b310bca4d88ab6bc04b101b1f2c`** (E2ESRC02 → E2ETGT07): 9 tables, 22 rows, 0 mismatches, 0 errors, report JSON status="success".
+- **Run `30f998eb2f9e4827b539d76dfdc30f49`** (E2ESRC02 → E2ETGT07): NO report file found in `reports/`; status cannot be verified.
+- **Unit tests**: 1269 passed, 0 failed (includes Db2 role transaction tests and FK edge-case tests).

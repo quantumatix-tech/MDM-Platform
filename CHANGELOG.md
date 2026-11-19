@@ -44,11 +44,12 @@ The application version is defined by the `version` field in `pyproject.toml`.
 
 ### Notes
 
-- The Docker image build and container run have been verified locally with
-  Podman 5.4.2. The runtime manifest inside the container correctly reports
-  application version 0.2.3, Python 3.11.9, and installed package versions.
-- The 4 pre-existing unit test failures (`test_cross_engine_type_safety.py` ×2,
-  `test_mysql_datatypes.py` ×2) are unchanged by this work.
+- The Docker image build and container run were verified locally with
+  Podman 5.4.2 during the 0.2.3 release cycle. The runtime manifest inside
+  the container reported application version 0.2.3 at that time (historical
+  evidence, not current version evidence).
+- Unit tests: 1269 passed, 0 failed as of the 0.4.0 release. No known
+  pre-existing failures remain in the current baseline.
 
 ## [0.4.0] - 2026-11-19
 

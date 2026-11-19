@@ -8,16 +8,18 @@
 
 ## Quick Start
 
-```bash
+Run from the repository root in Windows PowerShell:
+
+```powershell
 # 1. Copy config template
-cp config/db2.example.yaml config/db2_client.yaml
+Copy-Item config/db2.example.yaml config/db2_client.yaml
 
-# 2. Set secrets (PowerShell)
-$env:SECRET_db2_source_pass = "your_source_password"
-$env:SECRET_db2_target_pass = "your_target_password"
+# 2. Edit config/db2_client.yaml with your host, port, database, username, schema
 
-# 3. Optional: security executor for role self-grants (avoids SQL0554N)
-$env:SECRET_db2_admin_pass = "your_admin_password"
+# 3. Set secrets (PowerShell, never hardcode passwords)
+$env:SECRET_db2_source_pass = (Read-Host -AsSecureString -Prompt "Source DB2ADMIN password")
+$env:SECRET_db2_target_pass = (Read-Host -AsSecureString -Prompt "Target DB2ADMIN password")
+$env:SECRET_db2_admin_pass = (Read-Host -AsSecureString -Prompt "Target ADMIN security executor password")
 
 # 4. Run preflight (read-only)
 python scripts/db2/verify_db2_e2e_preflight.py --config config/db2_client.yaml
@@ -41,15 +43,20 @@ python scripts/db2/verify_db2_acceptance.py --config config/db2_client.yaml
 
 | Config File | Status | Purpose |
 |-------------|--------|---------|
-| `config/db2.example.yaml` | **Tracked** | Reusable public example template |
-| `config/db2_objects_objtg08.yaml` | **Tracked** | Successful local acceptance configuration (OBJSC01→OBJTG08) |
-| `config/db2_objects_template.yaml` | **Tracked** | Reusable Db2 template with security executor |
+| `config/db2.example.yaml` | Tracked | Reusable public example template |
+| `config/db2_objects_objtg08.yaml` | Tracked | Successful local acceptance configuration (OBJSC01→OBJTG08) |
+| `config/db2_objects_template.yaml` | Tracked | Reusable Db2 template with security executor |
 | `config/db2_client.yaml` | Local-only | Copy from `db2.example.yaml`; never commit |
 | `config/db2_e2e*.yaml` | Local-only | E2E test configs; gitignored |
 | `config/db2_test*.yaml` | Local-only | Test configs; gitignored |
 | `config/db2_connection_test.yaml` | Local-only | Connection test config; gitignored |
 
 > All `db2_objects_objtg*.yaml` configs except `objtg08` are obsolete local-only test configs and are **not tracked**. `config/db2_client.yaml` is never committed (gitignored).
+>
+> Tracked Db2 configs confirmed via `git ls-files config/`:
+> - `config/db2.example.yaml`
+> - `config/db2_objects_objtg08.yaml`
+> - `config/db2_objects_template.yaml`
 
 ## Verification Scripts
 

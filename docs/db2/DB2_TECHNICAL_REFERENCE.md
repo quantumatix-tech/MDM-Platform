@@ -111,6 +111,8 @@ Db2 prohibits a principal from granting privileges (including role membership) t
 
 **Resolution**: All role DDL (`CREATE ROLE`, `GRANT ROLE`) runs on the security executor connection, which holds SECADM and can grant to any principal including itself. SQL0554N is avoided because the grantor (ADMIN/SECADM) differs from the grantee.
 
+SQL0554N self-grants are executed through the distinct security executor connection, not the migration connection.
+
 ### Security Gaps
 1. Minimum viable privileges not yet documented (DBADM used as convenience)
 2. Ownership-generated privilege classification changed after recorded acceptance run (needs fresh read-only verification)
@@ -131,7 +133,7 @@ Db2 prohibits a principal from granting privileges (including role membership) t
 - DDL: `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (...) REFERENCES ... (...)`
 - Ordering: `core/orchestration/db2_fk_order.py`
 - Post-commit DDL failure reported as partial completion
-- Single-column same-schema scope verified; composite/cyclic pending
+- Composite FK ordering unit-tested; no live E2E evidence for composite FKs. Cyclic FKs rejected by design.
 
 ### Sequences and Identity
 - Source: `SYSCAT.SEQUENCES` with `DATATYPEID` mapping
@@ -142,7 +144,7 @@ Db2 prohibits a principal from granting privileges (including role membership) t
 - NEXTCACHEFIRSTVALUE is cache block start, NOT next value
 - Negative increments use MIN instead of MAX
 - Bounds checking: restart value must be within [minvalue, maxvalue]
-- Increment=0 not supported (collision risk)
+- Increment=0 identity not supported by code — restart computes MAX+0=MAX causing collision (verified by unit test `test_increment_zero_rejected`). Code does not explicitly reject increment=0 at discovery/DDL time. Db2 LUW INCREMENT BY 0 rejection claim is not verified by code or tests.
 
 ### Views
 - Source: `SYSCAT.VIEWS` (VIEWNAME, TEXT, VALID)
@@ -204,6 +206,7 @@ Db2 prohibits a principal from granting privileges (including role membership) t
 - DDL: `CREATE ALIAS schema.alias FOR schema.base_table`
 - Idempotent: existing aliases with matching definition are skipped
 - Alias conflict (different base table) raises RuntimeError
+- Db2 LUW aliases serve the synonym use case
 
 ### Partitioning
 - Discovery via `SYSCAT.DATAPARTITIONS`
@@ -247,10 +250,17 @@ Partition preflight runs before any target mutation; mismatch blocks migration.
 
 ### Role Transaction (Security Executor)
 - All role DDL runs on the executor connection (SECADM)
-- Committed independently of `target._conn`
+- Committed independently of `target._conn` via `executor_conn.commit()`
 - `target._conn` is never committed early for role work
-- On failure: executor transaction rolled back; no orphaned roles or partial memberships
+- On failure: executor transaction rolled back via `executor_conn.rollback()`; no orphaned roles or partial memberships
 - Committed grants survive executor connection close
+
+### Transaction Visibility and Limitations
+- Once the role transaction commits on the security executor connection, a later rollback of another connection cannot undo it. Committed role definitions and memberships become durable and visible to all connections.
+- Once the data-load transaction commits on `target._conn`, the committed data is durable. A later rollback of another connection cannot undo it.
+- A later failure (e.g. post-commit DDL error) may leave partial committed objects on the target.
+- There is **no guaranteed global atomicity** across the two connections (security executor and target) without distributed transaction support. The two transactions commit independently.
+- Failed or partially modified targets must not be re-run blindly. Use a fresh empty target for recovery.
 
 ### Safety Gates
 - Trigger enabled blocks Repeat FULL before DELETE
@@ -280,10 +290,10 @@ Partition preflight runs before any target mutation; mismatch blocks migration.
 | DB2-17 Generated/DECFLOAT | 83f22574b72241c49ca0f47e35be79d8 | SUCCESS |
 | DB2-18 Aliases/UDTs | 799430168f1e4156901933a94ef07837 | SUCCESS |
 | DB2-19 Partitioning | 103d7d9a920d43c3b30df4d194863722 | SUCCESS |
-| DB2-20 Roles/Structured UDTs | 33f9fadbeeb149bab34dc13980d0613c | SUCCESS |
-| Fresh E2E (latest) | 96980b310bca4d88ab6bc04b101b1f2c | INCOMPLETE (9 tables, 22 rows, 0 mismatches, 0 errors, 24 warnings) |
-| Fresh E2E (prior) | 30f998eb2f9e4827b539d76dfdc30f49 | INCOMPLETE (9 tables, 22 rows, 0 mismatches, 0 errors, 24 warnings) |
-| Fresh E2E (prior) | b93dc7dbc29b479ab1561953b82b07fe | SUCCESS (9 tables, 22 rows, 0 mismatches, 0 errors, 56 warnings) |
+| DB2-20 Roles/Structured UDTs | 33f9fadbeeb149bab34dc13980d0613c | SUCCESS (FULL migration, OBJSC01 → OBJTG08) |
+| E2E (verified) | 96980b310bca4d88ab6bc04b101b1f2c | SUCCESS (9 tables, 22 rows, 0 mismatches, 0 errors, per report JSON status="success") |
+| E2E (no report file) | 30f998eb2f9e4827b539d76dfdc30f49 | NO EVIDENCE — report JSON not found in `reports/`; status cannot be verified |
+| E2E (verified) | b93dc7dbc29b479ab1561953b82b07fe | SUCCESS (9 tables, 22 rows, 0 mismatches, 0 errors, per report JSON status="success") |
 
 ### Test Counts
 - Unit tests: 1269 passed, 0 failed
@@ -306,16 +316,42 @@ Partition preflight runs before any target mutation; mismatch blocks migration.
 | UDT column type | SQL0604N | Missing length on VARCHAR/CHAR | Type formatter appends (length) |
 | UDT attribute col | SQL0206N | Wrong column name | ATTR_NAME, ATTR_TYPENAME |
 
-## 8. Pending Feature Decisions
+## 8. Known Limitations (Reference)
 
-| Feature | Functional Req | Technical Feasibility | Security Impact | Effort/Risk | Recommendation |
-|---------|---------------|----------------------|-----------------|-------------|----------------|
-| CDC incremental | Real-time sync | Feasible (Db2 CDC) | Medium | High/High | Defer to separate phase |
-| Composite/cyclic FKs | Multi-column FKs | Feasible | Low | Medium/Medium | Implement if needed |
-| Increment=0 identity | Support zero-increment | Not feasible (collision) | None | N/A/N/A | Reject |
-| Least-privilege setup | Narrower target privileges | Feasible | Medium | Medium/Medium | Proposed, not verified |
+See `docs/db2/DB2_OBJECT_SUPPORT_MATRIX.md` sections B and C for the complete list of capabilities implemented but acceptance-pending (composite FKs) and known limitations (cyclic FKs, identity increment=0, CDC/incremental, least-privilege permissions).
 
-## 8b. GRANT_OPTION Security Audit (Run 30f998eb2f9e4827b539d76dfdc30f49)
+Key points:
+- **Composite FKs**: Discovery and DDL generation exist via `SYSCAT.KEYCOLUSE`; FK ordering unit-tested. No live multi-column FK E2E evidence. Label: CODE PRESENT / LIVE E2E NOT VERIFIED.
+- **Cyclic FKs**: `db2_fk_order.py` detects dependency cycles and raises `ValueError`. Cyclic FKs are rejected — not migrated. Future implementation plan in section 8a (not implemented in 0.4.0).
+- **Identity increment=0**: Code computes `nxt = MAX + increment`; increment=0 yields `nxt = MAX` causing collision (verified by unit test). Code does not explicitly reject increment=0 at discovery/DDL time. Db2 LUW `INCREMENT BY 0` rejection claim is unverified — do not state as fact.
+- **CDC / incremental migration**: OUT OF SCOPE for this Db2 release.
+- **Least-privilege permissions**: Tested setup used DBADM/SECADM. Proposed narrower privileges not verified. Security deployment limitation.
+
+## 8a. Cyclic FK Implementation Plan (Not Implemented)
+
+**Current behavior**: `core/orchestration/db2_fk_order.py` uses Kahn's algorithm for topological ordering. When a cycle is detected (no ready tables remain), it raises `ValueError("Foreign key dependency cycle detected")`. Cyclic FKs are rejected — not migrated.
+
+**Proposed approach: Deferred constraint creation after data load**
+
+1. **Phase 1**: Create all tables without FK constraints
+2. **Phase 2**: Load all data (DELETE/INSERT) without FK enforcement
+3. **Phase 3**: Create FK constraints after all data is loaded, in an order that avoids cycle violations
+
+**Db2 11.5 referential-integrity limitations**:
+- Db2 enforces FK constraints immediately upon creation. If existing data violates the constraint, `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` fails.
+- Cyclic FKs (A→B, B→A) cannot be satisfied by any creation order if data violates either direction.
+- `NOT ENFORCED` constraints are supported by Db2 but are not trusted by the optimizer and would require `SET INTEGRITY` to validate.
+- No `DEFERRABLE` constraints in Db2 LUW (unlike PostgreSQL/Oracle).
+
+**Risks**:
+- Data may violate FK constraints after load, causing constraint creation to fail
+- Partial constraint creation could leave inconsistent state
+- No rollback of already-created constraints if a later constraint in the cycle fails
+- Requires data cleanup or `NOT ENFORCED` + `SET INTEGRITY` workaround
+
+**Recommendation**: Defer to separate phase. Not implemented in 0.4.0.
+
+## 9. GRANT_OPTION Security Audit (Run 30f998eb2f9e4827b539d76dfdc30f49)
 
 **Root cause**: DB2ADMIN is the owner of all objects in E2ETGT07. Db2 implicitly grants all privileges WITH GRANT OPTION (grantable=G) to owners. The source has explicit grants without WITH GRANT OPTION (grantable=Y/N). The framework correctly detects the grantable difference and reports it as a warning.
 
@@ -371,7 +407,7 @@ Query 4 should return 0 rows if all 19 differences are ownership-derived.
 - **Recommendation**: No code change required. Grant-option differences are expected Db2 ownership behavior.
 - **Release decision**: PASS for grant-option security review (ownership-derived, not a security exposure)
 
-## 9. Acceptance Evidence (Run 33f9fadbeeb149bab34dc13980d0613c)
+## 10. Acceptance Evidence (Run 33f9fadbeeb149bab34dc13980d0613c)
 
 - **Source**: OBJSC01
 - **Target**: OBJTG08
@@ -419,23 +455,22 @@ SELECT GRANTEE, TABNAME, SELECTAUTH FROM SYSCAT.TABAUTH
 WHERE GRANTEE = 'MIG_READ_ROLE' AND TABNAME = 'EMPLOYEES';
 ```
 
-## 10. Scope and Limitations
+## 11. Scope and Limitations
 
 ### In Scope (FULL Migration)
 - Full schema + data + object + grant migration (Db2 → Db2)
 - Read-only preflight and acceptance verification
-- Idempotent DDL (existing objects skipped)
 - Fail-closed repeat FULL (aborts if target populated)
 - Identity restart safety (RESTART WITH MAX+increment)
 - Role creation and role membership migration (via security executor)
 - Structured UDT migration
-- Alias/synonym migration
+- Alias/synonym migration (Db2 aliases serve the synonym use case)
 
 ### Out of Scope (Intentionally Excluded)
 - **CDC/incremental migration**: Not implemented. Requires Db2 CDC infrastructure.
-- **Synonyms**: Not implemented. Db2 aliases cover this use case.
+- **Identity increment=0**: Not supported by code — restart computes MAX+0=MAX causing collision (verified by unit test). Db2 LUW `INCREMENT BY 0` rejection claim unverified — do not state as fact.
+- **Cyclic foreign keys**: Detected and rejected by fail-closed design.
 - **Least-privilege setup**: Only DBADM/SECADM tested (proposed, not verified)
-- **Composite/cyclic FKs**: Not specifically tested
 
 ### Four Client-Facing Documents
 1. `README.md` — Index and quick start
@@ -456,7 +491,8 @@ WHERE GRANTEE = 'MIG_READ_ROLE' AND TABNAME = 'EMPLOYEES';
 | Identity columns | identity.py | Verified | RESTART WITH MAX+increment |
 | Standalone sequences | sequence.py | Verified | Run 30f998eb... |
 | Primary keys | constraint.py | Verified | Run 30f998eb... |
-| Foreign keys | foreign_key.py | Verified | Run 30f998eb... |
+| Foreign keys (single-column) | foreign_key.py, target_foreign_key.py | Verified | Run 30f998eb... |
+| Foreign keys (composite) | foreign_key.py, target_foreign_key.py | Unit-tested only | No live multi-column FK E2E evidence |
 | UNIQUE constraints | constraint.py | Verified | Run 30f998eb... |
 | CHECK constraints | constraint.py | Verified | Run 30f998eb... |
 | Indexes | index.py | Verified | Run 30f998eb... |
@@ -476,7 +512,7 @@ WHERE GRANTEE = 'MIG_READ_ROLE' AND TABNAME = 'EMPLOYEES';
 ### Not Implemented (Genuine Gaps)
 | Capability | Status | Notes |
 |------------|--------|-------|
-| Synonyms | Not implemented | Db2 aliases already cover this use case |
 | CDC/incremental | Not implemented | Requires Db2 CDC infrastructure |
 | Least-privilege setup | Not verified | Only DBADM/SECADM tested |
-| Increment=0 identity | Invalid in Db2 | Not a gap; Db2 rejects INCREMENT BY 0 |
+| Identity increment=0 | Not supported by code | Not supported by code (collision at restart); Db2 LUW rejection claim unverified |
+| Cyclic FKs | Rejected by design | Fail-closed; not migrated |
