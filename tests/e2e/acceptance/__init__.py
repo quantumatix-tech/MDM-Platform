@@ -21,14 +21,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 __all__ = [
     "REPORTS_DIR",
     "E2EConfig",
+    "E2EResource",
     "fmt_phase",
     "fmt_source_target_counts",
     "json_default",
@@ -54,6 +57,29 @@ def _ensure_test_path() -> None:
 _ensure_test_path()
 
 
+@dataclass(frozen=True)
+class E2EResource:
+    """One independently configured acceptance target.
+
+    ``database`` resources are the legacy acceptance resource. ``schema``
+    resources represent a schema/owner inside the endpoint's configured
+    database or service. ``owner`` is accepted as an input alias for schema.
+    """
+
+    kind: Literal["database", "schema"]
+    name: str
+    safe_pattern: str | None = None
+
+    @property
+    def matches_safety_pattern(self) -> bool:
+        if not self.safe_pattern:
+            return False
+        try:
+            return re.match(self.safe_pattern, self.name) is not None
+        except re.error:
+            return False
+
+
 class E2EConfig:
     """Typed accessor over the raw YAML config dict.
 
@@ -70,15 +96,123 @@ class E2EConfig:
 
     @property
     def source_db(self) -> str:
-        return self.raw["e2e"]["source_database"]
+        resource = self.source_resource
+        if resource.kind != "database":
+            raise ValueError(
+                "The source acceptance resource is a schema/owner, not a database"
+            )
+        return resource.name
 
     @property
     def target_db(self) -> str:
-        return self.raw["e2e"]["target_database"]
+        resource = self.target_resource
+        if resource.kind != "database":
+            raise ValueError(
+                "The target acceptance resource is a schema/owner, not a database"
+            )
+        return resource.name
 
     @property
     def safe_pattern(self) -> str:
         return self.raw["e2e"]["safe_db_pattern"]
+
+    def _resource(self, side: str) -> E2EResource:
+        if side not in {"source", "target"}:
+            raise ValueError("Acceptance resource side must be 'source' or 'target'")
+        e2e = self.raw["e2e"]
+        resources = e2e.get("resources", {})
+        if not isinstance(resources, dict):
+            raise TypeError("e2e.resources must be a mapping with source/target entries")
+
+        raw_resource = resources.get(side)
+        if raw_resource is None:
+            legacy_key = f"{side}_database"
+            name = e2e.get(legacy_key)
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"Missing e2e.resources.{side} and legacy e2e.{legacy_key}"
+                )
+            pattern = e2e.get("safe_db_pattern")
+            return E2EResource("database", name, pattern)
+
+        if not isinstance(raw_resource, dict):
+            raise TypeError(f"e2e.resources.{side} must be a mapping")
+        kind = raw_resource.get("kind")
+        if kind == "owner":
+            kind = "schema"
+        if kind not in {"database", "schema"}:
+            raise ValueError(
+                f"e2e.resources.{side}.kind must be 'database' or 'schema' (owner)"
+            )
+        name = raw_resource.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"e2e.resources.{side}.name must be a non-empty string")
+        pattern = raw_resource.get("safe_pattern")
+        if pattern is None and kind == "database":
+            pattern = e2e.get("safe_db_pattern")
+        if pattern is not None and not isinstance(pattern, str):
+            raise ValueError(f"e2e.resources.{side}.safe_pattern must be a string")
+        return E2EResource(kind, name, pattern)
+
+    @property
+    def source_resource(self) -> E2EResource:
+        return self._resource("source")
+
+    @property
+    def target_resource(self) -> E2EResource:
+        return self._resource("target")
+
+    @property
+    def resources(self) -> dict[str, E2EResource]:
+        return {
+            "source": self.source_resource,
+            "target": self.target_resource,
+        }
+
+    @property
+    def database_cleanup_pattern(self) -> str:
+        """Return a safe database-only cleanup pattern or fail closed.
+
+        Schema/owner cleanup needs its own engine adapter. This guard prevents
+        existing database-drop adapters from receiving schema resources or an
+        Oracle service name such as FREEPDB1.
+        """
+        resources = self.resources
+        for side, resource in resources.items():
+            if resource.kind != "database":
+                raise ValueError(
+                    f"Database cleanup is not available for {side} schema/owner "
+                    f"resource {resource.name!r}"
+                )
+            endpoint_config = self.raw.get(side, {})
+            if str(endpoint_config.get("engine", "")).casefold() == "oracle":
+                raise ValueError(
+                    f"Database cleanup is not supported for Oracle {side} endpoints; "
+                    "Oracle acceptance targets are service/schema scoped"
+                )
+            endpoint = self.raw.get(side, {}).get("connection", {})
+            service_name = endpoint.get("service_name")
+            if (
+                isinstance(service_name, str)
+                and resource.name.casefold() == service_name.casefold()
+            ):
+                raise ValueError(
+                    f"Refusing database cleanup for {side} resource {resource.name!r}: "
+                    "it matches the endpoint service_name"
+                )
+            if not resource.matches_safety_pattern:
+                raise ValueError(
+                    f"Refusing database cleanup for {side} resource {resource.name!r}: "
+                    "it does not match its safety pattern"
+                )
+
+        patterns = {resource.safe_pattern for resource in resources.values()}
+        if len(patterns) == 1:
+            return next(iter(patterns)) or ""
+        # Existing adapters accept one pattern for both names. Narrow that
+        # pattern to the two already validated resource names.
+        names = "|".join(re.escape(resource.name) for resource in resources.values())
+        return rf"^(?:{names})$"
 
     @property
     def schema(self) -> str:
@@ -192,12 +326,40 @@ def json_default(obj: Any) -> str:
 def write_acceptance_report(
     report_path: str,
     report: dict[str, Any],
+    *,
+    preserve_existing: bool = False,
 ) -> str:
     """Write an acceptance report dict as JSON.
 
-    Returns the absolute path written.
+    If ``preserve_existing`` is true, never replace an existing report. The
+    requested path is used when free; otherwise a UTC timestamped sibling is
+    selected. Returns the absolute path written.
     """
-    os.makedirs(os.path.dirname(report_path), exist_ok=True)
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False, default=json_default)
-    return report_path
+    report_dir = os.path.dirname(report_path)
+    os.makedirs(report_dir, exist_ok=True)
+    serialized = json.dumps(
+        report, indent=2, ensure_ascii=False, default=json_default
+    )
+    if not preserve_existing:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(serialized)
+        return report_path
+
+    stem, extension = os.path.splitext(os.path.basename(report_path))
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    for attempt in range(1000):
+        if attempt == 0:
+            candidate = report_path
+        elif attempt == 1:
+            candidate = os.path.join(report_dir, f"{stem}_{timestamp}{extension}")
+        else:
+            candidate = os.path.join(
+                report_dir, f"{stem}_{timestamp}_{attempt - 1:03d}{extension}"
+            )
+        try:
+            with open(candidate, "x", encoding="utf-8") as f:
+                f.write(serialized)
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError(f"Could not allocate a unique acceptance report for {report_path}")

@@ -1,0 +1,139 @@
+# Canonical Oracle E2E acceptance profile: supported relational data scope.
+# Comprehensive Oracle object fixtures remain under tests/e2e/oracle/fixtures
+# for future categories; nested TSTZ values in OBJECT/VARRAY remain unsupported.
+
+source:
+  engine: oracle
+  connection:
+    host: 127.0.0.1
+    port: 1521
+    service_name: ORACLE_SOURCE_DB
+    username: MIGE2E_SIMPLE_SRC
+    password_secret: oracle_e2e_source_pass
+    connection_timeout: 5
+    connection_max_retries: 2
+    connection_retry_delay: 1
+
+target:
+  engine: oracle
+  connection:
+    host: 127.0.0.1
+    port: 1521
+    service_name: ORACLE_TARGET_DB
+    username: MIGE2E_SIMPLE_TGT
+    password_secret: oracle_e2e_target_pass
+    connection_timeout: 5
+    connection_max_retries: 2
+    connection_retry_delay: 1
+
+secrets:
+  provider: env
+
+oracle_permission_migration:
+  enabled: true
+  executor:
+    username: ORACLE_PERMISSION_EXECUTOR
+    password_secret: oracle_permission_executor_password
+  new_user_policy: LOCKED
+
+# The existing target admin may grant only these exact owner-level privileges,
+# and only when Oracle source discovery shows the migrated objects require them.
+# The connector verifies PDB identity and direct ADMIN OPTION before each grant.
+oracle_privilege_bootstrap:
+  enabled: true
+  approved_privileges:
+    - CREATE VIEW
+    - CREATE SEQUENCE
+    - CREATE TRIGGER
+  admin_connection:
+    host: 127.0.0.1
+    port: 1521
+    service_name: ORACLE_TARGET_DB
+    username: ORACLE_TARGET_ADMIN
+    password_secret: oracle_e2e_target_admin_pass
+
+migration:
+  mode: full
+  stop_on_error: true
+  batch_size: 1000
+  reconcile_target_schema: true
+  oracle_schema_replacement:
+    # Explicitly opts into repeat FULL replacement of source-managed target
+    # data. Routine data replacement needs no per-run approval_id. Any
+    # source-unmanaged owner-local schema cleanup still requires the exact id
+    # from --oracle-overwrite-plan. Target-only objects stay preserved and
+    # cross-owner dependencies are checked before target changes.
+    enabled: true
+
+alerting:
+  notifier: none
+
+validation:
+  mode: count
+  sample_size: 1000
+
+logging:
+  level: INFO
+
+e2e:
+  engine: oracle
+  onboarding_profile:
+    enabled: true
+    required_owner_privileges: fixture_derived
+    expected_db_unique_name: FREE
+    local_oracle_sid: FREE
+    source:
+      admin_connection:
+        username: ORACLE_SOURCE_ADMIN
+        password_secret: oracle_e2e_source_admin_pass
+      permanent_tablespace: E2E_APP_DATA
+      quota_bytes: 536870912
+      storage:
+        mode: reuse_existing
+    target:
+      admin_connection:
+        username: ORACLE_TARGET_ADMIN
+        password_secret: oracle_e2e_target_admin_pass
+      permanent_tablespace: E2E_APP_DATA
+      quota_bytes: 536870912
+      storage:
+        mode: reuse_existing
+  oracle_test_owner_prefix: MIGE2E_SIMPLE_
+  source_mode: fixtures
+  fixture_path: tests/e2e/oracle/fixtures/simple_data
+  fixtures:
+    - 03_create_tables.sql
+    - 04_create_foreign_keys.sql
+    - 05_create_indexes.sql
+    - 15_seed_data.sql
+  expected:
+    objects:
+      - SIMPLE_CUSTOMER
+      - SIMPLE_ORDER
+    row_counts:
+      SIMPLE_CUSTOMER: 2
+      SIMPLE_ORDER: 3
+    foreign_keys:
+      - table: SIMPLE_ORDER
+        referenced_table: SIMPLE_CUSTOMER
+  resources:
+    source:
+      kind: schema
+      name: MIGE2E_SIMPLE_SRC
+      safe_pattern: ^MIGE2E_SIMPLE_SRC$
+    target:
+      kind: schema
+      name: MIGE2E_SIMPLE_TGT
+      safe_pattern: ^MIGE2E_SIMPLE_TGT$
+  owner_provisioning:
+    enabled: false
+    source:
+      expected_container_name: ORACLE_SOURCE_DB
+    target:
+      expected_container_name: ORACLE_TARGET_DB
+  storage_bootstrap:
+    enabled: false
+  cleanup:
+    mode: never
+  functional:
+    enabled: false

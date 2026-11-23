@@ -7,6 +7,7 @@ Falls back to plain text output if rich cannot be installed.
 from __future__ import annotations
 
 import time
+import sys
 from typing import Any
 
 from core.driver_installer import ensure_driver
@@ -89,6 +90,25 @@ class RichProgressDisplay:
         self._table_stats[table] = {"source": source_rows, "success": success, "failure": failure}
         if self._live and _RICH_AVAILABLE:
             self._live.update(self._render())
+
+    def prompt(self, message: str) -> str:
+        """Pause Rich Live so interactive approval is visible and usable."""
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise RuntimeError(
+                "Oracle legacy permission approval requires an interactive terminal; "
+                "rerun from a terminal and confirm the exact displayed permission set"
+            )
+        live = self._live
+        was_started = bool(live and getattr(live, "is_started", False))
+        if was_started:
+            live.stop()
+        try:
+            if self._console:
+                self._console.print(message, markup=False)
+            return input()
+        finally:
+            if was_started:
+                live.start(refresh=True)
 
     # ------------------------------------------------------------------ context manager
     def __enter__(self) -> "RichProgressDisplay":
@@ -248,6 +268,14 @@ class NoopProgressDisplay:
 
     def record_table_stats(self, table: str, source_rows: int, success: int, failure: int) -> None:
         print(f"  → {table}: {success}/{source_rows} rows migrated, {failure} failed")
+
+    def prompt(self, message: str) -> str:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise RuntimeError(
+                "Oracle legacy permission approval requires an interactive terminal; "
+                "rerun from a terminal and confirm the exact displayed permission set"
+            )
+        return input(message)
 
     def __enter__(self) -> "NoopProgressDisplay":
         return self

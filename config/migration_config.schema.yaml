@@ -3,7 +3,7 @@ schema_version: "1.0"
 source:
   engine:
     type: string
-    enum: [postgresql, mysql, mongodb, mssql]
+    enum: [postgresql, mysql, mongodb, mssql, oracle]
   secret_provider:
     type: string
     optional: true
@@ -15,13 +15,57 @@ source:
     database: { type: string }
     username: { type: string }
     password_secret: { type: string }
-    ssl: { type: boolean, default: true }
-    ssl_ca_cert: { type: string, optional: true }
+    ssl:
+      type: boolean
+      optional: true
+      description: |
+        Oracle uses legacy TCP when omitted and TCPS only when explicitly true.
+        PostgreSQL, MySQL, and MSSQL retain their existing connector defaults.
+    ssl_ca_cert:
+      type: string
+      optional: true
+      description: Oracle Thin mode PEM CA bundle file; loaded as a verified SSLContext.
+    ssl_wallet_location:
+      type: string
+      optional: true
+      description: Oracle wallet directory (ewallet.pem for Thin mode or cwallet.sso for Thick mode).
+    ssl_wallet_password_secret:
+      type: string
+      optional: true
+      description: Oracle wallet password secret reference; requires ssl_wallet_location.
+    ssl_server_cert_dn:
+      type: string
+      optional: true
+      description: Oracle server certificate DN to match; hostname/DN verification remains enabled.
+    service_name:
+      type: string
+      optional: true
+      description: Oracle service name; required when engine is oracle.
+    include_tables:
+      type: array
+      optional: true
+      items: { type: string }
+      description: Oracle source only; restrict discovery to these owned table names.
+    connection_timeout:
+      type: integer
+      optional: true
+      minimum: 1
+      description: Oracle TCP connection timeout in seconds.
+    connection_max_retries:
+      type: integer
+      optional: true
+      minimum: 0
+      description: Oracle retries for transient listener/network errors only.
+    connection_retry_delay:
+      type: number
+      optional: true
+      minimum: 0
+      description: Initial Oracle retry delay in seconds; doubles on each retry.
 
 target:
   engine:
     type: string
-    enum: [postgresql, mysql, mongodb, mssql, cosmos_mongo]
+    enum: [postgresql, mysql, mongodb, mssql, cosmos_mongo, oracle]
   secret_provider:
     type: string
     optional: true
@@ -58,14 +102,190 @@ target:
         properties:
           user: { type: string }
           host: { type: string, default: "%" }
-    ssl: { type: boolean, default: true }
-    ssl_ca_cert: { type: string, optional: true }
+    ssl:
+      type: boolean
+      optional: true
+      description: |
+        Oracle uses legacy TCP when omitted and TCPS only when explicitly true.
+        PostgreSQL, MySQL, and MSSQL retain their existing connector defaults.
+    ssl_ca_cert:
+      type: string
+      optional: true
+      description: Oracle Thin mode PEM CA bundle file; loaded as a verified SSLContext.
+    ssl_wallet_location:
+      type: string
+      optional: true
+      description: Oracle wallet directory (ewallet.pem for Thin mode or cwallet.sso for Thick mode).
+    ssl_wallet_password_secret:
+      type: string
+      optional: true
+      description: Oracle wallet password secret reference; requires ssl_wallet_location.
+    ssl_server_cert_dn:
+      type: string
+      optional: true
+      description: Oracle server certificate DN to match; hostname/DN verification remains enabled.
+    service_name:
+      type: string
+      optional: true
+      description: Oracle service name; required when engine is oracle.
+    connection_timeout:
+      type: integer
+      optional: true
+      minimum: 1
+      description: Oracle TCP connection timeout in seconds.
+    connection_max_retries:
+      type: integer
+      optional: true
+      minimum: 0
+      description: Oracle retries for transient listener/network errors only.
+    connection_retry_delay:
+      type: number
+      optional: true
+      minimum: 0
+      description: Initial Oracle retry delay in seconds; doubles on each retry.
+
+oracle_privilege_bootstrap:
+  type: object
+  optional: true
+  description: |
+    Oracle FULL only. Read-only privilege inspection is the default. Grants are
+    applied only when enabled is true and every missing privilege is explicitly
+    listed in approved_privileges. Use a separate admin_connection identity and
+    secret reference; it must connect to the same database, PDB, and service as
+    the target owner.
+  properties:
+    enabled: { type: boolean, default: false }
+    secret_provider:
+      type: string
+      optional: true
+      enum: [env, aws_secrets_manager, gcp_secret_manager, hashicorp_vault, local_encrypted_file, azure_keyvault]
+      description: Defaults to the target secret provider, then secrets.provider.
+    approved_privileges:
+      type: array
+      default: []
+      items:
+        type: string
+        enum: [CREATE TABLE, CREATE VIEW, CREATE MATERIALIZED VIEW, CREATE PROCEDURE, CREATE TRIGGER, CREATE SEQUENCE, CREATE SYNONYM]
+      description: Exact Oracle system privileges approved for automatic grant to the target owner.
+    admin_connection:
+      type: object
+      optional: true
+      description: Separate Oracle admin connection; password must be supplied by secret reference.
+      properties:
+        host: { type: string }
+        port: { type: integer }
+        service_name: { type: string }
+        username: { type: string }
+        password_secret: { type: string }
+        ssl: { type: boolean, optional: true }
+        ssl_ca_cert: { type: string, optional: true }
+        ssl_wallet_location: { type: string, optional: true }
+        ssl_wallet_password_secret: { type: string, optional: true }
+        ssl_server_cert_dn: { type: string, optional: true }
+        connection_timeout: { type: integer, optional: true, minimum: 1 }
+
+oracle_permission_migration:
+  type: object
+  optional: true
+  description: |
+    Oracle-to-Oracle FULL permission migration. Disabled when omitted. Application
+    principals are discovered from grants on objects owned by the connected source
+    owner and the connected role-membership graph. Principal names are mapped by name.
+    Source passwords and hashes are never read/copied. Missing users are locked and
+    externally authenticated. A separate executor applies principal, membership and
+    system-grant DDL; the target schema owner remains responsible for grants on its
+    own objects. Missing-role creation and CREATE SESSION copying require approval.
+  properties:
+    enabled: { type: boolean, default: false }
+    secret_provider:
+      type: string
+      optional: true
+      enum: [env, aws_secrets_manager, gcp_secret_manager, hashicorp_vault, local_encrypted_file, azure_keyvault]
+      description: Defaults to the target secret provider, then secrets.provider.
+    executor:
+      type: object
+      description: Dedicated PDB-local security executor; endpoint is inherited from TARGET.
+      properties:
+        username: { type: string }
+        password_secret: { type: string, optional: true }
+        target_credentials: { type: boolean, optional: true, description: Explicitly reuse TARGET credentials only when executor.username exactly matches TARGET username. }
+    new_user_policy:
+      type: string
+      enum: [LOCKED, FAIL]
+      default: LOCKED
+      description: Missing discovered application users are provisioned locked, or fail before cleanup.
+    approve_role_creation_admin_option:
+      type: boolean
+      default: false
+      description: Required to create missing discovered roles; Oracle grants the creating owner ADMIN OPTION.
+    approve_create_session:
+      type: boolean
+      default: false
+      description: Required to copy a discovered CREATE SESSION privilege to its same-name principal.
+    onboarding:
+      type: object
+      optional: true
+      description: |
+        One-time, explicit onboarding. The admin connects to the TARGET endpoint and
+        receives only exact catalog-view SELECT and source-derived authority grants.
+        It must already hold direct grant option/ADMIN OPTION for every operation;
+        broad ANY privileges are not used. Source-side catalog access is provisioned
+        separately by a DBA on the SOURCE database.
+      properties:
+        enabled: { type: boolean, default: false }
+        approve_catalog_access: { type: boolean, default: false }
+        approve_create_user: { type: boolean, default: false }
+        approve_create_role: { type: boolean, default: false }
+        approve_create_session: { type: boolean, default: false }
+        approve_role_admin_option: { type: boolean, default: false }
+        admin_connection:
+          type: object
+          optional: true
+          properties:
+            username: { type: string }
+            password_secret: { type: string }
+    legacy_grant_adoption:
+      type: object
+      optional: true
+      description: Explicit operator-attested adoption of exact legacy grants after independent audit-record verification.
+      properties:
+        approved_permission_keys:
+          type: array
+          default: []
+          items: { type: string }
 
 migration:
   mode:
     type: string
     enum: [full, cdc-incremental, cdc-continuous]
     default: full
+  reconcile_target_schema:
+    type: boolean
+    optional: true
+    default: false
+    description: |
+      Reconcile supported source-managed target table columns before FULL data
+      replacement. Supported for MySQL, PostgreSQL, and Oracle; MSSQL retains
+      its existing FULL reconciliation behavior.
+  oracle_schema_replacement:
+    type: object
+    optional: true
+    description: |
+      Oracle FULL only. Explicit opt-in for replacing existing source-managed
+      target rows and cleaning stale supported owner-local objects. Requires
+      complete source-owner discovery (no include_tables filter). The enabled
+      policy authorizes routine replacement of source-managed rows. If the
+      read-only plan includes owner-local schema cleanup, approval_id must
+      exactly match that plan's id. Target-only objects and cross-owner
+      dependencies remain protected.
+    properties:
+      enabled:
+        type: boolean
+        default: false
+      approval_id:
+        type: string
+        optional: true
+        description: Exact plan_id printed by --oracle-overwrite-plan when owner-local schema cleanup is planned.
   batch_size:
     type: integer
     default: 1000

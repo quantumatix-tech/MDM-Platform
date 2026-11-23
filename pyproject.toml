@@ -13,6 +13,7 @@ dependencies = [
     "mysql-replication>=0.44",
     "pymongo>=4.0",
     "pyodbc>=4.0",
+    "oracledb>=2.5",
     "azure-identity>=1.12",
     "azure-keyvault-secrets>=4.0",
     "azure-cosmos>=4.0.0",

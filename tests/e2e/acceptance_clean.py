@@ -64,6 +64,11 @@ def main() -> None:
 
     cfg: E2EConfig = load_e2e_config(args.config)
 
+    try:
+        pattern = cfg.database_cleanup_pattern
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+
     mods = {key: importlib.import_module(val) for key, val in ENGINE_MAP[args.engine].items()}
     cleanup_mod = mods["cleanup"]
     db_mod = mods["database"]
@@ -78,8 +83,6 @@ def main() -> None:
 
     source_db = cfg.source_db
     target_db = cfg.target_db
-    pattern = cfg.safe_pattern
-
     # Safety: refuse to clean protected databases
     if target_mod.is_protected_database(source_db) or target_mod.is_protected_database(target_db):
         print("[!] Refusing to clean a protected database.")

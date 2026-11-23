@@ -8,6 +8,7 @@ Generates two shareable artifacts:
 from __future__ import annotations
 
 import json
+import html
 import math
 import os
 from datetime import UTC, datetime
@@ -52,6 +53,7 @@ _PHASE_META: list[tuple[str, str, str]] = [
     ("triggers",           "Triggers",               "⚡"),
     ("comments",           "Comments",               "💬"),
     ("grants",             "Grants",                 "🛡"),
+    ("oracle_schema_replacement_verification", "Oracle Replacement Verification", "🔎"),
     ("validation",         "Validation",             "✅"),
 ]
 
@@ -172,6 +174,10 @@ class ReportBuilder:
     # JSON
     # ------------------------------------------------------------------
     def build_json(self) -> dict[str, Any]:
+        errors = list(self._result.get("errors", []) or [])
+        top_error = self._result.get("error") or self._result.get("cdc_error")
+        if top_error and not errors:
+            errors = [str(top_error)]
         report = {
             "report_version": "2.0",
             "platform_version": _platform_version(),
@@ -182,7 +188,8 @@ class ReportBuilder:
             "duration_seconds": self._duration(),
             "status": self._result.get("status"),
             "phases": self._result.get("phases", {}),
-            "error": self._result.get("error") or self._result.get("cdc_error"),
+            "error": top_error or ("; ".join(str(error) for error in errors) or None),
+            "errors": errors,
         }
         if self._manifest is not None:
             report["runtime_manifest"] = self._manifest
@@ -203,12 +210,19 @@ class ReportBuilder:
         objects: list[str] = phases.get("discover", {}).get("objects", [])
         table_stats: dict[str, dict] = {}
         total_src = total_suc = total_fail = 0
+        data_table_outcomes = phases.get("data", {}).get("tables", {})
         for obj in objects:
             od = phases.get(obj, {})
             src = od.get("source_rows", od.get("initial_sync_rows", 0)) or 0
             suc = od.get("success", 0) or 0
             fail = od.get("failure", 0) or 0
-            table_stats[obj] = {"source": src, "success": suc, "failure": fail}
+            outcome = data_table_outcomes.get(obj, {})
+            table_status = outcome.get("status", od.get("status", "NOT RUN"))
+            table_reason = outcome.get("reason", od.get("reason", ""))
+            table_stats[obj] = {
+                "source": src, "success": suc, "failure": fail,
+                "status": table_status, "reason": table_reason,
+            }
             total_src += src
             total_suc += suc
             total_fail += fail
@@ -230,6 +244,11 @@ class ReportBuilder:
             if phase_val is None:
                 row_status, row_class = "skipped", "phase-skip"
             elif isinstance(phase_val, str) and phase_val.startswith("error"):
+                row_status, row_class = "error", "phase-error"
+            elif isinstance(phase_val, dict) and (
+                str(phase_val.get("status", "")).lower() in {"failed", "error"}
+                or phase_val.get("error")
+            ):
                 row_status, row_class = "error", "phase-error"
             else:
                 row_status, row_class = "success", "phase-success"
@@ -265,18 +284,23 @@ class ReportBuilder:
             rate_label = f"{rate_pct}%"
             bar_color = "#10b981" if fail == 0 else "#f59e0b"
             row_class = "" if fail == 0 else "row-warn"
+            table_name = html.escape(str(obj))
+            table_status = html.escape(str(stats["status"]))
+            table_reason = html.escape(str(stats["reason"]))
             data_rows += f"""
         <tr class="{row_class}">
-          <td class="td-table">{obj}</td>
+          <td class="td-table">{table_name}</td>
           <td class="td-num">{_fmt_rows(src)}</td>
           <td class="td-num" style="color:#34d399">{_fmt_rows(suc)}</td>
           <td class="td-num" style="color:{'#f87171' if fail > 0 else '#4b5563'}">{fail:,}</td>
           <td><div class="mini-bar-bg"><div class="mini-bar-fill" style="width:{rate_pct}%;background:{bar_color}"></div></div></td>
           <td class="td-num">{rate_label}</td>
+          <td><span class="badge-small">{table_status}</span></td>
+          <td>{table_reason or '—'}</td>
         </tr>"""
 
         if not data_rows:
-            data_rows = '<tr><td colspan="6" style="text-align:center;color:#4b5563">No table data</td></tr>'
+            data_rows = '<tr><td colspan="8" style="text-align:center;color:#4b5563">No table data</td></tr>'
 
         # ---- Validation ----
         validation = phases.get("validation", {})
@@ -303,11 +327,27 @@ class ReportBuilder:
 
         # ---- Errors ----
         error_html = ""
-        err = data.get("error")
-        if err:
+        errors = data.get("errors", []) or []
+        failures = phases.get("object_failures", []) or []
+        if failures or errors or data.get("error"):
+            if failures:
+                error_items = "".join(
+                    "<li><strong>[{}] {}</strong>: {}</li>".format(
+                        html.escape(str(item.get("phase", "migration"))),
+                        html.escape(str(item.get("object", "<unknown>"))),
+                        html.escape(str(item.get("error", "Migration failed"))),
+                    )
+                    for item in failures
+                )
+            else:
+                error_items = "".join(
+                    f"<li>{html.escape(str(error))}</li>" for error in errors
+                )
+            if not error_items and data.get("error"):
+                error_items = f"<li>{html.escape(str(data['error']))}</li>"
             error_html = f"""<section class="section error-section">
         <h2 class="section-title" style="color:#f87171">⚠ Errors</h2>
-        <pre class="error-pre">{str(err)}</pre>
+        <ul>{error_items}</ul>
       </section>"""
 
         # ---- Runtime Manifest ----
@@ -336,10 +376,11 @@ class ReportBuilder:
             if val is None:
                 continue
             raw = json.dumps(val, indent=2, default=str) if not isinstance(val, str) else val
+            raw = html.escape(raw[:4000])
             accordion_items += f"""
         <details class="accordion-item">
           <summary class="accordion-summary">{icon} {label}</summary>
-          <pre class="accordion-body">{raw[:4000]}</pre>
+          <pre class="accordion-body">{raw}</pre>
         </details>"""
 
         return f"""<!DOCTYPE html>
@@ -512,7 +553,7 @@ class ReportBuilder:
   </section>
 
   <!-- Data Migration Table -->
-  {'<section class="section"><h2 class="section-title">📦 Data Migration <span class="section-sub">(' + str(len(objects)) + ' tables)</span></h2><div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Table</th><th style="text-align:right">Source Rows</th><th style="text-align:right">Migrated</th><th style="text-align:right">Failed</th><th>Rate</th><th style="text-align:right">%</th></tr></thead><tbody>' + data_rows + '</tbody></table></div></section>' if table_stats else ''}
+  {'<section class="section"><h2 class="section-title">📦 Data Migration <span class="section-sub">(' + str(len(objects)) + ' tables)</span></h2><div style="overflow-x:auto"><table class="data-table"><thead><tr><th>Table</th><th style="text-align:right">Source Rows</th><th style="text-align:right">Migrated</th><th style="text-align:right">Failed</th><th>Rate</th><th style="text-align:right">%</th><th>Status</th><th>Reason</th></tr></thead><tbody>' + data_rows + '</tbody></table></div></section>' if table_stats else ''}
 
   <!-- Validation -->
   {val_html}

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 import time
 from threading import Thread
@@ -25,12 +27,14 @@ from core.connectors import (
     MSSQLTargetConnector,
     MySQLSourceConnector,
     MySQLTargetConnector,
+    OracleSourceConnector,
+    OracleTargetConnector,
     PostgresSourceConnector,
     PostgresTargetConnector,
 )
 from core.orchestrator import MigrationOrchestrator
 from core.preflight import assert_python_version
-from core.progress_display import create_progress_display
+from core.progress_display import NoopProgressDisplay, create_progress_display
 from core.reporting.report_builder import ReportBuilder
 from core.runtime_manifest import build_runtime_manifest, save_manifest
 from core.secrets import create_secret_provider
@@ -43,6 +47,7 @@ SOURCE_CONNECTORS = {
     "mongodb": MongoSourceConnector,
     "mysql": MySQLSourceConnector,
     "mssql": MSSQLSourceConnector,
+    "oracle": OracleSourceConnector,
 }
 
 TARGET_CONNECTORS = {
@@ -50,6 +55,7 @@ TARGET_CONNECTORS = {
     "mongodb": MongoTargetConnector,
     "mysql": MySQLTargetConnector,
     "mssql": MSSQLTargetConnector,
+    "oracle": OracleTargetConnector,
     "cosmos_mongo": CosmosMongoTargetConnector,
 }
 
@@ -73,9 +79,70 @@ class _CompoundReporter:
             if hasattr(r, "record_table_stats"):
                 r.record_table_stats(table, source_rows, success, failure)
 
+    def prompt(self, message: str) -> str:
+        for reporter in self._reporters:
+            prompt = getattr(reporter, "prompt", None)
+            if callable(prompt):
+                return prompt(message)
+        raise RuntimeError("Interactive approval is unavailable in this CLI session")
+
 
 def instantiate_connector(connector_cls, connection_config):
     return connector_cls(connection_config)
+
+
+def _safe_summary_text(value: object, limit: int = 240) -> str:
+    text = " ".join(str(value).split())
+    text = re.sub(
+        r"(?i)\b(password|passwd|pwd|secret|token|access_key)\s*[:=]\s*[^\s,;]+",
+        r"\1=<redacted>", text,
+    )
+    text = re.sub(r"(://[^:/\s]+:)[^@/\s]+@", r"\1<redacted>@", text)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def print_object_failures(result: dict, limit: int = 5) -> None:
+    """Print concise, credential-redacted object failures in the final summary."""
+    failures = result.get("phases", {}).get("object_failures", []) or []
+    if not failures:
+        failures = [
+            {"phase": "migration", "object": "<migration>", "error": error}
+            for error in (result.get("errors", []) or [])
+        ]
+        if not failures and result.get("error"):
+            failures = [{
+                "phase": "migration", "object": "<migration>",
+                "error": result["error"],
+            }]
+    if not failures:
+        return
+    print(f"  Object Errors : {len(failures)}")
+    for failure in failures[:limit]:
+        phase = _safe_summary_text(failure.get("phase", "migration"), 40)
+        obj = _safe_summary_text(failure.get("object", "<unknown>"), 80)
+        reason = _safe_summary_text(failure.get("error", "Migration failed"), 8192)
+        print(f"    - [{phase}] {obj}: {reason}")
+    if len(failures) > limit:
+        print(f"    - … {len(failures) - limit} more; see JSON report for details")
+
+
+def print_data_load_statuses(result: dict) -> None:
+    """Print per-table data outcomes, including dependency and policy skips."""
+    data = result.get("phases", {}).get("data", {}) or {}
+    tables = data.get("tables", {}) if isinstance(data, dict) else {}
+    if not tables:
+        return
+    counts = data.get("counts", {})
+    print(
+        "  Data Tables : "
+        f"SUCCESS {counts.get('SUCCESS', 0)}, "
+        f"FAILED {counts.get('FAILED', 0)}, "
+        f"SKIPPED {counts.get('SKIPPED', 0)}"
+    )
+    for table, outcome in tables.items():
+        status = _safe_summary_text(outcome.get("status", "UNKNOWN"), 20)
+        reason = _safe_summary_text(outcome.get("reason", ""), 8192)
+        print(f"    - [{status}] {_safe_summary_text(table, 120)}: {reason}")
 
 
 def main():
@@ -104,6 +171,19 @@ def main():
         "--no-live-ui", action="store_true",
         help="Disable rich terminal UI (raw JSON output)",
     )
+    parser.add_argument(
+        "--exit-after-run",
+        action="store_true",
+        help="Exit after writing reports instead of keeping the status server open",
+    )
+    parser.add_argument(
+        "--oracle-overwrite-plan", action="store_true",
+        help="Print a read-only Oracle FULL schema replacement plan and exit",
+    )
+    parser.add_argument(
+        "--oracle-permission-adopt-legacy", action="store_true",
+        help="Explicitly review and approve legacy Oracle grants whose framework ownership is untracked",
+    )
     args = parser.parse_args()
 
     # requires-python is only enforced by pip at install time; re-check at
@@ -117,6 +197,10 @@ def main():
     target_cfg = config.get("target", {})
     source_type = source_cfg.get("engine")
     target_type = target_cfg.get("engine")
+    if args.oracle_permission_adopt_legacy and not (
+        args.mode == "full" and source_type == "oracle" and target_type == "oracle"
+    ):
+        raise SystemExit("--oracle-permission-adopt-legacy requires Oracle-to-Oracle FULL mode")
 
     if source_type not in SOURCE_CONNECTORS:
         raise SystemExit(f"Unknown source engine: {source_type!r}. Available: {list(SOURCE_CONNECTORS)}")
@@ -136,6 +220,16 @@ def main():
     target_connection["source_engine"] = source_type
     target = instantiate_connector(TARGET_CONNECTORS[target_type], target_connection)
 
+    if args.oracle_overwrite_plan:
+        orchestrator = MigrationOrchestrator(source, target, config)
+        try:
+            plan = orchestrator.plan_oracle_schema_replacement(mode=args.mode)
+            print(json.dumps(plan, indent=2, sort_keys=True))
+            return
+        except Exception as exc:
+            print(f"Oracle schema replacement planning failed: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+
     # ---- Audit log to file (suppress stdout noise when rich is active) ----
     use_live_ui = not args.no_live_ui
     log_path = configure_file_logging(log_dir="logs", suppress_stdout=use_live_ui)
@@ -151,6 +245,8 @@ def main():
 
     # ---- Rich terminal progress display ----
     progress_display = create_progress_display(run_id, mode)
+    if args.no_live_ui:
+        progress_display = NoopProgressDisplay()
 
     # ---- Compound reporter (fans out to both) ----
     reporter = _CompoundReporter([status_server, progress_display])
@@ -165,7 +261,9 @@ def main():
             print(f"Audit log:      {log_path}")
 
         if args.mode == "full":
-            result = orchestrator.run_full()
+            result = orchestrator.run_full(
+                approve_legacy_permissions=args.oracle_permission_adopt_legacy
+            )
         elif args.mode == "cdc-incremental":
             result = orchestrator.run_cdc(max_iterations=1)
         elif args.mode == "cdc-continuous":
@@ -234,6 +332,8 @@ def main():
     print(f"  Run ID      : {run_id}")
     print(f"  Mode        : {mode}")
     print(f"  Duration    : {round(end_time - start_time, 1)}s")
+    print_object_failures(result)
+    print_data_load_statuses(result)
     print(f"  Audit Log   : {log_path}")
     print(f"  HTML Report : {os.path.abspath(html_path)}")
     print(f"  JSON Report : {os.path.abspath(json_path)}")
@@ -244,6 +344,10 @@ def main():
     if azure_url:
         print(f"  Public URL  : {azure_url}")
     print(sep)
+
+    if args.exit_after_run:
+        status_server.stop()
+        raise SystemExit(0 if result.get("status") in ("success", "completed") else 1)
 
     # ---- Open latest report automatically ----
     try:

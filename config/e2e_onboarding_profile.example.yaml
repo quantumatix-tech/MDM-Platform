@@ -1,0 +1,47 @@
+# Reusable Oracle LIVE E2E onboarding profile template.
+# Copy this block under `e2e:` in the acceptance YAML, fill every value from
+# approved environment policy, then set `enabled: true`. Passwords stay in the
+# configured secret provider; this file contains secret references only.
+# SOURCE/TARGET PDB names and owner names remain in the existing endpoint,
+# e2e.owner_provisioning expected_container_name, and e2e.resources fields.
+e2e:
+  onboarding_profile:
+    enabled: false
+    # The exact privilege set is derived from configured fixture SQL by the
+    # existing fixture loader. Arbitrary privilege lists are not accepted.
+    required_owner_privileges: fixture_derived
+    # Required: the DBA-verified local CDB identity. This is distinct from PDB names.
+    expected_db_unique_name: APPROVED_CDB_DB_UNIQUE_NAME
+    # Optional override. If omitted, the launcher requires ORACLE_SID in the
+    # current process and inherits LOCAL/TNS_ADMIN without changing them.
+    local_oracle_sid: null
+    # Optional SQL*Plus command/path; otherwise the executable is resolved from PATH.
+    sqlplus_executable: null
+    source:
+      admin_connection:
+        username: PDB_LOCAL_SOURCE_PROVISIONING_ADMIN
+        password_secret: source_provisioning_admin_secret
+        # Optional. Omit to use the configured default provider.
+        # secret_provider: local_encrypted_file
+      permanent_tablespace: APPROVED_SOURCE_PERMANENT_TABLESPACE
+      quota_bytes: null # DBA-approved finite byte quota
+      storage:
+        # reuse_existing | oracle_managed_files | explicit_path
+        mode: reuse_existing
+        # Required only for oracle_managed_files or explicit_path; use an
+        # explicit K/M/G unit, such as an environment-approved size value.
+        size: null
+        # Required only for explicit_path. Must be an approved Oracle-host path.
+        datafile_path: null
+    target:
+      admin_connection:
+        username: PDB_LOCAL_TARGET_PROVISIONING_ADMIN
+        password_secret: target_provisioning_admin_secret
+        # Optional. Omit to use the configured default provider.
+        # secret_provider: local_encrypted_file
+      permanent_tablespace: APPROVED_TARGET_PERMANENT_TABLESPACE
+      quota_bytes: null # DBA-approved finite byte quota
+      storage:
+        mode: reuse_existing
+        size: null
+        datafile_path: null
