@@ -36,3 +36,9 @@ secrets.enc
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Db2 local-only configs (keep db2.example.yaml tracked)
+config/db2_e2e*.yaml
+config/db2_test*.yaml
+config/db2_client.yaml
+config/db2_connection_test.yaml

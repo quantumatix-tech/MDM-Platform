@@ -1,0 +1,77 @@
+﻿-- scripts/db2_e2e/01_source_fixture.sql
+ CREATE DISTINCT TYPE TESTE2E.EMP_CODE AS INTEGER
+DB21034E  The command was processed as an SQL statement because it was not a
+valid Command Line Processor command.  During SQL processing it returned:
+SQL0104N  An unexpected token "﻿                         " was found
+following "BEGIN-OF-STATEMENT".  Expected tokens may include:
+"<create_or_replace>".  SQLSTATE=42601
+
+CREATE TABLE TESTE2E.EMP_UDT ( ID INTEGER NOT NULL, CODE TESTE2E.EMP_CODE, PRIMARY KEY (ID) )
+DB21034E  The command was processed as an SQL statement because it was not a
+valid Command Line Processor command.  During SQL processing it returned:
+SQL0204N  "TESTE2E.EMP_CODE" is an undefined name.  SQLSTATE=42704
+
+INSERT INTO TESTE2E.EMP_UDT VALUES (1, CAST(101 AS TESTE2E.EMP_CODE))
+DB21034E  The command was processed as an SQL statement because it was not a
+valid Command Line Processor command.  During SQL processing it returned:
+SQL0204N  "TESTE2E.EMP_UDT" is an undefined name.  SQLSTATE=42704
+
+INSERT INTO TESTE2E.EMP_UDT VALUES (2, CAST(102 AS TESTE2E.EMP_CODE))
+DB21034E  The command was processed as an SQL statement because it was not a
+valid Command Line Processor command.  During SQL processing it returned:
+SQL0204N  "TESTE2E.EMP_UDT" is an undefined name.  SQLSTATE=42704
+
+CREATE ALIAS TESTE2E.EMP_ALIAS FOR TESTE2E.EMPLOYEES
+DB20000I  The SQL command completed successfully.
+
+CREATE VIEW TESTE2E.EMP_VIEW AS SELECT EMP_ID, EMP_NAME FROM TESTE2E.EMPLOYEES
+DB20000I  The SQL command completed successfully.
+
+CREATE TABLE TESTE2E.RULES ( ID INTEGER NOT NULL, SALARY DECIMAL(10,2) DEFAULT 1000.00, STATUS VARCHAR(10) DEFAULT 'ACTIVE', BONUS INTEGER DEFAULT 0, CONSTRAINT CK_SALARY CHECK (SALARY >= 0), CONSTRAINT CK_STATUS CHECK (STATUS IN ('ACTIVE','INACTIVE')), PRIMARY KEY (ID) )
+DB20000I  The SQL command completed successfully.
+
+INSERT INTO TESTE2E.RULES (ID) VALUES (1)
+DB20000I  The SQL command completed successfully.
+
+INSERT INTO TESTE2E.RULES (ID) VALUES (2)
+DB20000I  The SQL command completed successfully.
+
+CREATE TABLE TESTE2E.GEN ( ID INTEGER NOT NULL, BASE_SALARY INTEGER NOT NULL, BONUS INTEGER NOT NULL, TOTAL_SALARY INTEGER GENERATED ALWAYS AS (BASE_SALARY + BONUS), TAX_RATE DECFLOAT(16), PRIMARY KEY (ID) )
+DB20000I  The SQL command completed successfully.
+
+INSERT INTO TESTE2E.GEN (ID, BASE_SALARY, BONUS, TAX_RATE) VALUES (1, 50000, 5000, 0.18)
+DB20000I  The SQL command completed successfully.
+
+INSERT INTO TESTE2E.GEN (ID, BASE_SALARY, BONUS, TAX_RATE) VALUES (2, 60000, 6000, 0.18)
+DB20000I  The SQL command completed successfully.
+
+CREATE TABLE TESTE2E.PART ( EMP_ID INTEGER NOT NULL, EMP_NAME VARCHAR(50), SALARY INTEGER ) PARTITION BY RANGE (EMP_ID) (STARTING FROM (1) ENDING AT (100) INCLUSIVE, STARTING FROM (101) ENDING AT (200) INCLUSIVE)
+DB20000I  The SQL command completed successfully.
+
+INSERT INTO TESTE2E.PART VALUES (1, 'Amit', 50000)
+DB20000I  The SQL command completed successfully.
+
+INSERT INTO TESTE2E.PART VALUES (150, 'Rahul', 60000)
+DB20000I  The SQL command completed successfully.
+
+CREATE TABLE TESTE2E.ORDERS ( ORDER_ID INTEGER NOT NULL, AMOUNT DECIMAL(10,2), PRIMARY KEY (ORDER_ID) )
+DB20000I  The SQL command completed successfully.
+
+CREATE TABLE TESTE2E.ORDER_AUDIT ( ORDER_ID INTEGER, EVENT_TYPE VARCHAR(10) )
+DB20000I  The SQL command completed successfully.
+
+CREATE TRIGGER TESTE2E.TRG_ORDER_UPDATE
+AFTER UPDATE OF AMOUNT ON TESTE2E.ORDERS
+REFERENCING NEW AS N
+FOR EACH ROW
+INSERT INTO TESTE2E.ORDER_AUDIT (ORDER_ID, EVENT_TYPE) VALUES (N.ORDER_ID, 'UPDATE')
+DB20000I  The SQL command completed successfully.
+
+INSERT INTO TESTE2E.ORDERS VALUES (1, 100.00)
+DB20000I  The SQL command completed successfully.
+
+CREATE FUNCTION TESTE2E.FN_DOUBLE (X INTEGER)
+RETURNS INTEGER
+LANGUAGE SQL
+RETURN X * 2
+DB20000I  The SQL command completed successfully.

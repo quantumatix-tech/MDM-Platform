@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.audit_logger import configure_file_logging, get_run_id
 from core.connectors import (
     CosmosMongoTargetConnector,
+    DB2SourceConnector,
+    DB2TargetConnector,
     MongoSourceConnector,
     MongoTargetConnector,
     MSSQLSourceConnector,
@@ -48,6 +50,7 @@ SOURCE_CONNECTORS = {
     "mysql": MySQLSourceConnector,
     "mssql": MSSQLSourceConnector,
     "oracle": OracleSourceConnector,
+    "db2": DB2SourceConnector,
 }
 
 TARGET_CONNECTORS = {
@@ -56,6 +59,7 @@ TARGET_CONNECTORS = {
     "mysql": MySQLTargetConnector,
     "mssql": MSSQLTargetConnector,
     "oracle": OracleTargetConnector,
+    "db2": DB2TargetConnector,
     "cosmos_mongo": CosmosMongoTargetConnector,
 }
 
@@ -229,6 +233,47 @@ def main():
         except Exception as exc:
             print(f"Oracle schema replacement planning failed: {exc}", file=sys.stderr)
             raise SystemExit(2) from None
+
+    # Db2 privilege grants may require a separate SECADM identity.
+    security_executor_conn = None
+    sec_connector = None
+    sec_cfg = config.get("security_executor", {})
+    if sec_cfg and source_type == "db2" and target_type == "db2":
+        sec_type = sec_cfg.get("engine", target_type)
+        sec_connection = dict(sec_cfg.get("connection", {}))
+        sec_connection["source_engine"] = source_type
+        sec_connector = instantiate_connector(
+            TARGET_CONNECTORS.get(sec_type, TARGET_CONNECTORS[target_type]), sec_connection
+        )
+        sec_resolver = create_secret_provider(config)
+        if "password_secret" in sec_connection:
+            sec_connector._config["password"] = sec_resolver.resolve(
+                sec_connection["password_secret"]
+            )
+        sec_connector.connect()
+        security_executor_conn = getattr(sec_connector, "_conn", None)
+        if security_executor_conn is None or not hasattr(security_executor_conn, "cursor"):
+            raise SystemExit("Security executor connection failed: _conn is None")
+        with security_executor_conn.cursor() as cursor:
+            cursor.execute("SELECT CURRENT SERVER, SESSION_USER FROM SYSIBM.SYSDUMMY1")
+            row = cursor.fetchone()
+            database = str(row[0]).strip().upper() if row else ""
+            username = str(row[1]).strip().upper() if row else ""
+            cursor.execute(
+                "SELECT SECURITYADMAUTH FROM SYSCAT.DBAUTH "
+                "WHERE GRANTEE = SESSION_USER AND GRANTEETYPE = 'U'"
+            )
+            authority = cursor.fetchone()
+        target_database = str(target_connection.get("database", "")).strip().upper()
+        if target_database and database != target_database:
+            raise SystemExit(
+                f"Security executor connected to wrong database: {database} != {target_database}"
+            )
+        migration_user = str(target_connection.get("username", "")).strip().upper()
+        if username == migration_user:
+            raise SystemExit(f"Security executor must differ from migration user: {username}")
+        if not authority or str(authority[0]).strip().upper() not in ("Y", "G"):
+            raise SystemExit("Security executor lacks SECADM authority")
 
     # ---- Audit log to file (suppress stdout noise when rich is active) ----
     use_live_ui = not args.no_live_ui

@@ -15,7 +15,6 @@ from core.alerting import create_notifier
 from core.assessment.report_generator import AssessmentReport, AssessmentReportGenerator
 from core.audit_logger import audit_log, get_run_id, set_run_id
 from core.connectors import create_cdc_engine
-from core.connectors.oracle import permissions as oracle_permissions
 from core.connectors.base import (
     CDCEngine,
     Schema,
@@ -23,12 +22,13 @@ from core.connectors.base import (
     TargetConnector,
     UpsertResult,
 )
-from core.schema_mapping.registry import TypeMappingRegistry
+from core.connectors.mssql.objects.partition import PartitionDefinitionMismatch
+from core.connectors.oracle import permissions as oracle_permissions
 from core.dependency_order import build_dependency_graph, order_data_load_objects
+from core.schema_mapping.registry import TypeMappingRegistry
 from core.secrets import create_secret_provider
 from core.status_server import StatusServer
 from core.validator import Validator
-from core.connectors.mssql.objects.partition import PartitionDefinitionMismatch
 
 
 def _safe_error_text(value: Any, secret_values: Any = ()) -> str:
@@ -724,6 +724,10 @@ class MigrationOrchestrator:
             "views": {}, "routines": {}, "triggers": {}, "synonyms": {},
             "materialized_views": {},
         }
+        is_db2 = (
+            self._config.get("source", {}).get("engine") == "db2"
+            and self._config.get("target", {}).get("engine") == "db2"
+        )
 
         def _run_phase(name: str, fn: Any, progress: int, critical: bool = False) -> Any:
             """Run a migration phase, log result, update progress."""
@@ -801,7 +805,13 @@ class MigrationOrchestrator:
             result["phases"]["ensure_database"] = "success"
             self._update_status("ensure_database", 4, [])
 
-            objects = self._source.list_objects()
+            if self._config.get("source", {}).get("engine") == "db2":
+                objects = [
+                    f"{schema}.{table}"
+                    for schema, table in self._source.list_objects_with_schema()
+                ]
+            else:
+                objects = self._source.list_objects()
             result["phases"]["discover"] = {"objects": objects}
             if (
                 self._config.get("source", {}).get("engine") == "oracle"
@@ -1108,8 +1118,8 @@ class MigrationOrchestrator:
             )
             if mysql_definer_dependency:
                 from core.connectors.mysql import (
-                    _mysql_definer_identity,
                     MySQLSecurityMetadataNotVisible,
+                    _mysql_definer_identity,
                 )
 
                 try:
@@ -1170,17 +1180,30 @@ class MigrationOrchestrator:
                 self._update_status("security_users_pre_objects", 4, all_errors)
             # ---------- Phase 2: Schemas ----------
             schema_results: dict[str, str] = {}
-            try:
-                for s in self._source.list_schemas():
+            if is_db2:
+                include = self._config.get("migration", {}).get("include_schemas") or []
+                selected = {str(item).strip().upper() for item in include}
+                for schema_name in self._source.list_schemas():
+                    if selected and str(schema_name).strip().upper() not in selected:
+                        continue
                     try:
-                        self._target.create_schema(s)
-                        schema_results[s.name] = "created"
-                    except Exception as exc:
-                        schema_results[s.name] = f"skipped: {exc}"
-                        all_errors.append(f"schema {s.name}: {exc}")
-            except Exception as exc:
-                schema_results["_error"] = str(exc)
-                all_errors.append(f"schema discovery: {exc}")
+                        self._target.create_schema_if_missing(schema_name)
+                        schema_results[schema_name] = "created"
+                    except Exception as exc:  # noqa: BLE001 - retain DB errors in the phase report
+                        schema_results[schema_name] = f"skipped: {exc}"
+                        all_errors.append(f"schema {schema_name}: {exc}")
+            else:
+                try:
+                    for s in self._source.list_schemas():
+                        try:
+                            self._target.create_schema(s)
+                            schema_results[s.name] = "created"
+                        except Exception as exc:
+                            schema_results[s.name] = f"skipped: {exc}"
+                            all_errors.append(f"schema {s.name}: {exc}")
+                except Exception as exc:
+                    schema_results["_error"] = str(exc)
+                    all_errors.append(f"schema discovery: {exc}")
             result["phases"]["schemas"] = schema_results
             self._update_status("schemas", 8, all_errors)
 
@@ -1188,6 +1211,8 @@ class MigrationOrchestrator:
             type_results: dict[str, str] = {}
             source_types: list[Any] = []
             try:
+                if is_db2:
+                    raise AttributeError("Db2 object types are handled by Db2 FULL orchestration")
                 source_types = list(self._source.list_types())
                 for t in source_types:
                     try:
@@ -1205,6 +1230,8 @@ class MigrationOrchestrator:
             # ---------- Phase 3.5: Create Sequences (before tables need them) ----------
             seq_create_results: dict[str, str] = {}
             try:
+                if is_db2:
+                    raise AttributeError("Db2 sequences are handled by Db2 FULL orchestration")
                 all_sequences = self._source.list_all_sequences()
                 for seq in all_sequences:
                     try:
@@ -1264,7 +1291,11 @@ class MigrationOrchestrator:
             reconciliation_results: dict[str, Any] = {}
             for obj_name in objects:
                 try:
-                    schema = self._source.get_schema(obj_name)
+                    if is_db2 and "." in obj_name:
+                        source_schema, table_name = obj_name.split(".", 1)
+                        schema = self._source.get_schema(table_name, schema_name=source_schema)
+                    else:
+                        schema = self._source.get_schema(obj_name)
                     schema_name = schema.schema_name or "dbo"
                     if (
                         self._config.get("source", {}).get("engine") == "oracle"
@@ -1328,7 +1359,7 @@ class MigrationOrchestrator:
                                 schema, postgres_source_views or []
                             )
                         reconciliation_results[obj_name] = outcome
-                    else:
+                    elif not is_db2:
                         self._target.create_object_if_missing(schema)
                     all_schemas[obj_name] = schema
                 except Exception as exc:
@@ -1717,7 +1748,8 @@ class MigrationOrchestrator:
             data_dependencies, _, _ = build_dependency_graph(all_schemas, objects)
             schema_map = {name: (s.schema_name if hasattr(s, "schema_name") else None) for name, s in all_schemas.items()}
             schema_preparation_complete = (
-                not (mssql_full_reconciliation or oracle_full_sync)
+                is_db2
+                or not (mssql_full_reconciliation or oracle_full_sync)
                 or (
                     not failed_objects
                     and set(all_schemas) == set(objects)
@@ -1725,6 +1757,13 @@ class MigrationOrchestrator:
                     and oracle_object_preparation_complete
                 )
             )
+            if schema_preparation_complete and is_db2:
+                from core.orchestration.db2_full import run_db2_full_replacement
+
+                replacement = run_db2_full_replacement(self, result)
+                if isinstance(replacement, dict) and replacement.get("status") != "success":
+                    raise RuntimeError(replacement.get("error", "Db2 FULL replacement failed"))
+                schema_preparation_complete = False
             if schema_preparation_complete:
                 cleared_objects = self._target.clear_objects_for_full_sync(list(all_schemas))
                 result["phases"]["full_target_sync"] = {
@@ -1732,7 +1771,7 @@ class MigrationOrchestrator:
                     "status": "success",
                     "cleared": cleared_objects,
                 }
-            else:
+            elif not is_db2:
                 # FULL sync must never delete a parent while one of its
                 # source-managed child tables failed schema preparation and
                 # is therefore absent from the connector's managed set. Keep
@@ -1832,7 +1871,7 @@ class MigrationOrchestrator:
                     + "; ".join(blocked_by)
                 )
 
-            if not schema_preparation_complete:
+            if not schema_preparation_complete and not is_db2:
                 preparation_reason = result["phases"]["full_target_sync"]["reason"]
                 for object_name in data_load_order:
                     existing = result["phases"].get(object_name, {})
@@ -1853,7 +1892,7 @@ class MigrationOrchestrator:
                 result["phases"]["data_load"]["reason"] = preparation_reason
 
             for idx, obj_name in enumerate(
-                data_load_order if schema_preparation_complete else (), start=1
+                data_load_order if schema_preparation_complete and not is_db2 else (), start=1
             ):
                 blocked_reason = dependency_skip_reason(obj_name)
                 if blocked_reason:
@@ -1973,671 +2012,672 @@ class MigrationOrchestrator:
             if schema_preparation_complete:
                 finalize_data_load()
 
-            # ---------- Phase 6+7+8: Indexes, FKs, Check Constraints ----------
-            constraint_results: dict[str, str] = {}
-            if oracle_full_sync and not schema_preparation_complete:
-                constraint_results = {
-                    obj_name: "skipped: Oracle schema preparation incomplete"
-                    for obj_name in all_schemas
-                }
-            else:
-                for obj_name, schema in all_schemas.items():
-                    if oracle_target_unavailable:
-                        constraint_results[obj_name] = (
-                            "skipped: target Oracle connection unavailable"
-                        )
-                        continue
-                    try:
-                        constraint_errors = self._target.apply_constraints(schema)
-                        if isinstance(constraint_errors, list) and constraint_errors:
-                            constraint_results[obj_name] = "error: " + "; ".join(constraint_errors)
-                            for error in constraint_errors:
+            if not is_db2:
+                # ---------- Phase 6+7+8: Indexes, FKs, Check Constraints ----------
+                constraint_results: dict[str, str] = {}
+                if oracle_full_sync and not schema_preparation_complete:
+                    constraint_results = {
+                        obj_name: "skipped: Oracle schema preparation incomplete"
+                        for obj_name in all_schemas
+                    }
+                else:
+                    for obj_name, schema in all_schemas.items():
+                        if oracle_target_unavailable:
+                            constraint_results[obj_name] = (
+                                "skipped: target Oracle connection unavailable"
+                            )
+                            continue
+                        try:
+                            constraint_errors = self._target.apply_constraints(schema)
+                            if isinstance(constraint_errors, list) and constraint_errors:
+                                constraint_results[obj_name] = "error: " + "; ".join(constraint_errors)
+                                for error in constraint_errors:
+                                    self._record_object_failure(
+                                        object_failures, all_errors, "apply_constraints",
+                                        obj_name, error,
+                                    )
+                                failed_objects.add(obj_name)
+                            else:
+                                constraint_results[obj_name] = "success"
+                        except Exception as exc:
+                            constraint_results[obj_name] = f"error: {exc}"
+                            if self._config.get("target", {}).get("engine") == "oracle":
                                 self._record_object_failure(
                                     object_failures, all_errors, "apply_constraints",
-                                    obj_name, error,
+                                    obj_name, exc,
                                 )
-                            failed_objects.add(obj_name)
-                        else:
-                            constraint_results[obj_name] = "success"
-                    except Exception as exc:
-                        constraint_results[obj_name] = f"error: {exc}"
-                        if self._config.get("target", {}).get("engine") == "oracle":
-                            self._record_object_failure(
-                                object_failures, all_errors, "apply_constraints",
-                                obj_name, exc,
-                            )
-                            failed_objects.add(obj_name)
-                            from core.connectors.oracle._models import (
-                                is_oracle_connection_unavailable,
-                            )
+                                failed_objects.add(obj_name)
+                                from core.connectors.oracle._models import (
+                                    is_oracle_connection_unavailable,
+                                )
 
-                            if is_oracle_connection_unavailable(exc):
-                                oracle_target_unavailable = True
-                                result["phases"]["apply_constraints"] = constraint_results
-                                raise
-                        else:
-                            all_errors.append(str(exc))
-            result["phases"]["apply_constraints"] = constraint_results
-            self._update_status("apply_constraints", 60, all_errors)
+                                if is_oracle_connection_unavailable(exc):
+                                    oracle_target_unavailable = True
+                                    result["phases"]["apply_constraints"] = constraint_results
+                                    raise
+                            else:
+                                all_errors.append(str(exc))
+                result["phases"]["apply_constraints"] = constraint_results
+                self._update_status("apply_constraints", 60, all_errors)
 
-            # ---------- MySQL AUTO_INCREMENT synchronisation ----------
-            # MySQL AUTO_INCREMENT is table-bound rather than a standalone
-            # sequence, so advance it once explicit source IDs have been loaded.
-            # Only engines that populate Column.auto_increment reach this path;
-            # every other connector leaves the flag False.
-            auto_increment_results: dict[str, str] = {}
-            for obj_name, schema in all_schemas.items():
-                for column in schema.columns:
-                    is_oracle_identity = (
-                        self._config.get("target", {}).get("engine") == "oracle"
-                        and getattr(column, "is_identity", False)
-                    )
-                    if not getattr(column, "auto_increment", False) and not is_oracle_identity:
-                        continue
-                    try:
-                        self._target.sync_auto_increment(obj_name, column.name)
-                        auto_increment_results[f"{obj_name}.{column.name}"] = "synchronized"
-                    except Exception as exc:
-                        auto_increment_results[f"{obj_name}.{column.name}"] = f"error: {exc}"
-                        all_errors.append(str(exc))
-            if auto_increment_results:
-                result["phases"]["auto_increment"] = auto_increment_results
-
-            # ---------- Phase 9: Sequence Ownership ----------
-            seq_owner_results: dict[str, str] = {}
-            try:
-                all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
-                for seq in all_sequences:
-                    if seq.owned_by or self._config.get("target", {}).get("engine") == "postgresql":
-                        try:
-                            self._target.apply_sequence_ownership(seq)
-                            seq_owner_results[seq.name] = (
-                                f"owned: {seq.owned_by}" if seq.owned_by else "unowned"
-                            )
-                        except Exception as exc:
-                            seq_owner_results[seq.name] = f"skipped: {exc}"
-            except Exception as exc:
-                seq_owner_results["_error"] = str(exc)
-            result["phases"]["apply_sequence_ownership"] = seq_owner_results
-            self._update_status("apply_sequence_ownership", 65, all_errors)
-
-            # ---------- Phase 10: Row-Level Security ----------
-            rls_results: dict[str, Any] = {}
-            try:
+                # ---------- MySQL AUTO_INCREMENT synchronisation ----------
+                # MySQL AUTO_INCREMENT is table-bound rather than a standalone
+                # sequence, so advance it once explicit source IDs have been loaded.
+                # Only engines that populate Column.auto_increment reach this path;
+                # every other connector leaves the flag False.
+                auto_increment_results: dict[str, str] = {}
                 for obj_name, schema in all_schemas.items():
-                    if schema.rls_enabled:
-                        rls_results[obj_name] = []
-                        for policy in self._source.get_rls_policies(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None):
-                            try:
-                                self._target.apply_rls_policy(policy)
-                                rls_results[obj_name].append(f"{policy.name}: created")
-                            except Exception as exc:
-                                rls_results[obj_name].append(f"{policy.name}: skipped ({exc})")
-            except Exception as exc:
-                rls_results["_error"] = str(exc)
-            result["phases"]["row_level_security"] = rls_results
-            self._update_status("row_level_security", 63, all_errors)
-
-            # ---------- Phase 10: Advance Sequences (set to max(col)+1 after data load) ----------
-            seq_advance_results: dict[str, list[str]] = {}
-            try:
-                all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
-                for seq in all_sequences:
-                    if seq.owned_by:
-                        # owned_by may be either "table.column" (legacy) or
-                        # "schema.table.column" (now produced by the source
-                        # connector for non-public schemas).
-                        parts = seq.owned_by.rsplit(".", 2)
-                        if len(parts) == 3:
-                            seq_schema, tbl, col = parts
-                        elif len(parts) == 2:
-                            seq_schema, tbl, col = "public", parts[0], parts[1]
-                        else:
+                    for column in schema.columns:
+                        is_oracle_identity = (
+                            self._config.get("target", {}).get("engine") == "oracle"
+                            and getattr(column, "is_identity", False)
+                        )
+                        if not getattr(column, "auto_increment", False) and not is_oracle_identity:
                             continue
-                        if tbl not in seq_advance_results:
-                            seq_advance_results[tbl] = []
-                        seq_qname = seq.name if seq_schema == "public" else f"{seq_schema}.{seq.name}"
                         try:
-                            self._target.advance_sequence(seq_qname, tbl, col, seq.owned_by)
-                            seq_advance_results[tbl].append(f"{seq_qname}: advanced")
+                            self._target.sync_auto_increment(obj_name, column.name)
+                            auto_increment_results[f"{obj_name}.{column.name}"] = "synchronized"
                         except Exception as exc:
-                            seq_advance_results[tbl].append(f"{seq_qname}: skipped ({exc})")
-                            if self._config.get("target", {}).get("engine") == "oracle":
-                                all_errors.append(f"sequence {seq_qname} state synchronization: {exc}")
-                    elif self._config.get("target", {}).get("engine") in {"postgresql", "oracle"}:
-                        try:
-                            self._target.restore_standalone_sequence_state(seq)
-                            seq_advance_results[seq.name] = ["standalone state restored"]
-                        except Exception as exc:
-                            seq_advance_results[seq.name] = [f"standalone state skipped ({exc})"]
-                            if self._config.get("target", {}).get("engine") == "oracle":
-                                all_errors.append(f"sequence {seq.name} state synchronization: {exc}")
-            except Exception as exc:
-                seq_advance_results["_error"] = [str(exc)]
-            result["phases"]["advance_sequences"] = seq_advance_results
-            self._update_status("advance_sequences", 66, all_errors)
+                            auto_increment_results[f"{obj_name}.{column.name}"] = f"error: {exc}"
+                            all_errors.append(str(exc))
+                if auto_increment_results:
+                    result["phases"]["auto_increment"] = auto_increment_results
 
-            # ---------- Phase 11: Views ----------
-            view_results: dict[str, str] = {}
-            try:
-                views_to_migrate = (
-                    postgres_source_views
-                    if postgres_source_views is not None
-                    else oracle_full_objects["views"]
-                    if oracle_full_objects is not None
-                    else self._source.list_views()
-                )
-                if oracle_full_objects is not None:
-                    view_results = {
-                        view.name: oracle_object_phase_results["views"].get(
-                            f"{view.schema_name}.{view.name}", "skipped: preflight failed"
-                        )
-                        for view in views_to_migrate
-                    }
-                    result["phases"]["views"] = view_results
-                    self._update_status("views", 70, all_errors)
-                    views_to_migrate = []
-                for view in views_to_migrate:
-                    try:
-                        self._target.create_view(view)
-                        view_results[view.name] = "created"
-                    except Exception as exc:
-                        view_results[view.name] = f"error: {exc}"
-                        all_errors.append(str(exc))
-                        # Track the failure so the run status cannot report
-                        # success while the object is missing on the target.
-                        failed_objects.add(view.name)
-            except Exception as exc:
-                view_results["_error"] = str(exc)
-            result["phases"]["views"] = view_results
-            self._update_status("views", 70, all_errors)
-
-            # ---------- Phase 12: Materialized Views ----------
-            mv_results: dict[str, str] = {}
-            try:
-                materialized_views = (
-                    oracle_full_objects["materialized_views"]
-                    if oracle_full_objects is not None else self._source.list_materialized_views()
-                )
-                for mv in materialized_views:
-                    try:
-                        if self._config.get("target", {}).get("engine") == "postgresql":
-                            self._target.reconcile_materialized_view(mv)
-                        elif oracle_full_objects is None:
-                            self._target.create_materialized_view(mv)
-                        self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
-                        if self._config.get("target", {}).get("engine") == "oracle":
-                            source_rows = self._source.materialized_view_query_rows(mv)
-                            target_rows = self._target.materialized_view_rows(mv.name)
-                            if sorted(map(repr, source_rows)) != sorted(map(repr, target_rows)):
-                                raise RuntimeError(
-                                    f"Oracle materialized view {mv.name} stored results do not match its source query"
+                # ---------- Phase 9: Sequence Ownership ----------
+                seq_owner_results: dict[str, str] = {}
+                try:
+                    all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
+                    for seq in all_sequences:
+                        if seq.owned_by or self._config.get("target", {}).get("engine") == "postgresql":
+                            try:
+                                self._target.apply_sequence_ownership(seq)
+                                seq_owner_results[seq.name] = (
+                                    f"owned: {seq.owned_by}" if seq.owned_by else "unowned"
                                 )
-                        mv_results[mv.name] = "created+refreshed"
-                    except Exception as exc:
-                        mv_results[mv.name] = f"error: {exc}"
-                        failed_objects.add(mv.name)
-                        all_errors.append(str(exc))
-            except Exception as exc:
-                mv_results["_error"] = str(exc)
-            result["phases"]["materialized_views"] = mv_results
-            self._update_status("materialized_views", 75, all_errors)
+                            except Exception as exc:
+                                seq_owner_results[seq.name] = f"skipped: {exc}"
+                except Exception as exc:
+                    seq_owner_results["_error"] = str(exc)
+                result["phases"]["apply_sequence_ownership"] = seq_owner_results
+                self._update_status("apply_sequence_ownership", 65, all_errors)
 
-            # ---------- Phase 13: Functions & Stored Procedures ----------
-            func_results: dict[str, str] = {}
-            try:
-                routines_to_migrate = (
-                    oracle_full_objects["routines"]
-                    if oracle_full_objects is not None
-                    else self._source.list_functions()
-                )
-                for func in routines_to_migrate:
-                    func_key = (
-                        func.name if func.schema_name == "public"
-                        else f"{func.schema_name}.{func.name}"
-                    )
-                    oracle_func_key = f"{func.schema_name}.{func.name}:{func.kind}"
-                    if oracle_full_objects is not None:
-                        func_results[oracle_func_key] = oracle_object_phase_results["routines"].get(
-                            oracle_func_key, "skipped: preflight failed"
-                        )
-                        continue
-                    try:
-                        self._target.create_function(func)
-                        func_results[func_key] = "created"
-                    except Exception as exc:
-                        func_results[func_key] = f"skipped: {exc}"
-                        self._record_object_failure(
-                            object_failures, all_errors, "create_function", func_key, exc
-                        )
-                        failed_objects.add(func_key)
-            except Exception as exc:
-                func_results["_error"] = str(exc)
-                self._record_object_failure(
-                    object_failures, all_errors, "list_functions", "<source>", exc
-                )
-                failed_objects.add("<source functions>")
-            result["phases"]["functions"] = func_results
-            self._update_status("functions", 80, all_errors)
+                # ---------- Phase 10: Row-Level Security ----------
+                rls_results: dict[str, Any] = {}
+                try:
+                    for obj_name, schema in all_schemas.items():
+                        if schema.rls_enabled:
+                            rls_results[obj_name] = []
+                            for policy in self._source.get_rls_policies(obj_name, schema_name=schema.schema_name if hasattr(schema, "schema_name") else None):
+                                try:
+                                    self._target.apply_rls_policy(policy)
+                                    rls_results[obj_name].append(f"{policy.name}: created")
+                                except Exception as exc:
+                                    rls_results[obj_name].append(f"{policy.name}: skipped ({exc})")
+                except Exception as exc:
+                    rls_results["_error"] = str(exc)
+                result["phases"]["row_level_security"] = rls_results
+                self._update_status("row_level_security", 63, all_errors)
 
-            # ---------- Phase 14: Synonyms ----------
-            synonym_results: dict[str, str] = {}
-            try:
-                synonyms_to_migrate = (
-                    oracle_full_objects["synonyms"]
-                    if oracle_full_objects is not None
-                    else self._source.list_synonyms()
-                )
-                for synonym in synonyms_to_migrate:
-                    syn_key = (
-                        synonym.name if synonym.schema_name == "public"
-                        else f"{synonym.schema_name}.{synonym.name}"
-                    )
-                    try:
-                        created = self._target.create_synonym(synonym)
-                        if created is False:
-                            raise RuntimeError(
-                                f"synonym target {synonym.base_owner}.{synonym.base_name} "
-                                "was not created before the synonym phase"
-                            )
-                        synonym_results[syn_key] = "created"
-                    except Exception as exc:
-                        synonym_results[syn_key] = f"skipped: {exc}"
-                        if oracle_full_objects is not None:
-                            failed_objects.add(syn_key)
-                            self._record_object_failure(
-                                object_failures, all_errors, "create_synonym", syn_key, exc
-                            )
-                        else:
-                            all_errors.append(f"synonym {syn_key}: {exc}")
-            except Exception as exc:
-                synonym_results["_error"] = str(exc)
-                if oracle_full_objects is not None:
-                    self._record_object_failure(
-                        object_failures, all_errors, "list_synonyms", "<source>", exc
-                    )
-                    failed_objects.add("<source synonyms>")
-                else:
-                    all_errors.append(f"synonym discovery: {exc}")
-            result["phases"]["synonyms"] = synonym_results
-            self._update_status("synonyms", 82, all_errors)
-
-            # ---------- Phase 15: Triggers ----------
-            trigger_results: dict[str, str] = {}
-            try:
-                triggers_to_migrate = (
-                    oracle_full_objects["triggers"]
-                    if oracle_full_objects is not None
-                    else self._source.get_all_triggers()
-                )
-                for trigger in triggers_to_migrate:
-                    trigger_key = (
-                        f"{trigger.table}.{trigger.name}"
-                        if trigger.schema_name == "public"
-                        else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
-                    )
-                    try:
-                        if oracle_full_objects is not None:
-                            preflight_key = f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
-                            preflight_result = oracle_object_phase_results["triggers"].get(preflight_key)
-                            if preflight_result != "created":
-                                trigger_results[trigger_key] = preflight_result or "skipped: preflight failed"
+                # ---------- Phase 10: Advance Sequences (set to max(col)+1 after data load) ----------
+                seq_advance_results: dict[str, list[str]] = {}
+                try:
+                    all_sequences = self._source.list_all_sequences() if hasattr(self._source, "list_all_sequences") else []
+                    for seq in all_sequences:
+                        if seq.owned_by:
+                            # owned_by may be either "table.column" (legacy) or
+                            # "schema.table.column" (now produced by the source
+                            # connector for non-public schemas).
+                            parts = seq.owned_by.rsplit(".", 2)
+                            if len(parts) == 3:
+                                seq_schema, tbl, col = parts
+                            elif len(parts) == 2:
+                                seq_schema, tbl, col = "public", parts[0], parts[1]
+                            else:
                                 continue
-                            self._target.set_trigger_source_state(trigger)
-                            trigger_created = True
-                        else:
-                            trigger_created = self._target.create_trigger(trigger)
-                        if trigger_created is False:
-                            message = "trigger parent table missing on target"
-                            trigger_results[trigger_key] = f"skipped: {message}"
+                            if tbl not in seq_advance_results:
+                                seq_advance_results[tbl] = []
+                            seq_qname = seq.name if seq_schema == "public" else f"{seq_schema}.{seq.name}"
+                            try:
+                                self._target.advance_sequence(seq_qname, tbl, col, seq.owned_by)
+                                seq_advance_results[tbl].append(f"{seq_qname}: advanced")
+                            except Exception as exc:
+                                seq_advance_results[tbl].append(f"{seq_qname}: skipped ({exc})")
+                                if self._config.get("target", {}).get("engine") == "oracle":
+                                    all_errors.append(f"sequence {seq_qname} state synchronization: {exc}")
+                        elif self._config.get("target", {}).get("engine") in {"postgresql", "oracle"}:
+                            try:
+                                self._target.restore_standalone_sequence_state(seq)
+                                seq_advance_results[seq.name] = ["standalone state restored"]
+                            except Exception as exc:
+                                seq_advance_results[seq.name] = [f"standalone state skipped ({exc})"]
+                                if self._config.get("target", {}).get("engine") == "oracle":
+                                    all_errors.append(f"sequence {seq.name} state synchronization: {exc}")
+                except Exception as exc:
+                    seq_advance_results["_error"] = [str(exc)]
+                result["phases"]["advance_sequences"] = seq_advance_results
+                self._update_status("advance_sequences", 66, all_errors)
+
+                # ---------- Phase 11: Views ----------
+                view_results: dict[str, str] = {}
+                try:
+                    views_to_migrate = (
+                        postgres_source_views
+                        if postgres_source_views is not None
+                        else oracle_full_objects["views"]
+                        if oracle_full_objects is not None
+                        else self._source.list_views()
+                    )
+                    if oracle_full_objects is not None:
+                        view_results = {
+                            view.name: oracle_object_phase_results["views"].get(
+                                f"{view.schema_name}.{view.name}", "skipped: preflight failed"
+                            )
+                            for view in views_to_migrate
+                        }
+                        result["phases"]["views"] = view_results
+                        self._update_status("views", 70, all_errors)
+                        views_to_migrate = []
+                    for view in views_to_migrate:
+                        try:
+                            self._target.create_view(view)
+                            view_results[view.name] = "created"
+                        except Exception as exc:
+                            view_results[view.name] = f"error: {exc}"
+                            all_errors.append(str(exc))
+                            # Track the failure so the run status cannot report
+                            # success while the object is missing on the target.
+                            failed_objects.add(view.name)
+                except Exception as exc:
+                    view_results["_error"] = str(exc)
+                result["phases"]["views"] = view_results
+                self._update_status("views", 70, all_errors)
+
+                # ---------- Phase 12: Materialized Views ----------
+                mv_results: dict[str, str] = {}
+                try:
+                    materialized_views = (
+                        oracle_full_objects["materialized_views"]
+                        if oracle_full_objects is not None else self._source.list_materialized_views()
+                    )
+                    for mv in materialized_views:
+                        try:
+                            if self._config.get("target", {}).get("engine") == "postgresql":
+                                self._target.reconcile_materialized_view(mv)
+                            elif oracle_full_objects is None:
+                                self._target.create_materialized_view(mv)
+                            self._target.refresh_materialized_view(mv.name, schema_name=mv.schema_name)
+                            if self._config.get("target", {}).get("engine") == "oracle":
+                                source_rows = self._source.materialized_view_query_rows(mv)
+                                target_rows = self._target.materialized_view_rows(mv.name)
+                                if sorted(map(repr, source_rows)) != sorted(map(repr, target_rows)):
+                                    raise RuntimeError(
+                                        f"Oracle materialized view {mv.name} stored results do not match its source query"
+                                    )
+                            mv_results[mv.name] = "created+refreshed"
+                        except Exception as exc:
+                            mv_results[mv.name] = f"error: {exc}"
+                            failed_objects.add(mv.name)
+                            all_errors.append(str(exc))
+                except Exception as exc:
+                    mv_results["_error"] = str(exc)
+                result["phases"]["materialized_views"] = mv_results
+                self._update_status("materialized_views", 75, all_errors)
+
+                # ---------- Phase 13: Functions & Stored Procedures ----------
+                func_results: dict[str, str] = {}
+                try:
+                    routines_to_migrate = (
+                        oracle_full_objects["routines"]
+                        if oracle_full_objects is not None
+                        else self._source.list_functions()
+                    )
+                    for func in routines_to_migrate:
+                        func_key = (
+                            func.name if func.schema_name == "public"
+                            else f"{func.schema_name}.{func.name}"
+                        )
+                        oracle_func_key = f"{func.schema_name}.{func.name}:{func.kind}"
+                        if oracle_full_objects is not None:
+                            func_results[oracle_func_key] = oracle_object_phase_results["routines"].get(
+                                oracle_func_key, "skipped: preflight failed"
+                            )
+                            continue
+                        try:
+                            self._target.create_function(func)
+                            func_results[func_key] = "created"
+                        except Exception as exc:
+                            func_results[func_key] = f"skipped: {exc}"
                             self._record_object_failure(
-                                object_failures, all_errors, "create_trigger", trigger_key, message
+                                object_failures, all_errors, "create_function", func_key, exc
+                            )
+                            failed_objects.add(func_key)
+                except Exception as exc:
+                    func_results["_error"] = str(exc)
+                    self._record_object_failure(
+                        object_failures, all_errors, "list_functions", "<source>", exc
+                    )
+                    failed_objects.add("<source functions>")
+                result["phases"]["functions"] = func_results
+                self._update_status("functions", 80, all_errors)
+
+                # ---------- Phase 14: Synonyms ----------
+                synonym_results: dict[str, str] = {}
+                try:
+                    synonyms_to_migrate = (
+                        oracle_full_objects["synonyms"]
+                        if oracle_full_objects is not None
+                        else self._source.list_synonyms()
+                    )
+                    for synonym in synonyms_to_migrate:
+                        syn_key = (
+                            synonym.name if synonym.schema_name == "public"
+                            else f"{synonym.schema_name}.{synonym.name}"
+                        )
+                        try:
+                            created = self._target.create_synonym(synonym)
+                            if created is False:
+                                raise RuntimeError(
+                                    f"synonym target {synonym.base_owner}.{synonym.base_name} "
+                                    "was not created before the synonym phase"
+                                )
+                            synonym_results[syn_key] = "created"
+                        except Exception as exc:
+                            synonym_results[syn_key] = f"skipped: {exc}"
+                            if oracle_full_objects is not None:
+                                failed_objects.add(syn_key)
+                                self._record_object_failure(
+                                    object_failures, all_errors, "create_synonym", syn_key, exc
+                                )
+                            else:
+                                all_errors.append(f"synonym {syn_key}: {exc}")
+                except Exception as exc:
+                    synonym_results["_error"] = str(exc)
+                    if oracle_full_objects is not None:
+                        self._record_object_failure(
+                            object_failures, all_errors, "list_synonyms", "<source>", exc
+                        )
+                        failed_objects.add("<source synonyms>")
+                    else:
+                        all_errors.append(f"synonym discovery: {exc}")
+                result["phases"]["synonyms"] = synonym_results
+                self._update_status("synonyms", 82, all_errors)
+
+                # ---------- Phase 15: Triggers ----------
+                trigger_results: dict[str, str] = {}
+                try:
+                    triggers_to_migrate = (
+                        oracle_full_objects["triggers"]
+                        if oracle_full_objects is not None
+                        else self._source.get_all_triggers()
+                    )
+                    for trigger in triggers_to_migrate:
+                        trigger_key = (
+                            f"{trigger.table}.{trigger.name}"
+                            if trigger.schema_name == "public"
+                            else f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
+                        )
+                        try:
+                            if oracle_full_objects is not None:
+                                preflight_key = f"{trigger.schema_name}.{trigger.table}.{trigger.name}"
+                                preflight_result = oracle_object_phase_results["triggers"].get(preflight_key)
+                                if preflight_result != "created":
+                                    trigger_results[trigger_key] = preflight_result or "skipped: preflight failed"
+                                    continue
+                                self._target.set_trigger_source_state(trigger)
+                                trigger_created = True
+                            else:
+                                trigger_created = self._target.create_trigger(trigger)
+                            if trigger_created is False:
+                                message = "trigger parent table missing on target"
+                                trigger_results[trigger_key] = f"skipped: {message}"
+                                self._record_object_failure(
+                                    object_failures, all_errors, "create_trigger", trigger_key, message
+                                )
+                                failed_objects.add(trigger_key)
+                            else:
+                                trigger_results[trigger_key] = "created"
+                        except Exception as exc:
+                            trigger_results[trigger_key] = f"skipped: {exc}"
+                            self._record_object_failure(
+                                object_failures, all_errors, "create_trigger", trigger_key, exc
                             )
                             failed_objects.add(trigger_key)
-                        else:
-                            trigger_results[trigger_key] = "created"
-                    except Exception as exc:
-                        trigger_results[trigger_key] = f"skipped: {exc}"
-                        self._record_object_failure(
-                            object_failures, all_errors, "create_trigger", trigger_key, exc
-                        )
-                        failed_objects.add(trigger_key)
-            except Exception as exc:
-                trigger_results["_error"] = str(exc)
-                self._record_object_failure(
-                    object_failures, all_errors, "list_triggers", "<source>", exc
-                )
-                failed_objects.add("<source triggers>")
-            result["phases"]["triggers"] = trigger_results
-            if (
-                hasattr(self._target, "complete_trigger_data_load")
-                and all(value == "created" for value in trigger_results.values())
-            ):
-                self._target.complete_trigger_data_load()
-            self._update_status("triggers", 85, all_errors)
-
-            # ---------- Phase 15.5: Events (MySQL/MariaDB) ----------
-            if source_events:
-                event_results: dict[str, str] = {}
-                for event in source_events:
-                    try:
-                        self._target.create_event(event)
-                        event_results[event.name] = "created"
-                    except Exception as exc:
-                        event_results[event.name] = (
-                            str(exc) if "BLOCKED" in str(exc).upper() else f"error: {exc}"
-                        )
-                        all_errors.append(str(exc))
-                result["phases"]["events"] = event_results
-
-            # ---------- Phase 16: Comments ----------
-            comment_results: dict[str, str] = {}
-            source_comments: list[Any] = []
-            try:
-                source_comments = list(
-                    oracle_full_objects["comments"]
-                    if oracle_full_objects is not None
-                    else self._source.list_comments()
-                )
-                for comment in source_comments:
-                    comment_key = (
-                        comment.object_name
-                        if comment.schema_name == "public"
-                        else f"{comment.schema_name}.{comment.object_name}"
-                    )
-                    if str(comment.object_type).upper() == "COLUMN":
-                        comment_key += f".{comment.column_name}"
-                    try:
-                        self._target.apply_comment(comment)
-                        comment_results[comment_key] = "applied"
-                    except Exception as exc:
-                        comment_results[comment_key] = f"error: {exc}"
-                        if oracle_full_objects is not None:
-                            failed_objects.add(comment_key)
-                            self._record_object_failure(
-                                object_failures, all_errors, "apply_comment", comment_key, exc
-                            )
-                        else:
-                            all_errors.append(f"comment {comment_key}: {exc}")
-            except Exception as exc:
-                comment_results["_error"] = str(exc)
-                if oracle_full_objects is not None:
-                    self._record_object_failure(
-                        object_failures, all_errors, "list_comments", "<source>", exc
-                    )
-                    failed_objects.add("<source comments>")
-                else:
-                    all_errors.append(f"comment discovery: {exc}")
-            if (
-                schema_reconciliation_enabled
-                and self._config.get("target", {}).get("engine") == "postgresql"
-            ):
-                try:
-                    result["phases"]["column_comment_reconciliation"] = (
-                        self._target.reconcile_postgresql_column_comments(
-                            list(all_schemas.values()), source_comments
-                        )
-                    )
                 except Exception as exc:
-                    result["phases"]["column_comment_reconciliation"] = {
-                        "error": str(exc)
-                    }
-                    all_errors.append(f"Column comment reconciliation: {exc}")
-            result["phases"]["comments"] = comment_results
-            self._update_status("comments", 88, all_errors)
+                    trigger_results["_error"] = str(exc)
+                    self._record_object_failure(
+                        object_failures, all_errors, "list_triggers", "<source>", exc
+                    )
+                    failed_objects.add("<source triggers>")
+                result["phases"]["triggers"] = trigger_results
+                if (
+                    hasattr(self._target, "complete_trigger_data_load")
+                    and all(value == "created" for value in trigger_results.values())
+                ):
+                    self._target.complete_trigger_data_load()
+                self._update_status("triggers", 85, all_errors)
 
-            # ---------- Phase: Users, Roles & Role Memberships (Step 14) ----------
-            security_results: dict[str, str] = {}
-            # MySQL has no database-role object model, so the shared role path
-            # must not be driven for a MySQL source.
-            source_has_roles = self._config.get("source", {}).get("engine") != "mysql"
-            try:
-                if oracle_permission_plan is not None:
-                    for role in oracle_permission_plan["roles"]:
-                        security_results[f"role:{role.name}"] = (
-                            f"mapped to same-name target role {role.name}"
+                # ---------- Phase 15.5: Events (MySQL/MariaDB) ----------
+                if source_events:
+                    event_results: dict[str, str] = {}
+                    for event in source_events:
+                        try:
+                            self._target.create_event(event)
+                            event_results[event.name] = "created"
+                        except Exception as exc:
+                            event_results[event.name] = (
+                                str(exc) if "BLOCKED" in str(exc).upper() else f"error: {exc}"
+                            )
+                            all_errors.append(str(exc))
+                    result["phases"]["events"] = event_results
+
+                # ---------- Phase 16: Comments ----------
+                comment_results: dict[str, str] = {}
+                source_comments: list[Any] = []
+                try:
+                    source_comments = list(
+                        oracle_full_objects["comments"]
+                        if oracle_full_objects is not None
+                        else self._source.list_comments()
+                    )
+                    for comment in source_comments:
+                        comment_key = (
+                            comment.object_name
+                            if comment.schema_name == "public"
+                            else f"{comment.schema_name}.{comment.object_name}"
                         )
-                    if oracle_permission_plan.get("new_users") or oracle_permission_plan.get("new_roles"):
+                        if str(comment.object_type).upper() == "COLUMN":
+                            comment_key += f".{comment.column_name}"
                         try:
-                            apply_principals = getattr(
-                                self._target, "apply_permission_principals", None
-                            )
-                            if not callable(apply_principals):
-                                raise RuntimeError(
-                                    "Oracle target lacks explicitly approved principal provisioning"
+                            self._target.apply_comment(comment)
+                            comment_results[comment_key] = "applied"
+                        except Exception as exc:
+                            comment_results[comment_key] = f"error: {exc}"
+                            if oracle_full_objects is not None:
+                                failed_objects.add(comment_key)
+                                self._record_object_failure(
+                                    object_failures, all_errors, "apply_comment", comment_key, exc
                                 )
-                            principals = apply_principals(oracle_permission_plan)
-                            security_results["principal_provisioning"] = principals
-                        except Exception as exc:
-                            oracle_permission_application_failed = True
-                            failed_objects.add("<Oracle principals>")
-                            self._record_object_failure(
-                                object_failures, all_errors,
-                                "oracle_permission_principal_provisioning",
-                                "<mapped principals>", exc,
-                            )
-                            security_results["principal_provisioning"] = f"failed: {self._redact_error(exc)}"
-                    if not oracle_permission_application_failed and (
-                        oracle_permission_plan.get("object_grants")
-                        or oracle_permission_plan.get("system_grants")
-                        or oracle_permission_plan.get("memberships")
-                        or oracle_permission_plan.get("permission_reconciliation", {}).get("stale")
-                    ):
-                        try:
-                            prepare_provenance = getattr(
-                                self._target, "prepare_permission_provenance", None
-                            )
-                            if not callable(prepare_provenance):
-                                raise RuntimeError(
-                                    "Oracle target lacks durable permission provenance support"
-                                )
-                            security_results["permission_provenance"] = prepare_provenance(
-                                oracle_permission_plan
-                            )
-                        except Exception as exc:
-                            oracle_permission_application_failed = True
-                            failed_objects.add("<Oracle permission provenance>")
-                            self._record_object_failure(
-                                object_failures, all_errors,
-                                "oracle_permission_provenance", "<permission ledger>", exc,
-                            )
-                            security_results["permission_provenance"] = (
-                                f"failed: {self._redact_error(exc)}"
-                            )
-                    if not oracle_permission_application_failed:
-                        try:
-                            memberships = self._target.apply_permission_role_memberships(
-                                oracle_permission_plan
-                            )
-                            for item in memberships:
-                                security_results[f"membership:{item}"] = "verified/applied"
-                        except Exception as exc:
-                            oracle_permission_application_failed = True
-                            failed_objects.add("<Oracle role memberships>")
-                            self._record_object_failure(
-                                object_failures, all_errors,
-                                "oracle_permission_role_membership", "<mapped roles>", exc,
-                            )
-                            security_results["role_memberships"] = f"failed: {self._redact_error(exc)}"
-                elif source_has_roles:
-                    for role in self._source.list_roles():
-                        try:
-                            self._target.create_role_if_not_exists(role.name)
-                            security_results[f"role:{role.name}"] = "created"
-                        except Exception as exc:
-                            security_results[f"role:{role.name}"] = f"skipped: {exc}"
-                if oracle_permission_plan is None:
-                    users_to_migrate = self._source.list_users()
-                else:
-                    users_to_migrate = []
-                for user in users_to_migrate:
-                    host = getattr(user, "host", None)
-                    label = f"{user.name}@{host}" if host is not None else user.name
-                    if f"USER {label}" in mysql_user_results:
-                        # Already created ahead of object DDL for its DEFINER ref.
-                        security_results[f"user:{label}"] = mysql_user_results[f"USER {label}"]
-                        continue
+                            else:
+                                all_errors.append(f"comment {comment_key}: {exc}")
+                except Exception as exc:
+                    comment_results["_error"] = str(exc)
+                    if oracle_full_objects is not None:
+                        self._record_object_failure(
+                            object_failures, all_errors, "list_comments", "<source>", exc
+                        )
+                        failed_objects.add("<source comments>")
+                    else:
+                        all_errors.append(f"comment discovery: {exc}")
+                if (
+                    schema_reconciliation_enabled
+                    and self._config.get("target", {}).get("engine") == "postgresql"
+                ):
                     try:
-                        if host is None:
-                            self._target.create_user_if_not_exists(user.name)
-                        else:
-                            self._target.create_user_if_not_exists(user.name, host)
-                        security_results[f"user:{label}"] = "created"
-                    except Exception as exc:
-                        security_results[f"user:{label}"] = f"skipped: {exc}"
-                if source_has_roles and oracle_permission_plan is None:
-                    for membership in self._source.list_role_memberships():
-                        try:
-                            self._target.create_role_membership(
-                                membership.member_name, membership.role_name
+                        result["phases"]["column_comment_reconciliation"] = (
+                            self._target.reconcile_postgresql_column_comments(
+                                list(all_schemas.values()), source_comments
                             )
-                            security_results[
-                                f"membership:{membership.member_name}->{membership.role_name}"
-                            ] = "created"
-                        except Exception as exc:
-                            security_results[
-                                f"membership:{membership.member_name}->{membership.role_name}"
-                            ] = f"skipped: {exc}"
-            except Exception as exc:
-                security_results["_error"] = str(exc)
-            result["phases"]["security"] = security_results
-            self._update_status("security", 89, all_errors)
+                        )
+                    except Exception as exc:
+                        result["phases"]["column_comment_reconciliation"] = {
+                            "error": str(exc)
+                        }
+                        all_errors.append(f"Column comment reconciliation: {exc}")
+                result["phases"]["comments"] = comment_results
+                self._update_status("comments", 88, all_errors)
 
-            # ---------- Phase 16: Grants ----------
-            grant_results: list[str] = []
-            try:
-                if oracle_permission_plan is not None:
-                    if oracle_permission_application_failed:
-                        grant_results.append("skipped: Oracle role membership application failed")
+                # ---------- Phase: Users, Roles & Role Memberships (Step 14) ----------
+                security_results: dict[str, str] = {}
+                # MySQL has no database-role object model, so the shared role path
+                # must not be driven for a MySQL source.
+                source_has_roles = self._config.get("source", {}).get("engine") != "mysql"
+                try:
+                    if oracle_permission_plan is not None:
+                        for role in oracle_permission_plan["roles"]:
+                            security_results[f"role:{role.name}"] = (
+                                f"mapped to same-name target role {role.name}"
+                            )
+                        if oracle_permission_plan.get("new_users") or oracle_permission_plan.get("new_roles"):
+                            try:
+                                apply_principals = getattr(
+                                    self._target, "apply_permission_principals", None
+                                )
+                                if not callable(apply_principals):
+                                    raise RuntimeError(
+                                        "Oracle target lacks explicitly approved principal provisioning"
+                                    )
+                                principals = apply_principals(oracle_permission_plan)
+                                security_results["principal_provisioning"] = principals
+                            except Exception as exc:
+                                oracle_permission_application_failed = True
+                                failed_objects.add("<Oracle principals>")
+                                self._record_object_failure(
+                                    object_failures, all_errors,
+                                    "oracle_permission_principal_provisioning",
+                                    "<mapped principals>", exc,
+                                )
+                                security_results["principal_provisioning"] = f"failed: {self._redact_error(exc)}"
+                        if not oracle_permission_application_failed and (
+                            oracle_permission_plan.get("object_grants")
+                            or oracle_permission_plan.get("system_grants")
+                            or oracle_permission_plan.get("memberships")
+                            or oracle_permission_plan.get("permission_reconciliation", {}).get("stale")
+                        ):
+                            try:
+                                prepare_provenance = getattr(
+                                    self._target, "prepare_permission_provenance", None
+                                )
+                                if not callable(prepare_provenance):
+                                    raise RuntimeError(
+                                        "Oracle target lacks durable permission provenance support"
+                                    )
+                                security_results["permission_provenance"] = prepare_provenance(
+                                    oracle_permission_plan
+                                )
+                            except Exception as exc:
+                                oracle_permission_application_failed = True
+                                failed_objects.add("<Oracle permission provenance>")
+                                self._record_object_failure(
+                                    object_failures, all_errors,
+                                    "oracle_permission_provenance", "<permission ledger>", exc,
+                                )
+                                security_results["permission_provenance"] = (
+                                    f"failed: {self._redact_error(exc)}"
+                                )
+                        if not oracle_permission_application_failed:
+                            try:
+                                memberships = self._target.apply_permission_role_memberships(
+                                    oracle_permission_plan
+                                )
+                                for item in memberships:
+                                    security_results[f"membership:{item}"] = "verified/applied"
+                            except Exception as exc:
+                                oracle_permission_application_failed = True
+                                failed_objects.add("<Oracle role memberships>")
+                                self._record_object_failure(
+                                    object_failures, all_errors,
+                                    "oracle_permission_role_membership", "<mapped roles>", exc,
+                                )
+                                security_results["role_memberships"] = f"failed: {self._redact_error(exc)}"
+                    elif source_has_roles:
+                        for role in self._source.list_roles():
+                            try:
+                                self._target.create_role_if_not_exists(role.name)
+                                security_results[f"role:{role.name}"] = "created"
+                            except Exception as exc:
+                                security_results[f"role:{role.name}"] = f"skipped: {exc}"
+                    if oracle_permission_plan is None:
+                        users_to_migrate = self._source.list_users()
+                    else:
+                        users_to_migrate = []
+                    for user in users_to_migrate:
+                        host = getattr(user, "host", None)
+                        label = f"{user.name}@{host}" if host is not None else user.name
+                        if f"USER {label}" in mysql_user_results:
+                            # Already created ahead of object DDL for its DEFINER ref.
+                            security_results[f"user:{label}"] = mysql_user_results[f"USER {label}"]
+                            continue
+                        try:
+                            if host is None:
+                                self._target.create_user_if_not_exists(user.name)
+                            else:
+                                self._target.create_user_if_not_exists(user.name, host)
+                            security_results[f"user:{label}"] = "created"
+                        except Exception as exc:
+                            security_results[f"user:{label}"] = f"skipped: {exc}"
+                    if source_has_roles and oracle_permission_plan is None:
+                        for membership in self._source.list_role_memberships():
+                            try:
+                                self._target.create_role_membership(
+                                    membership.member_name, membership.role_name
+                                )
+                                security_results[
+                                    f"membership:{membership.member_name}->{membership.role_name}"
+                                ] = "created"
+                            except Exception as exc:
+                                security_results[
+                                    f"membership:{membership.member_name}->{membership.role_name}"
+                                ] = f"skipped: {exc}"
+                except Exception as exc:
+                    security_results["_error"] = str(exc)
+                result["phases"]["security"] = security_results
+                self._update_status("security", 89, all_errors)
+
+                # ---------- Phase 16: Grants ----------
+                grant_results: list[str] = []
+                try:
+                    if oracle_permission_plan is not None:
+                        if oracle_permission_application_failed:
+                            grant_results.append("skipped: Oracle role membership application failed")
+                        else:
+                            try:
+                                applied = self._target.apply_permission_grants(oracle_permission_plan)
+                                grant_results.extend(applied)
+                                if (
+                                    oracle_permission_plan.get("system_grants")
+                                    or any(
+                                        item.get("kind") == "SYSTEM"
+                                        for item in oracle_permission_plan.get(
+                                            "permission_reconciliation", {}
+                                        ).get("stale", [])
+                                    )
+                                ):
+                                    apply_system_grants = getattr(
+                                        self._target, "apply_permission_system_grants", None
+                                    )
+                                    if not callable(apply_system_grants):
+                                        raise RuntimeError(
+                                            "Oracle target lacks the scoped permission executor for system grants"
+                                        )
+                                    grant_results.extend(
+                                        apply_system_grants(oracle_permission_plan)
+                                    )
+                                self._target.verify_permission_migration(oracle_permission_plan)
+                                result["phases"]["oracle_permission_verification"] = {
+                                    "status": "success",
+                                    "verified_object_and_column_grants": len(oracle_permission_plan["object_grants"]),
+                                    "verified_system_grants": len(oracle_permission_plan["system_grants"]),
+                                    "verified_role_memberships": len(oracle_permission_plan["memberships"]),
+                                }
+                            except Exception as exc:
+                                oracle_permission_application_failed = True
+                                failed_objects.add("<Oracle permissions>")
+                                grant_results.append(
+                                    f"Oracle permission migration failed: {self._redact_error(exc)}"
+                                )
+                                self._record_object_failure(
+                                    object_failures, all_errors,
+                                    "oracle_permission_application_or_verification",
+                                    "<mapped principals>", exc,
+                                )
+                    else:
+                        grants = list(self._source.list_grants())
+                        # Ensure all grantee roles exist on target before applying grants
+                        # Only for engines with role support (not MySQL)
+                        target_engine = self._config.get("target", {}).get("engine", "")
+                        if target_engine != "mysql":
+                            grantees = {g.grantee for g in grants}
+                            for grantee in grantees:
+                                try:
+                                    self._target.create_role_if_not_exists(grantee)
+                                except Exception as exc:
+                                    grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
+                        for grant in grants:
+                            if grant.object_type == "SCHEMA":
+                                grant_key = f"{grant.object_name} TO {grant.grantee}"
+                            elif self._config.get("target", {}).get("engine") == "mysql":
+                                target_database = self._config.get("target", {}).get("connection", {}).get("database", "")
+                                if grant.object_type == "GLOBAL":
+                                    target_object = "*.*"
+                                elif grant.object_type == "DATABASE":
+                                    target_object = f"{target_database}.*"
+                                else:
+                                    target_object = f"{target_database}.{grant.object_name.rsplit('.', 1)[-1]}"
+                                grant_key = f"{target_object} TO {grant.grantee}"
+                            else:
+                                grant_key = (
+                                    f"{grant.object_name} TO {grant.grantee}"
+                                    if grant.schema_name == "public"
+                                    else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
+                                )
+                            try:
+                                self._target.apply_grant(grant)
+                                grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
+                            except Exception as exc:
+                                grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
+                                all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
+                except Exception as exc:
+                    grant_results.append(f"_error: {exc}")
+                result["phases"]["grants"] = grant_results
+                self._update_status("grants", 91, all_errors)
+
+                if oracle_full_replace:
+                    if oracle_replacement_inventory is None or failed_objects:
+                        result["phases"]["oracle_schema_replacement_verification"] = {
+                            "status": "skipped",
+                            "reason": (
+                                "target Oracle connection became unavailable during an earlier phase"
+                                if oracle_target_unavailable
+                                else "one or more migration objects failed"
+                            ),
+                        }
                     else:
                         try:
-                            applied = self._target.apply_permission_grants(oracle_permission_plan)
-                            grant_results.extend(applied)
-                            if (
-                                oracle_permission_plan.get("system_grants")
-                                or any(
-                                    item.get("kind") == "SYSTEM"
-                                    for item in oracle_permission_plan.get(
-                                        "permission_reconciliation", {}
-                                    ).get("stale", [])
-                                )
-                            ):
-                                apply_system_grants = getattr(
-                                    self._target, "apply_permission_system_grants", None
-                                )
-                                if not callable(apply_system_grants):
-                                    raise RuntimeError(
-                                        "Oracle target lacks the scoped permission executor for system grants"
-                                    )
-                                grant_results.extend(
-                                    apply_system_grants(oracle_permission_plan)
-                                )
-                            self._target.verify_permission_migration(oracle_permission_plan)
-                            result["phases"]["oracle_permission_verification"] = {
-                                "status": "success",
-                                "verified_object_and_column_grants": len(oracle_permission_plan["object_grants"]),
-                                "verified_system_grants": len(oracle_permission_plan["system_grants"]),
-                                "verified_role_memberships": len(oracle_permission_plan["memberships"]),
-                            }
-                        except Exception as exc:
-                            oracle_permission_application_failed = True
-                            failed_objects.add("<Oracle permissions>")
-                            grant_results.append(
-                                f"Oracle permission migration failed: {self._redact_error(exc)}"
+                            verification = self._target.verify_schema_replacement(
+                                **oracle_replacement_inventory
                             )
+                            partition_counts: dict[str, Any] = {}
+                            for schema in oracle_replacement_inventory["schemas"]:
+                                if not schema.options.get("oracle_partitioning"):
+                                    continue
+                                source_counts = self._source.partition_row_counts(schema.name)
+                                target_counts = self._target.partition_row_counts(schema.name)
+                                partition_counts[schema.name] = {
+                                    "source": source_counts, "target": target_counts,
+                                    "match": source_counts == target_counts,
+                                }
+                                if source_counts != target_counts:
+                                    raise RuntimeError(
+                                        f"Oracle partition-wise row counts differ for {schema.name}: "
+                                        f"source={source_counts}, target={target_counts}"
+                                    )
+                            verification["partition_row_counts"] = partition_counts
+                            result["phases"]["oracle_schema_replacement_verification"] = verification
+                        except Exception as exc:
+                            target_owner = str(
+                                self._config.get("target", {}).get("connection", {}).get("username", "<target owner>")
+                            )
+                            result["phases"]["oracle_schema_replacement_verification"] = {
+                                "status": "failed",
+                                "phase": "oracle_schema_replacement_verification",
+                                "object": target_owner,
+                                "error": self._redact_error(exc),
+                            }
                             self._record_object_failure(
                                 object_failures, all_errors,
-                                "oracle_permission_application_or_verification",
-                                "<mapped principals>", exc,
+                                "oracle_schema_replacement_verification", target_owner, exc,
                             )
-                else:
-                    grants = list(self._source.list_grants())
-                    # Ensure all grantee roles exist on target before applying grants
-                    # Only for engines with role support (not MySQL)
-                    target_engine = self._config.get("target", {}).get("engine", "")
-                    if target_engine != "mysql":
-                        grantees = {g.grantee for g in grants}
-                        for grantee in grantees:
-                            try:
-                                self._target.create_role_if_not_exists(grantee)
-                            except Exception as exc:
-                                grant_results.append(f"CREATE ROLE {grantee}: skipped ({exc})")
-                    for grant in grants:
-                        if grant.object_type == "SCHEMA":
-                            grant_key = f"{grant.object_name} TO {grant.grantee}"
-                        elif self._config.get("target", {}).get("engine") == "mysql":
-                            target_database = self._config.get("target", {}).get("connection", {}).get("database", "")
-                            if grant.object_type == "GLOBAL":
-                                target_object = "*.*"
-                            elif grant.object_type == "DATABASE":
-                                target_object = f"{target_database}.*"
-                            else:
-                                target_object = f"{target_database}.{grant.object_name.rsplit('.', 1)[-1]}"
-                            grant_key = f"{target_object} TO {grant.grantee}"
-                        else:
-                            grant_key = (
-                                f"{grant.object_name} TO {grant.grantee}"
-                                if grant.schema_name == "public"
-                                else f"{grant.schema_name}.{grant.object_name} TO {grant.grantee}"
-                            )
-                        try:
-                            self._target.apply_grant(grant)
-                            grant_results.append(f"GRANT {grant.privileges} ON {grant_key}: ok")
-                        except Exception as exc:
-                            grant_results.append(f"GRANT ... ON {grant_key}: failed ({exc})")
-                            all_errors.append(f"GRANT {grant.privileges} ON {grant_key}: {exc}")
-            except Exception as exc:
-                grant_results.append(f"_error: {exc}")
-            result["phases"]["grants"] = grant_results
-            self._update_status("grants", 91, all_errors)
-
-            if oracle_full_replace:
-                if oracle_replacement_inventory is None or failed_objects:
-                    result["phases"]["oracle_schema_replacement_verification"] = {
-                        "status": "skipped",
-                        "reason": (
-                            "target Oracle connection became unavailable during an earlier phase"
-                            if oracle_target_unavailable
-                            else "one or more migration objects failed"
-                        ),
-                    }
-                else:
-                    try:
-                        verification = self._target.verify_schema_replacement(
-                            **oracle_replacement_inventory
-                        )
-                        partition_counts: dict[str, Any] = {}
-                        for schema in oracle_replacement_inventory["schemas"]:
-                            if not schema.options.get("oracle_partitioning"):
-                                continue
-                            source_counts = self._source.partition_row_counts(schema.name)
-                            target_counts = self._target.partition_row_counts(schema.name)
-                            partition_counts[schema.name] = {
-                                "source": source_counts, "target": target_counts,
-                                "match": source_counts == target_counts,
-                            }
-                            if source_counts != target_counts:
-                                raise RuntimeError(
-                                    f"Oracle partition-wise row counts differ for {schema.name}: "
-                                    f"source={source_counts}, target={target_counts}"
-                                )
-                        verification["partition_row_counts"] = partition_counts
-                        result["phases"]["oracle_schema_replacement_verification"] = verification
-                    except Exception as exc:
-                        target_owner = str(
-                            self._config.get("target", {}).get("connection", {}).get("username", "<target owner>")
-                        )
-                        result["phases"]["oracle_schema_replacement_verification"] = {
-                            "status": "failed",
-                            "phase": "oracle_schema_replacement_verification",
-                            "object": target_owner,
-                            "error": self._redact_error(exc),
-                        }
-                        self._record_object_failure(
-                            object_failures, all_errors,
-                            "oracle_schema_replacement_verification", target_owner, exc,
-                        )
-                        failed_objects.add(target_owner)
+                            failed_objects.add(target_owner)
 
             # ---------- Phase 17: Validate ----------
             self._update_status("validation", 94, all_errors)
@@ -2646,7 +2686,17 @@ class MigrationOrchestrator:
                 if obj_name not in failed_objects
                 and data_load_statuses.get(obj_name, {}).get("status") != "SKIPPED"
             ]
-            if oracle_target_unavailable:
+            if is_db2:
+                validation = result.get("phases", {}).get("validation")
+                if not isinstance(validation, dict) or not validation.get("checks"):
+                    raise RuntimeError("Db2 FULL validation checks missing")
+                if validation.get("status") != "success" or not all(
+                    isinstance(check, dict) and check.get("match") is True
+                    for check in validation["checks"].values()
+                ):
+                    raise RuntimeError("Db2 FULL validation failed")
+                result["status"] = "success"
+            elif oracle_target_unavailable:
                 validation_objects = []
                 validation = {
                     "status": "failed",
@@ -2668,7 +2718,8 @@ class MigrationOrchestrator:
                 }
             else:
                 validation = self.validate(validation_objects, schema_map=schema_map)
-            result["phases"]["validation"] = validation
+            if not is_db2:
+                result["phases"]["validation"] = validation
             for object_name, check in validation.get("checks", {}).items():
                 precision_check = check.get("precision_data", {})
                 mismatches = precision_check.get("mismatches", [])
@@ -2684,7 +2735,7 @@ class MigrationOrchestrator:
                         object_failures, all_errors, "data_validation", object_name, detail
                     )
                     failed_objects.add(object_name)
-            if failed_objects:
+            if not is_db2 and failed_objects:
                 result["status"] = (
                     "partial_success"
                     if validation_objects or (
@@ -2693,9 +2744,9 @@ class MigrationOrchestrator:
                     )
                     else "failed"
                 )
-            elif all_errors:
+            elif not is_db2 and all_errors:
                 result["status"] = "partial_success"
-            else:
+            elif not is_db2:
                 result["status"] = validation.get("status", "unknown")
             self._update_status("completed", 100, all_errors)
 
@@ -3624,7 +3675,11 @@ class MigrationOrchestrator:
             if not check.get("match", False):
                 all_passed = False
 
-        results["status"] = "success" if all_passed else "mismatch"
+        results["status"] = (
+            "success" if all_passed and bool(results["checks"])
+            else "failed" if not results["checks"]
+            else "mismatch"
+        )
         return results
 
     def rollback(self) -> dict[str, Any]:

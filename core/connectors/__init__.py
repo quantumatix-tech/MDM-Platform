@@ -17,6 +17,7 @@ from core.connectors.cosmos_mongo import (
     CosmosMongoCDCEngine,
     CosmosMongoTargetConnector,
 )
+from core.connectors.db2 import DB2SourceConnector, DB2TargetConnector
 from core.connectors.mongodb import (
     MongoCDCEngine,
     MongoSourceConnector,
@@ -46,6 +47,8 @@ __all__ = [
     "Column",
     "CosmosMongoCDCEngine",
     "CosmosMongoTargetConnector",
+    "DB2SourceConnector",
+    "DB2TargetConnector",
     "MSSQLCDCEngine",
     "MSSQLSourceConnector",
     "MSSQLTargetConnector",
