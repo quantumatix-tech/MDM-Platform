@@ -51,6 +51,18 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - Unit tests: 1269 passed, 0 failed as of the 0.4.0 release. No known
   pre-existing failures remain in the current baseline.
 
+## [0.4.1] - 2026-11-23
+
+### Fixed
+
+- Fixed CLI UnboundLocalError caused by a duplicate function-local
+  create_secret_provider import after migration execution.
+
+### Documentation
+
+- Added reusable Db2-to-Db2 Fresh Migration Runbook covering
+  database setup, permissions, migration, and data verification.
+
 ## [0.4.0] - 2026-11-19
 
 ### Added

@@ -149,7 +149,6 @@ def main():
         sec_connection["source_engine"] = source_type
         sec_connector = instantiate_connector(TARGET_CONNECTORS.get(sec_type, TARGET_CONNECTORS[target_type]), sec_connection)
         # Resolve password_secret using the existing secret provider
-        from core.secrets import create_secret_provider
         sec_resolver = create_secret_provider(config)
         if "password_secret" in sec_connection:
             sec_connector._config["password"] = sec_resolver.resolve(sec_connection["password_secret"])
