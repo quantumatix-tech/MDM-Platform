@@ -446,7 +446,7 @@ def test_partial_failure_reports_committed_data_and_ddl_errors():
         result = orch.run_full()
 
     # data committed despite DDL failure
-    assert result["status"] == "failed", f"expected failed, got {result.get('status')}: {result.get('error')}"    
+    assert result["status"] == "failed", f"expected failed, got {result.get('status')}: {result.get('error')}"
     data = result["phases"].get("data", {})
     assert data.get("status") == "success", f"data phase should be success: {data}"
     assert data.get("success", 0) > 0, "data should be committed"
@@ -854,17 +854,17 @@ def test_verify_acceptance_imports_is_partitioned_source_correctly():
     # This test ensures the import path is correct and won't cause AttributeError at runtime
     from core.connectors.db2.objects.partition import discover_partitions
     from core.orchestration.db2_full import is_partitioned_source
-    
+
     # Verify the function exists and works
     parts_multi = [
         {"name": "PART0", "seqno": 1, "low": "1", "high": "100", "low_inclusive": "Y", "high_inclusive": "Y"},
         {"name": "PART1", "seqno": 2, "low": "101", "high": "200", "low_inclusive": "Y", "high_inclusive": "Y"},
     ]
     assert is_partitioned_source(parts_multi) is True
-    
+
     # Verify it's NOT in the partition module (this would have caused the bug)
     assert not hasattr(discover_partitions, 'is_partitioned_source')
-    
+
     # Verify the partition module doesn't have this attribute
     import core.connectors.db2.objects.partition as part_mod
     assert not hasattr(part_mod, 'is_partitioned_source')
@@ -886,7 +886,7 @@ def test_discover_routines_returns_expected_structure():
     assert '"definition"' in source or "'definition'" in source
     # Verify 'origin' is NOT used
     assert '"origin"' not in source and "'origin'" not in source, "routine dict should not have 'origin' key"
-    
+
     # Also verify _retrieve_text is called correctly
     assert "_retrieve_text" in source
 

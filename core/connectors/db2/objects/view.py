@@ -45,4 +45,3 @@ def discover_views(conn: Any, schema_name: str) -> list[dict]:
                 raise RuntimeError(f"View definition length mismatch for {schema_name}.{view_name}: expected {text_len}, got {len(definition)}")
             views.append({"name": view_name, "definition": definition})
     return views
-

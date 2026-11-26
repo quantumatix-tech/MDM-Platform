@@ -186,6 +186,7 @@ class SequenceDef:
     last_used_value: int | None = None
     last_used_value_available: bool = False
     is_exhausted: bool = False
+    options: dict[str, Any] = field(default_factory=dict)  # engine-specific options preserved by capable connectors
 
 
 @dataclass
@@ -228,6 +229,10 @@ class MaterializedViewDef:
     name: str
     definition: str     # raw SELECT definition
     schema_name: str = "public"
+    build_mode: str = "IMMEDIATE"
+    refresh_mode: str = "DEMAND"
+    refresh_method: str = "COMPLETE"
+    rewrite_enabled: str = "N"
 
 
 @dataclass
@@ -292,6 +297,7 @@ class CommentDef:
     object_name: str    # For columns: 'table.column'; schema is tracked separately
     comment: str
     schema_name: str = "public"
+    column_name: str | None = None
 
 
 @dataclass
@@ -312,6 +318,10 @@ class SynonymDef:
     name: str
     schema_name: str
     base_object: str    # fully qualified base object name, e.g. "schema.table"
+    base_owner: str | None = None
+    base_name: str | None = None
+    db_link: str | None = None
+    is_public: bool = False
 
 
 @dataclass

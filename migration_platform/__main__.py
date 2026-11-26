@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 import time
 from threading import Thread
@@ -27,12 +29,14 @@ from core.connectors import (
     MSSQLTargetConnector,
     MySQLSourceConnector,
     MySQLTargetConnector,
+    OracleSourceConnector,
+    OracleTargetConnector,
     PostgresSourceConnector,
     PostgresTargetConnector,
 )
 from core.orchestrator import MigrationOrchestrator
 from core.preflight import assert_python_version
-from core.progress_display import create_progress_display
+from core.progress_display import NoopProgressDisplay, create_progress_display
 from core.reporting.report_builder import ReportBuilder
 from core.runtime_manifest import build_runtime_manifest, save_manifest
 from core.secrets import create_secret_provider
@@ -45,6 +49,7 @@ SOURCE_CONNECTORS = {
     "mongodb": MongoSourceConnector,
     "mysql": MySQLSourceConnector,
     "mssql": MSSQLSourceConnector,
+    "oracle": OracleSourceConnector,
     "db2": DB2SourceConnector,
 }
 
@@ -53,8 +58,9 @@ TARGET_CONNECTORS = {
     "mongodb": MongoTargetConnector,
     "mysql": MySQLTargetConnector,
     "mssql": MSSQLTargetConnector,
-    "cosmos_mongo": CosmosMongoTargetConnector,
+    "oracle": OracleTargetConnector,
     "db2": DB2TargetConnector,
+    "cosmos_mongo": CosmosMongoTargetConnector,
 }
 
 
@@ -77,9 +83,70 @@ class _CompoundReporter:
             if hasattr(r, "record_table_stats"):
                 r.record_table_stats(table, source_rows, success, failure)
 
+    def prompt(self, message: str) -> str:
+        for reporter in self._reporters:
+            prompt = getattr(reporter, "prompt", None)
+            if callable(prompt):
+                return prompt(message)
+        raise RuntimeError("Interactive approval is unavailable in this CLI session")
+
 
 def instantiate_connector(connector_cls, connection_config):
     return connector_cls(connection_config)
+
+
+def _safe_summary_text(value: object, limit: int = 240) -> str:
+    text = " ".join(str(value).split())
+    text = re.sub(
+        r"(?i)\b(password|passwd|pwd|secret|token|access_key)\s*[:=]\s*[^\s,;]+",
+        r"\1=<redacted>", text,
+    )
+    text = re.sub(r"(://[^:/\s]+:)[^@/\s]+@", r"\1<redacted>@", text)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def print_object_failures(result: dict, limit: int = 5) -> None:
+    """Print concise, credential-redacted object failures in the final summary."""
+    failures = result.get("phases", {}).get("object_failures", []) or []
+    if not failures:
+        failures = [
+            {"phase": "migration", "object": "<migration>", "error": error}
+            for error in (result.get("errors", []) or [])
+        ]
+        if not failures and result.get("error"):
+            failures = [{
+                "phase": "migration", "object": "<migration>",
+                "error": result["error"],
+            }]
+    if not failures:
+        return
+    print(f"  Object Errors : {len(failures)}")
+    for failure in failures[:limit]:
+        phase = _safe_summary_text(failure.get("phase", "migration"), 40)
+        obj = _safe_summary_text(failure.get("object", "<unknown>"), 80)
+        reason = _safe_summary_text(failure.get("error", "Migration failed"), 8192)
+        print(f"    - [{phase}] {obj}: {reason}")
+    if len(failures) > limit:
+        print(f"    - … {len(failures) - limit} more; see JSON report for details")
+
+
+def print_data_load_statuses(result: dict) -> None:
+    """Print per-table data outcomes, including dependency and policy skips."""
+    data = result.get("phases", {}).get("data", {}) or {}
+    tables = data.get("tables", {}) if isinstance(data, dict) else {}
+    if not tables:
+        return
+    counts = data.get("counts", {})
+    print(
+        "  Data Tables : "
+        f"SUCCESS {counts.get('SUCCESS', 0)}, "
+        f"FAILED {counts.get('FAILED', 0)}, "
+        f"SKIPPED {counts.get('SKIPPED', 0)}"
+    )
+    for table, outcome in tables.items():
+        status = _safe_summary_text(outcome.get("status", "UNKNOWN"), 20)
+        reason = _safe_summary_text(outcome.get("reason", ""), 8192)
+        print(f"    - [{status}] {_safe_summary_text(table, 120)}: {reason}")
 
 
 def main():
@@ -108,6 +175,19 @@ def main():
         "--no-live-ui", action="store_true",
         help="Disable rich terminal UI (raw JSON output)",
     )
+    parser.add_argument(
+        "--exit-after-run",
+        action="store_true",
+        help="Exit after writing reports instead of keeping the status server open",
+    )
+    parser.add_argument(
+        "--oracle-overwrite-plan", action="store_true",
+        help="Print a read-only Oracle FULL schema replacement plan and exit",
+    )
+    parser.add_argument(
+        "--oracle-permission-adopt-legacy", action="store_true",
+        help="Explicitly review and approve legacy Oracle grants whose framework ownership is untracked",
+    )
     args = parser.parse_args()
 
     # requires-python is only enforced by pip at install time; re-check at
@@ -121,6 +201,10 @@ def main():
     target_cfg = config.get("target", {})
     source_type = source_cfg.get("engine")
     target_type = target_cfg.get("engine")
+    if args.oracle_permission_adopt_legacy and not (
+        args.mode == "full" and source_type == "oracle" and target_type == "oracle"
+    ):
+        raise SystemExit("--oracle-permission-adopt-legacy requires Oracle-to-Oracle FULL mode")
 
     if source_type not in SOURCE_CONNECTORS:
         raise SystemExit(f"Unknown source engine: {source_type!r}. Available: {list(SOURCE_CONNECTORS)}")
@@ -140,39 +224,55 @@ def main():
     target_connection["source_engine"] = source_type
     target = instantiate_connector(TARGET_CONNECTORS[target_type], target_connection)
 
-    # Optional security executor for self-grants (SQL0554N avoidance)
+    if args.oracle_overwrite_plan:
+        orchestrator = MigrationOrchestrator(source, target, config)
+        try:
+            plan = orchestrator.plan_oracle_schema_replacement(mode=args.mode)
+            print(json.dumps(plan, indent=2, sort_keys=True))
+            return
+        except Exception as exc:
+            print(f"Oracle schema replacement planning failed: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+
+    # Db2 privilege grants may require a separate SECADM identity.
     security_executor_conn = None
+    sec_connector = None
     sec_cfg = config.get("security_executor", {})
-    if sec_cfg:
+    if sec_cfg and source_type == "db2" and target_type == "db2":
         sec_type = sec_cfg.get("engine", target_type)
         sec_connection = dict(sec_cfg.get("connection", {}))
         sec_connection["source_engine"] = source_type
-        sec_connector = instantiate_connector(TARGET_CONNECTORS.get(sec_type, TARGET_CONNECTORS[target_type]), sec_connection)
-        # Resolve password_secret using the existing secret provider
+        sec_connector = instantiate_connector(
+            TARGET_CONNECTORS.get(sec_type, TARGET_CONNECTORS[target_type]), sec_connection
+        )
         sec_resolver = create_secret_provider(config)
         if "password_secret" in sec_connection:
-            sec_connector._config["password"] = sec_resolver.resolve(sec_connection["password_secret"])
+            sec_connector._config["password"] = sec_resolver.resolve(
+                sec_connection["password_secret"]
+            )
         sec_connector.connect()
         security_executor_conn = getattr(sec_connector, "_conn", None)
         if security_executor_conn is None or not hasattr(security_executor_conn, "cursor"):
             raise SystemExit("Security executor connection failed: _conn is None")
-        with security_executor_conn.cursor() as _c:
-            _c.execute("SELECT CURRENT SERVER, SESSION_USER FROM SYSIBM.SYSDUMMY1")
-            _row = _c.fetchone()
-            _db = str(_row[0]).strip().upper() if _row else ""
-            _user = str(_row[1]).strip().upper() if _row else ""
-            _c.execute("SELECT SECURITYADMAUTH FROM SYSCAT.DBAUTH WHERE GRANTEE = SESSION_USER AND GRANTEETYPE = 'U'")
-            _auth = _c.fetchone()
-        # Validate target database
-        _target_db = str(target_connection.get("database", "")).strip().upper()
-        if _target_db and _db != _target_db:
-            raise SystemExit(f"Security executor connected to wrong database: {_db} != {_target_db}")
-        # Validate distinct identity (must differ from migration user)
-        _migration_user = str(target_connection.get("username", "")).strip().upper()
-        if _user == _migration_user:
-            raise SystemExit(f"Security executor must differ from migration user: {_user}")
-        # Validate SECADM
-        if not _auth or str(_auth[0]).strip().upper() not in ("Y", "G"):
+        with security_executor_conn.cursor() as cursor:
+            cursor.execute("SELECT CURRENT SERVER, SESSION_USER FROM SYSIBM.SYSDUMMY1")
+            row = cursor.fetchone()
+            database = str(row[0]).strip().upper() if row else ""
+            username = str(row[1]).strip().upper() if row else ""
+            cursor.execute(
+                "SELECT SECURITYADMAUTH FROM SYSCAT.DBAUTH "
+                "WHERE GRANTEE = SESSION_USER AND GRANTEETYPE = 'U'"
+            )
+            authority = cursor.fetchone()
+        target_database = str(target_connection.get("database", "")).strip().upper()
+        if target_database and database != target_database:
+            raise SystemExit(
+                f"Security executor connected to wrong database: {database} != {target_database}"
+            )
+        migration_user = str(target_connection.get("username", "")).strip().upper()
+        if username == migration_user:
+            raise SystemExit(f"Security executor must differ from migration user: {username}")
+        if not authority or str(authority[0]).strip().upper() not in ("Y", "G"):
             raise SystemExit("Security executor lacks SECADM authority")
 
     # ---- Audit log to file (suppress stdout noise when rich is active) ----
@@ -190,14 +290,13 @@ def main():
 
     # ---- Rich terminal progress display ----
     progress_display = create_progress_display(run_id, mode)
+    if args.no_live_ui:
+        progress_display = NoopProgressDisplay()
 
     # ---- Compound reporter (fans out to both) ----
     reporter = _CompoundReporter([status_server, progress_display])
 
     orchestrator = MigrationOrchestrator(source, target, config, status_server=reporter)
-    orchestrator._security_executor_conn = security_executor_conn
-    if security_executor_conn is not None:
-        orchestrator._security_executor_connector = sec_connector
 
     start_time = time.time()
 
@@ -207,7 +306,9 @@ def main():
             print(f"Audit log:      {log_path}")
 
         if args.mode == "full":
-            result = orchestrator.run_full()
+            result = orchestrator.run_full(
+                approve_legacy_permissions=args.oracle_permission_adopt_legacy
+            )
         elif args.mode == "cdc-incremental":
             result = orchestrator.run_cdc(max_iterations=1)
         elif args.mode == "cdc-continuous":
@@ -276,6 +377,8 @@ def main():
     print(f"  Run ID      : {run_id}")
     print(f"  Mode        : {mode}")
     print(f"  Duration    : {round(end_time - start_time, 1)}s")
+    print_object_failures(result)
+    print_data_load_statuses(result)
     print(f"  Audit Log   : {log_path}")
     print(f"  HTML Report : {os.path.abspath(html_path)}")
     print(f"  JSON Report : {os.path.abspath(json_path)}")
@@ -286,6 +389,10 @@ def main():
     if azure_url:
         print(f"  Public URL  : {azure_url}")
     print(sep)
+
+    if args.exit_after_run:
+        status_server.stop()
+        raise SystemExit(0 if result.get("status") in ("success", "completed") else 1)
 
     # ---- Open latest report automatically ----
     try:
@@ -299,8 +406,8 @@ def main():
     # This means http://localhost:{port}/reports/ remains accessible
     # until the user explicitly stops it.
     print(f"\n  Report server is running at http://{local_ip}:{args.port}/")
-    print("  Share that URL with your team to view all migration reports.")
-    print("  Press Ctrl+C to stop the server.\n")
+    print(f"  Share that URL with your team to view all migration reports.")
+    print(f"  Press Ctrl+C to stop the server.\n")
 
     try:
         status_server.run()   # blocks until Ctrl+C
@@ -310,5 +417,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

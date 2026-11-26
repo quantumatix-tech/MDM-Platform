@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.schema_mapping.type_map import map_type, check_size_limit
+from core.schema_mapping.type_map import check_size_limit, map_type
 
 
 class TypeMappingRegistry:
@@ -23,7 +23,7 @@ class TypeMappingRegistry:
         return check_size_limit(target_engine, size_bytes)
 
     def get_supported_engines(self) -> list[str]:
-        return ["postgresql", "mysql", "mongodb", "mssql", "cosmos_mongo"]
+        return ["postgresql", "mysql", "mongodb", "mssql", "oracle", "cosmos_mongo"]
 
     def validate_compatibility(self, source_engine: str, target_engine: str, source_type: str) -> dict[str, Any]:
         target_type = self.map_type(source_engine, target_engine, source_type)

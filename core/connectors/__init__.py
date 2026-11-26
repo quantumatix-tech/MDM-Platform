@@ -1,75 +1,76 @@
+from typing import Any
+
 from core.connectors.base import (
+    ApplyResult,
+    CDCEngine,
+    ChangeEvent,
+    Column,
+    PartitionDef,
+    Schema,
+    SequenceDef,
     SourceConnector,
     TargetConnector,
-    CDCEngine,
-    Column,
-    Schema,
-    PartitionDef,
-    SequenceDef,
     UpsertResult,
-    ApplyResult,
-    ChangeEvent,
     validate_identifier,
 )
-from typing import Any
-from core.connectors.postgresql import (
-    PostgresSourceConnector,
-    PostgresTargetConnector,
-    PostgresCDCEngine,
+from core.connectors.cosmos_mongo import (
+    CosmosMongoCDCEngine,
+    CosmosMongoTargetConnector,
 )
+from core.connectors.db2 import DB2SourceConnector, DB2TargetConnector
 from core.connectors.mongodb import (
+    MongoCDCEngine,
     MongoSourceConnector,
     MongoTargetConnector,
-    MongoCDCEngine,
-)
-from core.connectors.mysql import (
-    MySQLSourceConnector,
-    MySQLTargetConnector,
-    MySQLCDCEngine,
 )
 from core.connectors.mssql import (
+    MSSQLCDCEngine,
     MSSQLSourceConnector,
     MSSQLTargetConnector,
-    MSSQLCDCEngine,
 )
-from core.connectors.cosmos_mongo import (
-    CosmosMongoTargetConnector,
-    CosmosMongoCDCEngine,
+from core.connectors.mysql import (
+    MySQLCDCEngine,
+    MySQLSourceConnector,
+    MySQLTargetConnector,
 )
-from core.connectors.db2 import (
-    DB2SourceConnector,
-    DB2TargetConnector,
+from core.connectors.oracle import OracleSourceConnector, OracleTargetConnector
+from core.connectors.postgresql import (
+    PostgresCDCEngine,
+    PostgresSourceConnector,
+    PostgresTargetConnector,
 )
 
 __all__ = [
-    "SourceConnector",
-    "TargetConnector",
-    "CDCEngine",
-    "Column",
-    "Schema",
-    "PartitionDef",
-    "SequenceDef",
-    "UpsertResult",
     "ApplyResult",
+    "CDCEngine",
     "ChangeEvent",
-    "validate_identifier",
-    "PostgresSourceConnector",
-    "PostgresTargetConnector",
-    "PostgresCDCEngine",
-    "MongoSourceConnector",
-    "MongoTargetConnector",
-    "MongoCDCEngine",
-    "MySQLSourceConnector",
-    "MySQLTargetConnector",
-    "MySQLCDCEngine",
-    "MSSQLSourceConnector",
-    "MSSQLTargetConnector",
-    "MSSQLCDCEngine",
-    "CosmosMongoTargetConnector",
+    "Column",
     "CosmosMongoCDCEngine",
+    "CosmosMongoTargetConnector",
     "DB2SourceConnector",
     "DB2TargetConnector",
+    "MSSQLCDCEngine",
+    "MSSQLSourceConnector",
+    "MSSQLTargetConnector",
+    "MongoCDCEngine",
+    "MongoSourceConnector",
+    "MongoTargetConnector",
+    "MySQLCDCEngine",
+    "MySQLSourceConnector",
+    "MySQLTargetConnector",
+    "OracleSourceConnector",
+    "OracleTargetConnector",
+    "PartitionDef",
+    "PostgresCDCEngine",
+    "PostgresSourceConnector",
+    "PostgresTargetConnector",
+    "Schema",
+    "SequenceDef",
+    "SourceConnector",
+    "TargetConnector",
+    "UpsertResult",
     "create_cdc_engine",
+    "validate_identifier",
 ]
 
 _CDC_ENGINE_MAP = {

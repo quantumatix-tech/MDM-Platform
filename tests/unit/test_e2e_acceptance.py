@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from tests.e2e.acceptance import (
     E2EConfig,
+    E2EResource,
     fmt_phase,
     fmt_source_target_counts,
     json_default,
@@ -83,6 +86,137 @@ class TestE2EConfig:
 
     def test_target_password_secret(self, sample_cfg):
         assert sample_cfg.target_password_secret() == "mysql_e2e_target_pass"
+
+    def test_legacy_database_fields_resolve_to_database_resources(self, sample_cfg):
+        assert sample_cfg.source_resource == E2EResource(
+            "database", "MigrationE2E_MySQL_Source", r"^MigrationE2E_MySQL_.+$"
+        )
+        assert sample_cfg.target_resource == E2EResource(
+            "database", "MigrationE2E_MySQL_Target", r"^MigrationE2E_MySQL_.+$"
+        )
+        assert sample_cfg.database_cleanup_pattern == r"^MigrationE2E_MySQL_.+$"
+
+    def test_explicit_source_and_target_schema_resources_are_independent(self):
+        cfg = E2EConfig({
+            "source": {"connection": {"service_name": "FREEPDB1"}},
+            "target": {"connection": {"service_name": "FREEPDB1"}},
+            "e2e": {
+                "resources": {
+                    "source": {
+                        "kind": "owner",
+                        "name": "MIGRATION_E2E_SOURCE",
+                        "safe_pattern": r"^MIGRATION_E2E_SOURCE$",
+                    },
+                    "target": {
+                        "kind": "schema",
+                        "name": "MIGRATION_E2E_TARGET",
+                        "safe_pattern": r"^MIGRATION_E2E_TARGET$",
+                    },
+                },
+            },
+        })
+
+        assert cfg.source_resource.kind == "schema"
+        assert cfg.source_resource.name == "MIGRATION_E2E_SOURCE"
+        assert cfg.target_resource.kind == "schema"
+        assert cfg.target_resource.name == "MIGRATION_E2E_TARGET"
+        assert cfg.source_resource.matches_safety_pattern
+        assert cfg.target_resource.matches_safety_pattern
+        with pytest.raises(ValueError, match="not a database"):
+            _ = cfg.source_db
+
+    def test_schema_resources_are_rejected_by_database_cleanup_guard(self):
+        cfg = E2EConfig({
+            "e2e": {
+                "resources": {
+                    "source": {"kind": "schema", "name": "SOURCE_OWNER"},
+                    "target": {"kind": "schema", "name": "TARGET_OWNER"},
+                },
+            },
+        })
+        with pytest.raises(ValueError, match="Database cleanup is not available"):
+            _ = cfg.database_cleanup_pattern
+
+    def test_database_cleanup_rejects_resource_matching_oracle_service(self):
+        cfg = E2EConfig({
+            "source": {"connection": {"service_name": "FREEPDB1"}},
+            "target": {"connection": {"service_name": "FREEPDB1"}},
+            "e2e": {
+                "resources": {
+                    "source": {"kind": "database", "name": "FREEPDB1"},
+                    "target": {"kind": "database", "name": "FREEPDB1"},
+                },
+                "safe_db_pattern": r"^.+$",
+            },
+        })
+        with pytest.raises(ValueError, match="matches the endpoint service_name"):
+            _ = cfg.database_cleanup_pattern
+
+    def test_database_cleanup_is_unavailable_for_oracle_endpoints(self):
+        cfg = E2EConfig({
+            "source": {
+                "engine": "oracle",
+                "connection": {"service_name": "FREEPDB1"},
+            },
+            "target": {
+                "engine": "oracle",
+                "connection": {"service_name": "FREEPDB1"},
+            },
+            "e2e": {
+                "resources": {
+                    "source": {"kind": "database", "name": "SOURCE_SCOPE"},
+                    "target": {"kind": "database", "name": "TARGET_SCOPE"},
+                },
+                "safe_db_pattern": r"^.+$",
+            },
+        })
+        with pytest.raises(ValueError, match="not supported for Oracle"):
+            _ = cfg.database_cleanup_pattern
+
+    @pytest.mark.parametrize(
+        "config_name",
+        [
+            "mssql_e2e_acceptance.yaml",
+            "mysql_e2e_acceptance.yaml",
+            "postgresql_e2e_acceptance.yaml",
+        ],
+    )
+    def test_existing_acceptance_configs_keep_database_cleanup_behavior(self, config_name):
+        repo_root = Path(__file__).parents[2]
+        cfg = load_e2e_config(str(repo_root / "config" / config_name))
+        assert cfg.source_resource.kind == "database"
+        assert cfg.target_resource.kind == "database"
+        assert cfg.source_db == cfg.raw["e2e"]["source_database"]
+        assert cfg.target_db == cfg.raw["e2e"]["target_database"]
+        assert cfg.database_cleanup_pattern == cfg.safe_pattern
+
+    def test_shared_cleaner_rejects_schema_resources_before_loading_cleanup_adapter(
+        self, tmp_path, monkeypatch
+    ):
+        import yaml
+
+        from tests.e2e import acceptance_clean
+
+        config_file = tmp_path / "schema_targets.yaml"
+        config_file.write_text(yaml.safe_dump({
+            "source": {"connection": {"service_name": "FREEPDB1"}},
+            "target": {"connection": {"service_name": "FREEPDB1"}},
+            "e2e": {
+                "resources": {
+                    "source": {"kind": "schema", "name": "SOURCE_OWNER"},
+                    "target": {"kind": "schema", "name": "TARGET_OWNER"},
+                },
+            },
+        }), encoding="utf-8")
+        monkeypatch.setattr(
+            sys, "argv", ["acceptance_clean.py", "--engine", "pg", "--config", str(config_file)]
+        )
+        monkeypatch.setattr(acceptance_clean.importlib, "import_module", lambda _: pytest.fail(
+            "cleanup adapter must not be imported for schema resources"
+        ))
+
+        with pytest.raises(SystemExit, match="Database cleanup is not available"):
+            acceptance_clean.main()
 
     def test_to_abs_fixture_path_relative(self, sample_cfg, tmp_path):
         """Repo-root-relative fixture_path resolves from repo root, not config_dir."""

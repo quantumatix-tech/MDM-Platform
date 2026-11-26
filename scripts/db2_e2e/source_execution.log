@@ -1,23 +1,23 @@
 ﻿-- scripts/db2_e2e/01_source_fixture.sql
  CREATE DISTINCT TYPE TESTE2E.EMP_CODE AS INTEGER
-DB21034E  The command was processed as an SQL statement because it was not a 
+DB21034E  The command was processed as an SQL statement because it was not a
 valid Command Line Processor command.  During SQL processing it returned:
-SQL0104N  An unexpected token "﻿                         " was found 
-following "BEGIN-OF-STATEMENT".  Expected tokens may include:  
+SQL0104N  An unexpected token "﻿                         " was found
+following "BEGIN-OF-STATEMENT".  Expected tokens may include:
 "<create_or_replace>".  SQLSTATE=42601
 
 CREATE TABLE TESTE2E.EMP_UDT ( ID INTEGER NOT NULL, CODE TESTE2E.EMP_CODE, PRIMARY KEY (ID) )
-DB21034E  The command was processed as an SQL statement because it was not a 
+DB21034E  The command was processed as an SQL statement because it was not a
 valid Command Line Processor command.  During SQL processing it returned:
 SQL0204N  "TESTE2E.EMP_CODE" is an undefined name.  SQLSTATE=42704
 
 INSERT INTO TESTE2E.EMP_UDT VALUES (1, CAST(101 AS TESTE2E.EMP_CODE))
-DB21034E  The command was processed as an SQL statement because it was not a 
+DB21034E  The command was processed as an SQL statement because it was not a
 valid Command Line Processor command.  During SQL processing it returned:
 SQL0204N  "TESTE2E.EMP_UDT" is an undefined name.  SQLSTATE=42704
 
 INSERT INTO TESTE2E.EMP_UDT VALUES (2, CAST(102 AS TESTE2E.EMP_CODE))
-DB21034E  The command was processed as an SQL statement because it was not a 
+DB21034E  The command was processed as an SQL statement because it was not a
 valid Command Line Processor command.  During SQL processing it returned:
 SQL0204N  "TESTE2E.EMP_UDT" is an undefined name.  SQLSTATE=42704
 
@@ -75,4 +75,3 @@ RETURNS INTEGER
 LANGUAGE SQL
 RETURN X * 2
 DB20000I  The SQL command completed successfully.
-

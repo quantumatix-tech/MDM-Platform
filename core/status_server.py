@@ -169,8 +169,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       }
 
       const badge = document.getElementById('status-badge');
-      if (pct === 100) { badge.textContent = '✓ Completed'; badge.className = 'badge success'; }
-      else if ((d.errors||[]).length > 0) { badge.textContent = '⚠ Errors'; badge.className = 'badge failed'; }
+      if ((d.errors||[]).length > 0) { badge.textContent = '⚠ Errors'; badge.className = 'badge failed'; }
+      else if (pct === 100) { badge.textContent = '✓ Completed'; badge.className = 'badge success'; }
       else if (pct > 0) { badge.textContent = '⟳ Running'; badge.className = 'badge running'; }
       else { badge.textContent = 'Idle'; badge.className = 'badge idle'; }
 
@@ -210,9 +210,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       const ep = document.getElementById('errors-panel');
       if (errs.length > 0) {
         ep.classList.add('has-errors');
-        document.getElementById('error-list').innerHTML = errs.slice(-10).map(e => `<li>${e}</li>`).join('');
+        const list = document.getElementById('error-list');
+        list.replaceChildren(...errs.slice(-10).map(e => {
+          const item = document.createElement('li');
+          item.textContent = String(e);
+          return item;
+        }));
       } else {
         ep.classList.remove('has-errors');
+        document.getElementById('error-list').replaceChildren();
       }
     } catch (e) {}
   }

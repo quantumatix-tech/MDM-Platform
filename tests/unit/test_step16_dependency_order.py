@@ -34,6 +34,8 @@ def _orchestrator_for_order_test():
     """Create orchestrator with mocks that track call order."""
     source = MagicMock(spec=SourceConnector)
     target = MagicMock(spec=TargetConnector)
+    source._config = {}
+    target._config = {}
 
     objects = ["table1", "table2"]
     schemas_map = {name: _schema(name) for name in objects}

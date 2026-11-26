@@ -502,29 +502,29 @@ def compare_comments(src, tgt, schemas, result):
             # discover_table_comments(conn, schema_name) -> list[{"object_type": "TABLE", "table": ..., "comment": ...}]
             tc_src = db2_comment.discover_table_comments(src._conn, sch)
             tc_tgt = db2_comment.discover_table_comments(tgt._conn, sch)
-            
+
             # discover_column_comments(conn, schema_name) -> list[{"object_type": "COLUMN", "table": ..., "column": ..., "comment": ...}]
             cc_src = db2_comment.discover_column_comments(src._conn, sch)
             cc_tgt = db2_comment.discover_column_comments(tgt._conn, sch)
-            
+
             # Normalize for comparison
             def norm_table_comment(c):
                 return (c.get("object_type"), c.get("table"), c.get("comment"))
             def norm_col_comment(c):
                 return (c.get("object_type"), c.get("table"), c.get("column"), c.get("comment"))
-            
+
             tc_src_norm = sorted([norm_table_comment(c) for c in tc_src])
             tc_tgt_norm = sorted([norm_table_comment(c) for c in tc_tgt])
             cc_src_norm = sorted([norm_col_comment(c) for c in cc_src])
             cc_tgt_norm = sorted([norm_col_comment(c) for c in cc_tgt])
-            
+
             tbl_match = tc_src_norm == tc_tgt_norm
             col_match = cc_src_norm == cc_tgt_norm
-            
+
             print(f'  {sch}: TBL_COMMENT_src={tc_src_norm}')
             print(f'  {sch}: TBL_COMMENT_tgt={tc_tgt_norm} MATCH={tbl_match}')
             print(f'  {sch}: COL_COMMENT_src_count={len(cc_src_norm)} tgt_count={len(cc_tgt_norm)} MATCH={col_match}')
-            
+
             if not tbl_match:
                 result.add_mismatch(f"COMMENT_TABLE.{sch}", f"src={tc_src_norm} tgt={tc_tgt_norm}")
             if not col_match:
