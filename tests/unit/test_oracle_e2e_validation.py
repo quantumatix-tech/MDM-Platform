@@ -28,7 +28,6 @@ class FakeCursor:
 
     def __exit__(self, *_args):
         self.close()
-        return None
 
     def execute(self, statement: str, params=()):
         self.statement = statement

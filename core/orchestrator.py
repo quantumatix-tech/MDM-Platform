@@ -2168,12 +2168,23 @@ class MigrationOrchestrator:
                         else self._source.list_views()
                     )
                     if oracle_full_objects is not None:
-                        view_results = {
-                            view.name: oracle_object_phase_results["views"].get(
-                                f"{view.schema_name}.{view.name}", "skipped: preflight failed"
-                            )
-                            for view in views_to_migrate
-                        }
+                        # Oracle table reconciliation, identity advancement,
+                        # and constraint DDL happen after the early object
+                        # preflight. Reapply source-managed views only after
+                        # those table changes so Oracle cannot leave a
+                        # dependent view INVALID at the end of a repeat FULL.
+                        for view in views_to_migrate:
+                            try:
+                                self._target.create_view(view)
+                                view_results[view.name] = "recreated_after_table_ddl"
+                            except Exception as exc:
+                                view_results[view.name] = f"error: {self._redact_error(exc)}"
+                                failed_objects.add(view.name)
+                                self._record_object_failure(
+                                    object_failures, all_errors,
+                                    "recreate_oracle_view_after_table_ddl",
+                                    f"{view.schema_name}.{view.name}", exc,
+                                )
                         result["phases"]["views"] = view_results
                         self._update_status("views", 70, all_errors)
                         views_to_migrate = []

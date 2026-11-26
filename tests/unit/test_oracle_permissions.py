@@ -175,7 +175,6 @@ def _target_connection(*, missing_users=(), missing_roles=(), conflicting_users=
 
     def fetchone():
         sql = str(cur.execute.call_args.args[0]).upper()
-        binds = cur.execute.call_args.args[1] if len(cur.execute.call_args.args) > 1 else ()
         for needle, row in overrides.items():
             if needle in sql and not callable(row):
                 return row[0] if row else None
@@ -462,6 +461,8 @@ def test_executor_authority_preflight_consolidates_missing_system_and_role_autho
             self.sql, self.binds = str(sql).upper(), binds
 
         def fetchall(self):
+            if "SELECT 1 FROM SYS." in self.sql:
+                return []
             if "DBA_USERS" in self.sql and self.binds:
                 return [(self.binds[0],)]
             if "DBA_ROLES" in self.sql and self.binds:
@@ -482,6 +483,50 @@ def test_executor_authority_preflight_consolidates_missing_system_and_role_autho
     assert "ADMIN OPTION on existing target role SRC_READ" in gaps
     assert "ADMIN OPTION on existing target role SRC_NESTED" in gaps
     assert "CREATE SESSION WITH ADMIN OPTION to apply the approved source grant" in gaps
+
+
+def test_executor_authority_preflight_uses_mapped_target_role_names():
+    class Cursor:
+        def __init__(self, conn):
+            self.conn, self.sql, self.binds = conn, "", ()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, binds=()):
+            self.sql, self.binds = str(sql).upper(), binds
+
+        def fetchall(self):
+            if "SELECT 1 FROM SYS." in self.sql:
+                return []
+            if "DBA_ROLES" in self.sql:
+                return [(self.binds[0],)]
+            if "DBA_USERS" in self.sql:
+                return []
+            if "USER_SYS_PRIVS" in self.sql:
+                return [("CREATE SESSION", "YES")]
+            if "USER_ROLE_PRIVS" in self.sql:
+                return []
+            return []
+
+    class Connection:
+        def cursor(self):
+            return Cursor(self)
+
+    inventory = _source_inventory(_policy(approve_create_session=True))
+    inventory["policy"]["role_mappings"] = {
+        "SRC_READ": "TARGET_READ", "SRC_NESTED": "TARGET_NESTED",
+    }
+    inventory["role_mappings"] = dict(inventory["policy"]["role_mappings"])
+    gaps = permissions.executor_authority_gaps(
+        Connection(), _policy(approve_create_session=True), inventory,
+    )
+    assert "ADMIN OPTION on existing target role TARGET_READ" in gaps
+    assert "ADMIN OPTION on existing target role TARGET_NESTED" in gaps
+    assert not any("existing target role SRC_" in gap for gap in gaps)
 
 
 def test_permission_onboarding_requires_explicit_approval_and_specific_catalog_grant_option():
@@ -857,6 +902,11 @@ def test_preflight_refuses_membership_that_would_expose_unrelated_existing_role_
 
 def test_memberships_and_object_column_grants_are_applied_idempotently():
     target, cur = _target_connection()
+    cur.fetchall.side_effect = lambda: (
+        [("YES",)]
+        if "USER_ROLE_PRIVS" in str(cur.execute.call_args.args[0]).upper()
+        else []
+    )
     plan = {
         "object_grants": [
             {"kind": "TABLE", "object_name": "P8_S40_DATA", "privilege": "SELECT", "grantee": "SRC_APP"},
@@ -904,6 +954,11 @@ def test_create_session_copy_and_missing_grant_authority_are_preflighted():
 
 def test_denied_grant_and_membership_operations_surface_actionable_errors():
     target, cur = _target_connection()
+    cur.fetchall.side_effect = lambda: (
+        [("R", "YES")]
+        if "USER_ROLE_PRIVS" in str(cur.execute.call_args.args[0]).upper()
+        else []
+    )
     cur.execute.side_effect = lambda statement, *a, **k: (
         (_ for _ in ()).throw(PermissionError("ORA-01031 insufficient privileges"))
         if str(statement).upper().startswith("GRANT ") else None
@@ -917,6 +972,44 @@ def test_denied_grant_and_membership_operations_surface_actionable_errors():
         permissions.apply_memberships(target, {
             "memberships": [{"member": "APP", "role": "R"}],
         })
+
+
+def test_new_role_creator_admin_option_is_verified_before_memberships():
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.side_effect = lambda: [("YES",)]
+
+    applied = permissions.apply_principals(conn, {
+        "new_users": [], "new_roles": [{"target": "NEW_ROLE"}],
+    })
+
+    assert applied == ["ROLE NEW_ROLE (creator ADMIN OPTION approved)"]
+    assert 'CREATE ROLE "NEW_ROLE" NOT IDENTIFIED' in [call.args[0] for call in cur.execute.call_args_list]
+
+
+def test_new_role_without_verified_creator_admin_option_stops_membership_stage():
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.side_effect = list
+
+    with pytest.raises(RuntimeError, match="creator ADMIN OPTION could not be verified"):
+        permissions.apply_principals(conn, {
+            "new_users": [], "new_roles": [{"target": "NEW_ROLE"}],
+        })
+    assert 'CREATE ROLE "NEW_ROLE" NOT IDENTIFIED' in [call.args[0] for call in cur.execute.call_args_list]
+    assert not any(str(call.args[0]).upper().startswith("GRANT ") for call in cur.execute.call_args_list)
+
+
+def test_membership_apply_rechecks_executor_admin_option_before_grant():
+    conn = MagicMock()
+    cur = conn.cursor.return_value.__enter__.return_value
+    cur.fetchall.side_effect = list
+
+    with pytest.raises(RuntimeError, match="lacks verified ADMIN OPTION on role READ_ROLE"):
+        permissions.apply_memberships(conn, {
+            "memberships": [{"member": "APP_USER", "role": "READ_ROLE"}],
+        })
+    assert not any(str(call.args[0]).upper().startswith("GRANT ") for call in cur.execute.call_args_list)
 
 
 def _tracked_item(kind, privilege, object_name="", column_name="", grantee="APP"):
@@ -1178,9 +1271,13 @@ def test_provenance_setup_grants_executor_only_ledger_dml_and_is_idempotent(monk
     assert len(first) == 4
     assert any(statement.startswith("CREATE TABLE \"TGT_OWNER\".\"DMT_PERMISSION_PROVENANCE\"")
                for statement in statements)
-    assert any(statement.startswith("GRANT SELECT, DELETE, INSERT, UPDATE ON")
-               or statement.startswith("GRANT DELETE, INSERT, SELECT, UPDATE ON")
-               for statement in statements)
+    assert any(
+        statement.startswith((
+            "GRANT SELECT, DELETE, INSERT, UPDATE ON",
+            "GRANT DELETE, INSERT, SELECT, UPDATE ON",
+        ))
+        for statement in statements
+    )
     statements.clear()
     second = permissions.prepare_provenance(conn, "TGT_OWNER", "EXECUTOR")
     assert second == []

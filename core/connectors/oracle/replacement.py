@@ -188,7 +188,7 @@ def _validated_framework_provenance_table(conn: Any, owner: str) -> bool:
         )
     try:
         _read_provenance(conn, owner)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         raise RuntimeError(
             f"Target object {owner}.{PROVENANCE_TABLE} has invalid framework provenance metadata; "
             f"refusing replacement planning ({type(exc).__name__})"
@@ -492,7 +492,7 @@ def _target_inventory(
                 "object": str(name), "column": str(column), "grantee": str(grantee),
                 "privilege": str(privilege), "kind": "column",
             })
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         inspection_errors.append(
             "Grant inventory unavailable (ALL_TAB_PRIVS_MADE/ALL_COL_PRIVS_MADE): "
             f"{type(exc).__name__}: {exc}"
@@ -563,7 +563,7 @@ def _target_inventory(
                     blockers.setdefault(sequence_name, []).append(
                         f"column default {table_name}.{column_name} references this sequence"
                     )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         inspection_errors.append(
             "Owner-local sequence-default dependency inventory unavailable (USER_TAB_COLS): "
             f"{type(exc).__name__}: {exc}"
@@ -694,7 +694,7 @@ def build_plan(
                     f"target TYPE {type_def.name} definition differs from source; "
                     "automatic Oracle TYPE replacement is not supported"
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             inspection_errors.append(
                 f"Could not compare existing target TYPE {type_def.name}: "
                 f"{type(exc).__name__}: {exc}"
@@ -948,7 +948,7 @@ def build_plan(
             # unlike DBA_DEPENDENCIES it has no OWNER column.
             "FROM user_dependencies ORDER BY name, type",
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         inspection_errors.append(
             "Owner-local dependency inventory unavailable (USER_DEPENDENCIES): "
             f"{type(exc).__name__}: {exc}; cleanup is unsafe without this inventory"
@@ -1139,7 +1139,7 @@ def build_plan(
     ).hexdigest()[:20].upper()
     return ReplacementPlan(
         owner=owner.upper(), plan_id=plan_id,
-        inventory=tuple([*inventory, *target_constraints, *parent_managed]),
+        inventory=(*inventory, *target_constraints, *parent_managed),
         cleanup=tuple(cleanup), implicit_cleanup=tuple(implicit_cleanup), blockers=tuple(blockers),
         inspection_errors=tuple(inspection_errors),
         dependency_impact=tuple(dependency_impact), grants_impact=tuple(grants_impact),
@@ -1213,7 +1213,7 @@ def apply_plan(conn: Any, plan: ReplacementPlan) -> list[str]:
                     statement = f"DROP {kind} {quote_identifier(name)}"
                 cur.execute(statement)
                 executed.append(statement)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         progress = "; ".join(executed) or "none"
         raise RuntimeError(
             f"Oracle schema replacement cleanup stopped after DDL [{progress}]: {exc}"

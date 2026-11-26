@@ -638,7 +638,7 @@ def test_fixture_sql_rejects_unsafe_or_unsupported_oracle_statements(sql):
         validate_fixture_sql(sql)
 
 
-def test_canonical_and_historical_oracle_fixture_sets_are_separate_and_ordered():
+def test_canonical_and_historical_oracle_fixture_sets_are_separate_and_ordered(tmp_path):
     fixture_dir = Path(__file__).parents[1] / "e2e" / "oracle" / "fixtures"
     canonical_names = [path.name for path in fixture_dir.glob("*.sql")]
     canonical_files = resolve_fixture_files(fixture_dir, canonical_names)
@@ -665,7 +665,23 @@ def test_canonical_and_historical_oracle_fixture_sets_are_separate_and_ordered()
     }
     assert "13_create_security.sql" not in canonical_names
 
-    historical_dir = fixture_dir / "historical"
+    # Historical fixture source files were intentionally removed from the
+    # repository. Keep their loader ordering and parsing contract covered with
+    # temporary samples instead of recreating or overwriting those assets.
+    historical_dir = tmp_path / "historical"
+    historical_dir.mkdir()
+    historical_sql = {
+        "01_create_p10_s46_parent.sql": "CREATE TABLE P10_S46_PARENT (ID NUMBER)",
+        "01_create_sample.sql": "CREATE TABLE SAMPLE_T (ID NUMBER)",
+        "02_seed_p10_s46_parent.sql": "INSERT INTO P10_S46_PARENT (ID) VALUES (1)",
+        "02_seed_sample.sql": "INSERT INTO SAMPLE_T (ID) VALUES (1)",
+        "03_create_p10_s46_child.sql": "CREATE TABLE P10_S46_CHILD (ID NUMBER)",
+        "04_create_p10_s46_independent.sql": "CREATE TABLE P10_S46_INDEPENDENT (ID NUMBER)",
+        "05_seed_p10_s46_child.sql": "INSERT INTO P10_S46_CHILD (ID) VALUES (1)",
+        "06_seed_p10_s46_independent.sql": "INSERT INTO P10_S46_INDEPENDENT (ID) VALUES (1)",
+    }
+    for name, statement in historical_sql.items():
+        (historical_dir / name).write_text(statement, encoding="utf-8")
     historical_names = [path.name for path in historical_dir.glob("*.sql")]
     historical_files = resolve_fixture_files(historical_dir, historical_names)
     assert [path.name for path in historical_files] == [

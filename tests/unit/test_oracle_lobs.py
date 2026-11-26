@@ -232,7 +232,6 @@ def test_target_connection_remains_owned_through_19_lob_rows_and_verification(mo
     )
     monkeypatch.setitem(sys.modules, "oracledb", oracle)
     connection = MagicMock()
-    cursor = connection.cursor.return_value.__enter__.return_value
     locators = [FakeTargetLob() for _ in range(38)]
     connection.createlob.side_effect = locators
     target = OracleTargetConnector({"source_engine": "oracle"})
@@ -251,8 +250,10 @@ def test_target_connection_remains_owned_through_19_lob_rows_and_verification(mo
 
     assert result.success_count == 19
     target.verify_replacement_table_definitions = MagicMock()
+    target.verify_managed_object_status = MagicMock(return_value={"status": "verified"})
     plan = SimpleNamespace(
         blockers=[], inspection_errors=[], cleanup=[], missing=[],
+        source_inventory=[{"type": "TABLE", "name": "T"}],
         as_dict=lambda: {"status": "ready"},
     )
     target.plan_schema_replacement = MagicMock(return_value=plan)

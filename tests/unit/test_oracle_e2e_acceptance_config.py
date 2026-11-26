@@ -218,7 +218,10 @@ def test_repository_contains_only_the_canonical_oracle_yaml():
         for path in repo_root.rglob("*.y*ml")
         if path.name.casefold().startswith("oracle_")
     )
-    assert oracle_yaml_files == ["config/oracle_e2e_acceptance.yaml"]
+    assert oracle_yaml_files == [
+        "config/oracle_e2e_acceptance.yaml",
+        "config/oracle_local_to_local.yaml",
+    ]
 
 
 def test_documented_powershell_workflow_gates_migration_on_setup_exit_code():

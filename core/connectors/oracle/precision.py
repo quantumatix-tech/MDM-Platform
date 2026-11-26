@@ -5,11 +5,10 @@ import json
 import re
 import tempfile
 import xml.etree.ElementTree as ET
-from typing import Any
 from itertools import zip_longest
+from typing import Any
 
 from core.connectors.base import quote_identifier
-
 
 DATE_FORMAT = 'YYYY-MM-DD"T"HH24:MI:SS'
 TIMESTAMP_FORMAT = DATE_FORMAT + ".FF9"
@@ -211,9 +210,11 @@ class OracleLobPayload:
         return self.length == 0
 
     @classmethod
-    def from_lob(cls, lob: Any, kind: str, chunk_size: int = 64 * 1024) -> "OracleLobPayload":
+    def from_lob(cls, lob: Any, kind: str, chunk_size: int = 64 * 1024) -> OracleLobPayload:
         is_binary = kind == "BLOB"
-        spool = tempfile.SpooledTemporaryFile(
+        # Ownership transfers to OracleLobPayload, so this temporary file must
+        # stay open after the factory returns until the caller closes the value.
+        spool = tempfile.SpooledTemporaryFile(  # noqa: SIM115
             max_size=64 * 1024,
             mode="w+b" if is_binary else "w+t",
             encoding=None if is_binary else "utf-8",
@@ -235,9 +236,11 @@ class OracleLobPayload:
             raise
 
     @classmethod
-    def from_value(cls, value: Any, kind: str) -> "OracleLobPayload":
+    def from_value(cls, value: Any, kind: str) -> OracleLobPayload:
         is_binary = kind == "BLOB"
-        spool = tempfile.SpooledTemporaryFile(
+        # Ownership transfers to OracleLobPayload, so this temporary file must
+        # stay open after the factory returns until the caller closes the value.
+        spool = tempfile.SpooledTemporaryFile(  # noqa: SIM115
             max_size=64 * 1024,
             mode="w+b" if is_binary else "w+t",
             encoding=None if is_binary else "utf-8",

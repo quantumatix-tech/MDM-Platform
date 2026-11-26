@@ -160,7 +160,7 @@ class OracleTargetConnector(TargetConnector):
 
         target_owner = str(self._config.get("username", "")).strip()
         if not isinstance(executor_connection, dict):
-            raise RuntimeError(
+            raise RuntimeError(  # noqa: TRY004 - Keep the setup API RuntimeError validation contract.
                 "Oracle permission migration requires a separate executor username and password_secret"
             )
         executor_user = str(executor_connection.get("username", "")).strip()
@@ -174,7 +174,7 @@ class OracleTargetConnector(TargetConnector):
             self._permission_executor_conn = oracledb.connect(
                 **make_connect_kwargs(executor_connection, oracledb)
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             error_code = oracle_error_code(exc)
             code = f" (ORA-{error_code})" if error_code else ""
             raise RuntimeError(
@@ -229,7 +229,7 @@ class OracleTargetConnector(TargetConnector):
                 )
             except RuntimeError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
                 error_code = oracle_error_code(exc)
                 code = f" (ORA-{error_code})" if error_code else ""
                 raise RuntimeError(
@@ -460,7 +460,7 @@ class OracleTargetConnector(TargetConnector):
                             "service": target_identity["service_name"],
                         },
                     )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
                     error_code = oracle_error_code(exc)
                     audit_log(
                         phase="oracle_privilege_bootstrap",
@@ -488,7 +488,7 @@ class OracleTargetConnector(TargetConnector):
                 },
             )
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             error_code = oracle_error_code(exc)
             code = f" (ORA-{error_code})" if error_code else ""
             audit_log(
@@ -508,7 +508,7 @@ class OracleTargetConnector(TargetConnector):
             if admin_conn is not None:
                 try:
                     admin_conn.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110 - cleanup must not mask provisioning result
                     pass
         return granted
 
@@ -836,8 +836,113 @@ class OracleTargetConnector(TargetConnector):
                     f"{item['type']} {item['name']}" for item in plan.missing
                 ))
             raise RuntimeError("Oracle schema replacement verification failed: " + "; ".join(reasons))
+        report["managed_object_status_validation"] = self.verify_managed_object_status(
+            plan.source_inventory
+        )
+        report["managed_object_status_validation"]["source_managed_constraints_checked"] = sum(
+            item.get("type") == "CONSTRAINT" for item in plan.source_inventory
+        )
         report["status"] = "verified"
         return report
+
+    def verify_managed_object_status(
+        self, source_inventory: list[dict[str, str]] | tuple[dict[str, str], ...]
+    ) -> dict[str, Any]:
+        """Fail if a source-managed Oracle object is absent or no longer VALID.
+
+        The query reads the connected owner's catalog and filters against the
+        source inventory. Independent target-only objects, including framework
+        permission provenance, are deliberately outside this check.
+        """
+        expected: set[tuple[str, str]] = set()
+        for item in source_inventory:
+            kind = str(item.get("type", "")).strip().upper()
+            name = str(item.get("name", "")).strip().upper()
+            if kind and name and kind != "CONSTRAINT":
+                expected.add((kind, name))
+        if not expected:
+            raise RuntimeError(
+                "Oracle final managed-object status validation has no source inventory"
+            )
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT object_name, object_type, status FROM user_objects "
+                "WHERE generated = 'N'"
+            )
+            rows = cur.fetchall()
+
+        def canonical_type(kind: str) -> str:
+            kind = kind.upper()
+            if kind == "PACKAGE BODY":
+                return "PACKAGE"
+            if kind == "TYPE BODY":
+                return "TYPE"
+            return kind
+
+        found: set[tuple[str, str]] = set()
+        invalid: list[dict[str, str]] = []
+        for row in rows:
+            if not isinstance(row, (tuple, list)) or len(row) != 3:
+                raise RuntimeError(
+                    "Oracle final managed-object status query returned malformed USER_OBJECTS metadata"
+                )
+            name, kind, status = (str(value or "").strip().upper() for value in row)
+            key = (canonical_type(kind), name)
+            if key not in expected:
+                continue
+            found.add(key)
+            if status != "VALID":
+                invalid.append({"type": kind, "name": name, "status": status or "UNKNOWN"})
+
+        missing = sorted(expected - found)
+        if missing or invalid:
+            details = [
+                f"{kind} {name} is missing from USER_OBJECTS" for kind, name in missing
+            ] + [
+                f"{item['type']} {item['name']} is {item['status']}"
+                for item in invalid
+            ]
+            raise RuntimeError(
+                "Oracle final managed-object status validation failed: "
+                + "; ".join(details)
+            )
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, type, line, position, text FROM user_errors "
+                "ORDER BY type, name, sequence"
+            )
+            error_rows = cur.fetchall()
+        compilation_errors: list[dict[str, Any]] = []
+        for row in error_rows:
+            if not isinstance(row, (tuple, list)) or len(row) != 5:
+                raise RuntimeError(
+                    "Oracle final compilation query returned malformed USER_ERRORS metadata"
+                )
+            name, kind, line, position, message = row
+            key = (canonical_type(str(kind or "")), str(name or "").strip().upper())
+            if key in expected:
+                compilation_errors.append({
+                    "type": str(kind or "").upper(),
+                    "name": str(name or "").upper(),
+                    "line": line,
+                    "position": position,
+                    "message": str(message or ""),
+                })
+        if compilation_errors:
+            first = compilation_errors[0]
+            raise RuntimeError(
+                "Oracle final managed-object compilation validation failed: "
+                f"{first['type']} {first['name']} line {first['line']}: "
+                f"{first['message']} ({len(compilation_errors)} error(s))"
+            )
+        return {
+            "status": "verified",
+            "source_managed_objects_checked": len(expected),
+            "invalid_source_managed_objects": [],
+            "source_managed_compilation_errors": 0,
+            "independent_target_objects_checked": False,
+        }
 
     def verify_replacement_table_definitions(self, schemas: list[Schema]) -> None:
         """Verify source-supported columns, constraints, and ordinary indexes."""
@@ -1390,6 +1495,11 @@ class OracleTargetConnector(TargetConnector):
             if column.is_identity and column.identity_kind == "ALWAYS"
             and column.name in columns
         ]
+        by_default_identity_columns = [
+            column.name for column in (schema.columns if schema else [])
+            if column.is_identity and column.identity_kind == "BY DEFAULT"
+            and column.name in columns
+        ]
         temporarily_changed: list[str] = []
         temporary_lobs: list[Any] = []
         oracle_connection_unavailable = False
@@ -1484,7 +1594,7 @@ class OracleTargetConnector(TargetConnector):
                         cur.executemany(statement, values)
             self._conn.commit()
             result.success_count = len(batch)
-        except Exception as exc:  # noqa: BLE001 - return per-batch failures to the orchestrator
+        except Exception as exc:
             try:
                 self._conn.rollback()
             except Exception as rollback_exc:  # preserve the DML exception as primary
@@ -1527,6 +1637,22 @@ class OracleTargetConnector(TargetConnector):
                     self._conn.rollback()
                     raise RuntimeError(
                         f"Failed to restore GENERATED ALWAYS identity mode for "
+                        f"Oracle table {object_name!r}: {exc}"
+                    ) from exc
+            if by_default_identity_columns and not oracle_connection_unavailable:
+                try:
+                    with self._conn.cursor() as cur:
+                        for name in by_default_identity_columns:
+                            cur.execute(
+                                f"ALTER TABLE {quote_identifier(object_name)} MODIFY "
+                                f"({quote_identifier(name)} GENERATED BY DEFAULT AS IDENTITY "
+                                "(START WITH LIMIT VALUE))"
+                            )
+                    self._conn.commit()
+                except Exception as exc:
+                    self._conn.rollback()
+                    raise RuntimeError(
+                        f"Failed to advance GENERATED BY DEFAULT identity for "
                         f"Oracle table {object_name!r}: {exc}"
                     ) from exc
         return result
@@ -2074,12 +2200,11 @@ def _oracle_constraint_matches(
         (name,),
     )
     existing = cursor.fetchone()
-    if existing is not None:
-        if _oracle_constraint_definition_matches(
+    if existing is not None and _oracle_constraint_definition_matches(
             cursor, name, existing, table, kind, columns, ref_table, ref_columns,
             expression,
-        ):
-            return True
+    ):
+        return True
     if strict_name:
         if existing is not None:
             raise RuntimeError(
@@ -2168,11 +2293,11 @@ def _oracle_constraint_definition_matches(
             != [str(value).casefold() for value in (ref_columns or [])]
         ):
             return False
-    if kind == "C" and _normalize_check_expression(actual_expression) != (
-        _normalize_check_expression(expression)
-    ):
-        return False
-    return True
+    return not (
+        kind == "C"
+        and _normalize_check_expression(actual_expression)
+        != _normalize_check_expression(expression)
+    )
 
 
 def _normalize_check_expression(expression: Any) -> str:
@@ -2224,7 +2349,7 @@ def _oracle_index_inventory(cursor: Any, table: str) -> dict[str, dict[str, Any]
     )
     indexes: dict[str, dict[str, Any]] = {}
     for row in catalog_rows:
-        name, table_name, _uniqueness, kind, status, partitioned, constraint_type = row[:7]
+        name, table_name, _uniqueness, kind, _status, partitioned, constraint_type = row[:7]
         definition = normalized[name]
         indexes.setdefault(name, {
             "name": name,
@@ -2387,11 +2512,13 @@ def _oracle_column_change_is_widening(
     actual = _oracle_column_signature(target.source_type, target)
     if expected[0] != actual[0]:
         return False
-    if source_engine == "oracle":
-        if schema.options.get("oracle_char_semantics", {}).get(source.name) != (
+    if (
+        source_engine == "oracle"
+        and schema.options.get("oracle_char_semantics", {}).get(source.name) != (
             target_schema.options.get("oracle_char_semantics", {}).get(target.name)
-        ):
-            return False
+        )
+    ):
+        return False
     if target.nullable and not source.nullable:
         return False
     if expected[0] in {"VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR", "RAW"}:

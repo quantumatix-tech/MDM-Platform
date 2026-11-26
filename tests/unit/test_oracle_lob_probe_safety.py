@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
-import sys
 
 from tests.integration import oracle_lob_locator_lifecycle as probe
 

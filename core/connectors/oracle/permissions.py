@@ -54,7 +54,7 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
     create_session_approval = policy.get("approve_create_session", False)
     onboarding = policy.get("onboarding", {})
     if not isinstance(onboarding, dict):
-        raise RuntimeError("oracle_permission_migration.onboarding must be an object")
+        raise RuntimeError("oracle_permission_migration.onboarding must be an object")  # noqa: TRY004 - Keep the setup API RuntimeError validation contract.
     unexpected_onboarding = set(onboarding) - {
         "enabled", "approve_catalog_access", "approve_create_user",
         "approve_create_role", "approve_create_session",
@@ -105,7 +105,7 @@ def normalize_policy(policy: dict[str, Any]) -> dict[str, Any]:
         if "password" in executor:
             raise RuntimeError("Oracle permission executor plaintext passwords are not accepted")
     if not isinstance(role_admin_approval, bool) or not isinstance(create_session_approval, bool):
-        raise RuntimeError(
+        raise RuntimeError(  # noqa: TRY004 - Keep the setup API RuntimeError validation contract.
             "Oracle permission migration approval fields must be boolean"
         )
     return {
@@ -183,7 +183,7 @@ def bootstrap_permission_executor(
         for view in PERMISSION_CATALOG_VIEWS:
             if view not in grantable_views:
                 gaps.append(f"direct SELECT WITH GRANT OPTION on SYS.{view} for onboarding admin")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         gaps.append(f"inspect direct catalog grant authority: {exc}")
 
     # Determine the minimal system privileges required for the discovered plan.
@@ -204,7 +204,7 @@ def bootstrap_permission_executor(
                     user_conflicts.add(name)
                 else:
                     missing_users.add(name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             gaps.append(f"inspect mapped target user {name}: {exc}")
     for name in sorted(target_roles):
         try:
@@ -213,7 +213,7 @@ def bootstrap_permission_executor(
                     role_conflicts.add(name)
                 else:
                     missing_roles.add(name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             gaps.append(f"inspect mapped target role {name}: {exc}")
     gaps.extend(f"mapped target user {name} conflicts with an existing role" for name in sorted(user_conflicts))
     gaps.extend(f"mapped target role {name} conflicts with an existing user" for name in sorted(role_conflicts))
@@ -239,12 +239,14 @@ def bootstrap_permission_executor(
         }
         for privilege in sorted(required_sys - admin_sys):
             gaps.append(f"direct ADMIN OPTION on {privilege} for onboarding admin")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         gaps.append(f"inspect onboarding admin system privilege authority: {exc}")
 
     existing_membership_roles = {
-        str(item.role_name) for item in inventory.get("memberships", [])
-        if str(item.role_name) in target_roles and str(item.role_name) not in missing_roles
+        str(policy["role_mappings"].get(item.role_name, item.role_name))
+        for item in inventory.get("memberships", [])
+        if policy["role_mappings"].get(item.role_name, item.role_name) in target_roles
+        and policy["role_mappings"].get(item.role_name, item.role_name) not in missing_roles
     }
     if existing_membership_roles:
         if not onboarding.get("approve_role_admin_option", False):
@@ -258,7 +260,7 @@ def bootstrap_permission_executor(
             }
             for role in sorted(existing_membership_roles - admin_roles):
                 gaps.append(f"ADMIN OPTION on mapped target role {role} for onboarding admin")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             gaps.append(f"inspect onboarding admin role authority: {exc}")
 
     if gaps:
@@ -291,7 +293,7 @@ def bootstrap_permission_executor(
             with admin_conn.cursor() as cur:
                 cur.execute(statement)
             applied.append(statement)
-        except Exception as exc:
+        except Exception:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             raise RuntimeError(
                 "Oracle permission onboarding stopped after an authorized grant failure; "
                 f"completed {len(applied)} of {len(statements)} approved statements. "
@@ -317,7 +319,7 @@ def _fetchall(conn: Any, statement: str, binds: tuple[Any, ...] = ()) -> list[tu
         with conn.cursor() as cur:
             cur.execute(statement, binds)
             return list(cur.fetchall())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         raise RuntimeError(
             f"Oracle permission catalog discovery failed for {statement.split('FROM', 1)[-1].strip()}: "
             f"{type(exc).__name__}: {exc}"
@@ -337,7 +339,7 @@ def verify_source_catalog_access(conn: Any) -> list[str]:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT 1 FROM {reference} WHERE 1 = 0")
                 cur.fetchall()
-        except Exception:
+        except Exception:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             missing.append(f"SELECT on {reference}")
     return missing
 
@@ -1041,9 +1043,8 @@ def _build_reconciliation(conn: Any, principal_conn: Any, *, target_owner: str,
                 "remove them after reviewing the current preflight inventory"
             )
         unapproved = [item for item in ambiguous if _permission_key(item) not in approved]
-        if unapproved:
-            if not permit_legacy_candidates:
-                raise LegacyPermissionAdoptionRequired(target_owner, unapproved)
+        if unapproved and not permit_legacy_candidates:
+            raise LegacyPermissionAdoptionRequired(target_owner, unapproved)
         adopted = list(ambiguous)
         stale.extend(adopted)
     if approved - {_permission_key(item) for item in adopted}:
@@ -1084,7 +1085,7 @@ def _legacy_adoption_diagnostic(owner: str, items: list[dict[str, Any]]) -> str:
         "framework provenance. No permission changes were made. Grantor/current state cannot prove "
         "framework ownership. Review the following exact JSON manifest and independently verify each "
         "entry using trusted audit records or an approved change record; then add only verified approval_key values to "
-        f"oracle_permission_migration.legacy_grant_adoption.approved_permission_keys and rerun FULL: "
+        "oracle_permission_migration.legacy_grant_adoption.approved_permission_keys and rerun FULL: "
         + json.dumps({"target_owner": owner, "permissions": manifest}, sort_keys=True)
     )
 
@@ -1462,13 +1463,13 @@ def preflight_target(
     if will_need_provenance and not _fetchall(
         conn, "SELECT table_name FROM all_tables WHERE owner=:1 AND table_name=:2",
         (target_owner, PROVENANCE_TABLE),
+    ) and not _fetchall(
+        conn, "SELECT privilege FROM session_privs WHERE privilege='CREATE TABLE'"
     ):
-        if not _fetchall(conn,
-            "SELECT privilege FROM session_privs WHERE privilege='CREATE TABLE'"):
-            raise RuntimeError(
-                "Oracle target owner lacks effective CREATE TABLE authority required for the "
-                "durable permission-provenance journal; refusing permission migration before cleanup"
-            )
+        raise RuntimeError(
+            "Oracle target owner lacks effective CREATE TABLE authority required for the "
+            "durable permission-provenance journal; refusing permission migration before cleanup"
+        )
     reconciliation = _build_reconciliation(
         conn, principal_conn, target_owner=target_owner,
         target_objects={name.upper() for name in expected_objects},
@@ -1502,7 +1503,7 @@ def verify_executor_catalog_access(conn: Any) -> list[str]:
             with conn.cursor() as cur:
                 cur.execute(f"SELECT 1 FROM SYS.{view} WHERE 1 = 0")
                 cur.fetchall()
-        except Exception:
+        except Exception:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             unavailable.append(f"SELECT on SYS.{view}")
     return unavailable
 
@@ -1532,7 +1533,7 @@ def executor_authority_gaps(
             conn, "SELECT privilege, admin_option FROM user_sys_privs"
         )
         direct_sys = {str(row[0]).upper(): str(row[1]).upper() for row in system_rows}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
         gaps.append(f"read USER_SYS_PRIVS: {exc}")
         direct_sys = {}
 
@@ -1542,13 +1543,13 @@ def executor_authority_gaps(
         try:
             if _fetchall(conn, "SELECT username FROM dba_users WHERE username=:1", (name,)):
                 existing_users.add(name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             gaps.append(f"inspect target user {name}: {exc}")
     for name in roles.values():
         try:
             if _fetchall(conn, "SELECT role FROM dba_roles WHERE role=:1", (name,)):
                 existing_roles.add(name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             gaps.append(f"inspect target role {name}: {exc}")
 
     missing_users = set(users.values()) - existing_users
@@ -1559,8 +1560,10 @@ def executor_authority_gaps(
         gaps.append("direct CREATE ROLE on the permission executor")
 
     existing_membership_roles = {
-        str(item.role_name) for item in inventory.get("memberships", [])
-        if str(item.role_name) in roles and str(item.role_name) in existing_roles
+        str(normalized["role_mappings"].get(item.role_name, item.role_name))
+        for item in inventory.get("memberships", [])
+        if normalized["role_mappings"].get(item.role_name, item.role_name) in set(roles.values())
+        and normalized["role_mappings"].get(item.role_name, item.role_name) in existing_roles
     }
     if existing_membership_roles:
         try:
@@ -1572,7 +1575,7 @@ def executor_authority_gaps(
             }
             for role in sorted(existing_membership_roles - admin_roles):
                 gaps.append(f"ADMIN OPTION on existing target role {role}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             gaps.append(f"read USER_ROLE_PRIVS for role grant authority: {exc}")
 
     needs_create_session = False
@@ -1590,7 +1593,7 @@ def executor_authority_gaps(
                 (mapped_grantee,),
             )
             needs_create_session = needs_create_session or not already_granted
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             gaps.append(f"inspect target CREATE SESSION state for {grant.grantee}: {exc}")
     if needs_create_session and direct_sys.get("CREATE SESSION") != "YES":
         gaps.append("CREATE SESSION WITH ADMIN OPTION to apply the approved source grant")
@@ -1620,7 +1623,7 @@ def apply_principals(conn: Any, plan: dict[str, Any]) -> list[str]:
             with conn.cursor() as cur:
                 cur.execute(statement)
                 conn.commit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             raise RuntimeError(
                 f"Oracle target user provisioning failed for {username}: {exc}; "
                 f"users created earlier in this run: {', '.join(applied) or 'none'}"
@@ -1633,11 +1636,24 @@ def apply_principals(conn: Any, plan: dict[str, Any]) -> list[str]:
             with conn.cursor() as cur:
                 cur.execute(f"CREATE ROLE {quote_identifier(role)} NOT IDENTIFIED")
                 conn.commit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             raise RuntimeError(
                 f"Oracle target role provisioning failed for {role}: {exc}; "
                 f"principals created earlier in this run: {', '.join(applied) or 'none'}"
             ) from None
+        try:
+            authority = _fetchall(
+                conn,
+                "SELECT admin_option FROM user_role_privs WHERE granted_role=:1",
+                (role,),
+            )
+            if not any(str(row[0]).upper() == "YES" for row in authority):
+                raise RuntimeError("creator ADMIN OPTION is not visible after CREATE ROLE")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Oracle role {role} was created, but its creator ADMIN OPTION could not be verified; "
+                "dependent memberships were not applied."
+            ) from exc
         applied.append(f"ROLE {role} (creator ADMIN OPTION approved)")
     return applied
 
@@ -1737,11 +1753,14 @@ def _apply_tracked_permissions(conn: Any, plan: dict[str, Any], target_owner: st
             ledger[_permission_key(item)] = {**item, "state": "ACTIVE"}
             applied.append(f"ADOPTED explicitly approved legacy {item['kind']} {item['privilege']} for {item['grantee']}")
     for key, item in ledger.items():
-        if item.get("kind") in kinds and item.get("state") in {
+        if (
+            item.get("kind") in kinds and item.get("state") in {
             "PENDING_REVOKE", "ACTIVE", "PENDING_GRANT", "APPROVED_LEGACY"
-        }:
-            if key not in {_permission_key(x) for x in reconciliation["desired"]} and not _permission_exists(conn, item, target_owner):
-                _provenance_delete(conn, target_owner, item)
+            }
+            and key not in {_permission_key(x) for x in reconciliation["desired"]}
+            and not _permission_exists(conn, item, target_owner)
+        ):
+            _provenance_delete(conn, target_owner, item)
     desired_items = [item for item in reconciliation["desired"] if item["kind"] in kinds]
     for item in desired_items:
         key = _permission_key(item)
@@ -1762,7 +1781,7 @@ def _apply_tracked_permissions(conn: Any, plan: dict[str, Any], target_owner: st
                 raise RuntimeError("Oracle did not expose the granted permission in its catalog")
             _provenance_set(conn, target_owner, item, "ACTIVE")
             applied.append(f"GRANT {item['privilege']} {item['kind']} TO {item['grantee']}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - driver and verification failures must stop memberships
             raise RuntimeError(
                 f"Oracle permission grant failed for {item}; earlier changes: {', '.join(applied) or 'none'}; {exc}"
             ) from None
@@ -1784,7 +1803,7 @@ def _apply_tracked_permissions(conn: Any, plan: dict[str, Any], target_owner: st
                 raise RuntimeError("Oracle still reports the permission after REVOKE")
             _provenance_delete(conn, target_owner, item)
             applied.append(f"REVOKE {item['privilege']} {item['kind']} FROM {item['grantee']}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             raise RuntimeError(
                 f"Oracle permission revoke failed for {item}; earlier changes: {', '.join(applied) or 'none'}; {exc}"
             ) from None
@@ -1798,6 +1817,15 @@ def apply_memberships(conn: Any, plan: dict[str, Any]) -> list[str]:
     for item in plan["memberships"]:
         try:
             with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT admin_option FROM user_role_privs WHERE granted_role = :1",
+                    (item["role"],),
+                )
+                authority_rows = list(cur.fetchall())
+                if not any(str(row[0]).upper() == "YES" for row in authority_rows):
+                    raise RuntimeError(
+                        f"Oracle permission executor lacks verified ADMIN OPTION on role {item['role']}"
+                    )
                 cur.execute(
                     "SELECT admin_option, default_role FROM dba_role_privs "
                     "WHERE grantee = :1 AND granted_role = :2",
@@ -1813,7 +1841,7 @@ def apply_memberships(conn: Any, plan: dict[str, Any]) -> list[str]:
                     raise RuntimeError(
                         f"Existing target membership {item['member']}->{item['role']} has broader or incompatible state"
                     )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             raise RuntimeError(
                 f"Oracle role membership {item['member']}->{item['role']} failed; "
                 f"memberships applied earlier in this run: {', '.join(applied) or 'none'}; {exc}"
@@ -1834,16 +1862,20 @@ def apply_grants(conn: Any, plan: dict[str, Any], target_owner: str) -> list[str
         if item["kind"] == "COLUMN":
             target = f"{owner}.{object_name}.{quote_identifier(item['column_name'])}"
             check = (
-                "SELECT grantable FROM all_col_privs_made WHERE owner=:1 AND table_name=:2 "
-                "AND column_name=:3 AND grantee=:4 AND privilege=:5",
+                (
+                    "SELECT grantable FROM all_col_privs_made WHERE owner=:1 AND table_name=:2 "
+                    "AND column_name=:3 AND grantee=:4 AND privilege=:5"
+                ),
                 (target_owner, item["object_name"], item["column_name"], item["grantee"], privilege),
             )
             statement = f"GRANT {privilege} ({quote_identifier(item['column_name'])}) ON {owner}.{object_name} TO {grantee}"
         else:
             target = f"{owner}.{object_name}"
             check = (
-                "SELECT grantable FROM all_tab_privs_made WHERE owner=:1 AND table_name=:2 "
-                "AND grantee=:3 AND privilege=:4",
+                (
+                    "SELECT grantable FROM all_tab_privs_made WHERE owner=:1 AND table_name=:2 "
+                    "AND grantee=:3 AND privilege=:4"
+                ),
                 (target_owner, item["object_name"], item["grantee"], privilege),
             )
             statement = f"GRANT {privilege} ON {target} TO {grantee}"
@@ -1857,7 +1889,7 @@ def apply_grants(conn: Any, plan: dict[str, Any], target_owner: str) -> list[str
                 else:
                     cur.execute(statement)
                     conn.commit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             raise RuntimeError(
                 f"Oracle permission grant {privilege} on {target} to {item['grantee']} failed; "
                 f"grants applied earlier in this run: {', '.join(applied) or 'none'}; {exc}"
@@ -1882,7 +1914,7 @@ def apply_grants(conn: Any, plan: dict[str, Any], target_owner: str) -> list[str
                         f"GRANT {item['privilege']} TO {quote_identifier(item['grantee'])}"
                     )
                     conn.commit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             raise RuntimeError(
                 f"Oracle system grant {item['privilege']} to {item['grantee']} failed; "
                 f"system grants applied earlier in this run: {', '.join(applied) or 'none'}; {exc}"
@@ -1923,14 +1955,18 @@ def verify(conn: Any, plan: dict[str, Any], *, principal_conn: Any | None = None
     for item in plan["object_grants"]:
         if item["kind"] == "COLUMN":
             query = (
-                "SELECT grantable FROM all_col_privs_made WHERE owner=:1 AND table_name=:2 "
-                "AND column_name=:3 AND grantee=:4 AND privilege=:5",
+                (
+                    "SELECT grantable FROM all_col_privs_made WHERE owner=:1 AND table_name=:2 "
+                    "AND column_name=:3 AND grantee=:4 AND privilege=:5"
+                ),
                 (plan["target_owner"], item["object_name"], item["column_name"], item["grantee"], item["privilege"]),
             )
         else:
             query = (
-                "SELECT grantable FROM all_tab_privs_made WHERE owner=:1 AND table_name=:2 "
-                "AND grantee=:3 AND privilege=:4",
+                (
+                    "SELECT grantable FROM all_tab_privs_made WHERE owner=:1 AND table_name=:2 "
+                    "AND grantee=:3 AND privilege=:4"
+                ),
                 (plan["target_owner"], item["object_name"], item["grantee"], item["privilege"]),
             )
         rows = _fetchall(conn, query[0], query[1])

@@ -1,6 +1,7 @@
 """Focused tests for Oracle owner-scoped schema replacement planning."""
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -129,9 +130,13 @@ def _inventory_connection(*, user="TARGET_OWNER", objects=None, indexes=None,
             for item in objects:
                 name, kind = item[:2]
                 if str(kind).upper() != "TABLE PARTITION":
-                    rows.append((name, kind, None))
+                    status = item[2] if len(item) > 2 else "VALID"
+                    status = status if "OBJECT_NAME, OBJECT_TYPE, STATUS" in sql else None
+                    rows.append((name, kind, status))
             rows.extend((parent, "TABLE PARTITION", sub) for parent, sub in partition_objects)
             return rows
+        if "FROM USER_ERRORS" in sql:
+            return []
         if "FROM USER_INDEXES" in sql:
             if "IE.COLUMN_EXPRESSION" in sql:
                 return index_expression_rows or []
@@ -139,6 +144,11 @@ def _inventory_connection(*, user="TARGET_OWNER", objects=None, indexes=None,
                 return [row for row in indexes if row[0] not in lob_index_names]
             return indexes
         if "FROM USER_CONSTRAINTS" in sql:
+            if "SELECT CONSTRAINT_NAME, STATUS, VALIDATED" in sql:
+                return [
+                    (row[1], "ENABLED", "VALIDATED")
+                    for row in constraints if len(row) > 1
+                ]
             return constraints
         if "FROM ALL_TAB_PRIVS_MADE" in sql:
             if "ALL_TAB_PRIVS_MADE" in inspection_failures:
@@ -1432,3 +1442,109 @@ def test_oracle_replacement_drops_only_the_owner_local_plan():
                for statement in statements)
     assert conn.commit.call_count == 0
     assert len(cur.execute.call_args_list) >= len(statements)
+
+
+def test_final_managed_object_status_rejects_repeat_full_invalid_view():
+    target = object.__new__(OracleTargetConnector)
+    target._conn = MagicMock()
+    cursor = target._conn.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [
+        ("V_PATIENT_APPOINTMENTS", "VIEW", "INVALID"),
+        ("INDEPENDENT_TARGET_VIEW", "VIEW", "INVALID"),
+    ]
+
+    with pytest.raises(RuntimeError, match="VIEW V_PATIENT_APPOINTMENTS is INVALID"):
+        target.verify_managed_object_status([
+            {"type": "VIEW", "name": "V_PATIENT_APPOINTMENTS"},
+        ])
+
+    assert "FROM user_objects" in cursor.execute.call_args.args[0]
+
+
+def test_final_replacement_verification_fails_for_invalid_managed_view_only():
+    conn, _ = _inventory_connection(
+        objects=[
+            ("T", "TABLE", "VALID"),
+            ("V_MANAGED", "VIEW", "INVALID"),
+            ("V_TARGET_ONLY", "VIEW", "INVALID"),
+        ],
+        table_names=["T"],
+    )
+    schema = Schema("T", columns=[Column("ID", "NUMBER")])
+    target = OracleTargetConnector({"username": "TARGET_OWNER"})
+    target._conn = conn
+    target.verify_replacement_table_definitions = MagicMock()
+    plan = SimpleNamespace(
+        blockers=(), inspection_errors=(), cleanup=(), missing=(),
+        source_inventory=(
+            {"type": "TABLE", "name": "T"},
+            {"type": "VIEW", "name": "V_MANAGED"},
+        ),
+        as_dict=lambda: {"status": "ready"},
+    )
+    target.plan_schema_replacement = lambda **_inventory: plan
+
+    with pytest.raises(RuntimeError, match="VIEW V_MANAGED is INVALID"):
+        target.verify_schema_replacement(
+            tables={"T"}, schemas=[schema], views=[], materialized_views=[],
+            sequences=[], routines=[], triggers=[], synonyms=[], comments=[],
+        )
+
+
+def test_final_managed_object_status_checks_package_body_and_ignores_target_only():
+    target = object.__new__(OracleTargetConnector)
+    target._conn = MagicMock()
+    cursor = target._conn.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = [
+        ("PKG_MANAGED", "PACKAGE", "VALID"),
+        ("PKG_MANAGED", "PACKAGE BODY", "INVALID"),
+        ("INDEPENDENT_TARGET_VIEW", "VIEW", "INVALID"),
+    ]
+
+    with pytest.raises(RuntimeError, match="PACKAGE BODY PKG_MANAGED is INVALID"):
+        target.verify_managed_object_status([
+            {"type": "PACKAGE", "name": "PKG_MANAGED"},
+        ])
+
+
+def test_final_managed_object_status_passes_valid_inventory_with_invalid_target_only():
+    target = object.__new__(OracleTargetConnector)
+    target._conn = MagicMock()
+    cursor = target._conn.cursor.return_value.__enter__.return_value
+    cursor.fetchall.side_effect = [
+        [
+            ("V_MANAGED", "VIEW", "VALID"),
+            ("INDEPENDENT_TARGET_VIEW", "VIEW", "INVALID"),
+        ],
+        [],
+    ]
+
+    result = target.verify_managed_object_status([
+        {"type": "VIEW", "name": "V_MANAGED"},
+    ])
+
+    assert result == {
+        "status": "verified",
+        "source_managed_objects_checked": 1,
+        "invalid_source_managed_objects": [],
+        "source_managed_compilation_errors": 0,
+        "independent_target_objects_checked": False,
+    }
+
+
+def test_final_managed_object_status_rejects_user_errors_for_managed_objects():
+    target = object.__new__(OracleTargetConnector)
+    target._conn = MagicMock()
+    cursor = target._conn.cursor.return_value.__enter__.return_value
+    cursor.fetchall.side_effect = [
+        [("V_MANAGED", "VIEW", "VALID")],
+        [("V_MANAGED", "VIEW", 4, 8, "ORA-00904: invalid identifier")],
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="VIEW V_MANAGED line 4: ORA-00904: invalid identifier",
+    ):
+        target.verify_managed_object_status([
+            {"type": "VIEW", "name": "V_MANAGED"},
+        ])

@@ -1,9 +1,13 @@
+from typing import ClassVar
+
 from core import orchestrator as orchestrator_module
 from core.orchestrator import MigrationOrchestrator
 
 
 class _Target:
-    _config = {"username": "TARGET_OWNER", "password": "target-password"}
+    _config: ClassVar[dict[str, str]] = {
+        "username": "TARGET_OWNER", "password": "target-password"
+    }
 
 
 def test_executor_password_falls_back_to_local_store_when_global_provider_is_env(monkeypatch):

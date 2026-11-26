@@ -278,7 +278,7 @@ class OracleSourceConnector(SourceConnector):
                     if str(owner).casefold() != self._owner.casefold():
                         raise RuntimeError("ALL_COL_PRIVS_MADE returned a row outside the connected owner")
                     column_grants.append((table_name, column_name, privilege))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Normalize database-driver failures into actionable diagnostics.
             raise RuntimeError(
                 "Source grant inventory unavailable (ALL_TAB_PRIVS_MADE/ALL_COL_PRIVS_MADE); "
                 f"schema replacement is not approvable: {type(exc).__name__}: {exc}"

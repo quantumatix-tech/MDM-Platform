@@ -5,7 +5,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.connectors.base import Column, FunctionDef, Schema, SequenceDef, TriggerDef, ViewDefinition
+from core.connectors.base import (
+    Column,
+    FunctionDef,
+    Schema,
+    SequenceDef,
+    TriggerDef,
+    ViewDefinition,
+)
 from core.connectors.oracle import objects
 from core.connectors.oracle.source import OracleSourceConnector
 from core.connectors.oracle.target import OracleTargetConnector
@@ -26,8 +33,10 @@ def test_oracle_discovers_views_with_ddl_and_source_schema_scope():
     conn, cur = _connection()
     cur.fetchall.side_effect = [[("V_CUSTOMERS",)], [("V_CUSTOMERS", "VALID")], [], []]
     cur.fetchone.return_value = (
-        'CREATE OR REPLACE FORCE EDITIONABLE VIEW "APP_OWNER"."V_CUSTOMERS" '
-        '("ID") AS SELECT 1 ID FROM DUAL',
+        (
+            'CREATE OR REPLACE FORCE EDITIONABLE VIEW "APP_OWNER"."V_CUSTOMERS" '
+            '("ID") AS SELECT 1 ID FROM DUAL'
+        ),
     )
     source = OracleSourceConnector({"username": "APP_OWNER"})
     source._conn = conn
@@ -61,8 +70,11 @@ def test_oracle_selected_tables_filter_attached_triggers():
     def fetchone_for_query():
         sql = str(cur.execute.call_args.args[0]).upper()
         if "DBMS_METADATA.GET_DDL" in sql:
-            return (f"CREATE OR REPLACE TRIGGER {cur.execute.call_args.args[1][1]} "
-                    "BEFORE INSERT ON T BEGIN NULL; END;",)
+            ddl = (
+                f"CREATE OR REPLACE TRIGGER {cur.execute.call_args.args[1][1]} "
+                "BEFORE INSERT ON T BEGIN NULL; END;"
+            )
+            return (ddl,)
         raise AssertionError(f"Unexpected fetchone query: {sql}")
 
     cur.fetchall.side_effect = fetchall_for_query
@@ -818,4 +830,4 @@ def test_oracle_full_object_phase_is_idempotently_reapplied_on_repeat_runs():
 
     assert first["phases"]["oracle_object_preparation"]["status"] == "success"
     assert second["phases"]["oracle_object_preparation"]["status"] == "success"
-    assert target.view_applications == 2  # exactly one preflight application per FULL run
+    assert target.view_applications == 4  # preflight plus post-table-DDL application per run

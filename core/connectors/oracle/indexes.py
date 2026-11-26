@@ -98,6 +98,24 @@ def normalize_index_rows(
             if expression:
                 expressions_seen = True
                 parsed = _intrinsic_expression(expression)
+                # Oracle 26ai can expose an ordinary DESC key as the hidden
+                # SYS_NC* index column plus the original bare identifier in
+                # USER_IND_EXPRESSIONS (for example, "COL"), rather than
+                # SYS_OP_DESCEND("COL"). Accept that exact catalog shape only
+                # when it is a DESC FUNCTION-BASED NORMAL key and the named
+                # visible table column exists. This does not admit arbitrary
+                # function/expression indexes.
+                if (
+                    parsed is None
+                    and raw_type == "FUNCTION-BASED NORMAL"
+                    and direction == "DESC"
+                    and _text(catalog_column).upper().startswith("SYS_NC")
+                ):
+                    bare_column = _COLUMN_EXPRESSION.fullmatch(expression)
+                    if bare_column:
+                        candidate = _identifier_value(bare_column)
+                        if candidate.casefold() in types:
+                            parsed = (candidate, "descending", False)
                 if parsed is None:
                     reason = f"unsupported key expression at position {position}"
                     break

@@ -120,7 +120,7 @@ def test_precision_comparison_covers_numeric_boundaries_and_temporal_mismatch_de
         Column("TS_LTZ", "TIMESTAMP WITH LOCAL TIME ZONE", precision=9),
     ], primary_key=["ID"])
     source = {
-        "ID": Decimal("99999999999999999999999999999999999999"),
+        "ID": Decimal(99999999999999999999999999999999999999),
         "AMOUNT": Decimal("-12345678901234.123456"),
         "D": "2024-02-29T23:59:59",
         "TS6": "2024-02-29T23:59:59.123456000",
@@ -147,8 +147,8 @@ def test_precision_comparison_preserves_null_zero_negative_and_mixed_tz_offsets(
         Column("TS_TZ", "TIMESTAMP WITH TIME ZONE", precision=9),
     ], primary_key=["ID"])
     rows = [
-        {"ID": Decimal("1"), "N": Decimal("0"), "TS_TZ": "2024-02-29T23:59:59.123456789 +05:30"},
-        {"ID": Decimal("2"), "N": Decimal("-0.000001"), "TS_TZ": "2024-02-29T10:59:59.123456789 -08:00"},
-        {"ID": Decimal("3"), "N": None, "TS_TZ": None},
+        {"ID": Decimal(1), "N": Decimal(0), "TS_TZ": "2024-02-29T23:59:59.123456789 +05:30"},
+        {"ID": Decimal(2), "N": Decimal("-0.000001"), "TS_TZ": "2024-02-29T10:59:59.123456789 -08:00"},
+        {"ID": Decimal(3), "N": None, "TS_TZ": None},
     ]
     assert compare_precision_rows(rows, list(reversed(rows)), schema)["match"]

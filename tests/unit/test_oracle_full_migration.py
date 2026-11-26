@@ -17,6 +17,7 @@ from core.connectors.base import (
     UniqueConstraint,
     UnmappedTypeError,
     UpsertResult,
+    ViewDefinition,
 )
 from core.connectors.oracle.indexes import normalize_index_rows
 from core.connectors.oracle.precision import oracle_full_unsupported_datatypes
@@ -450,6 +451,32 @@ def test_oracle_index_catalog_normalizes_normal_descending_and_timestamp_tz_keys
     assert indexes["IX_DESC"]["descending_columns"] == ["CUSTOMER_ID"]
 
 
+def test_oracle_26ai_bare_column_expression_maps_hidden_descending_key_to_original_column():
+    # Captured read-only USER_* metadata for an ordinary CREATE INDEX ... (COL DESC):
+    # Oracle reports a hidden RAW SYS_NC column and the quoted logical identifier.
+    row = ("IX_NATIVE_DESC", "NONUNIQUE", "FUNCTION-BASED NORMAL", "VALID", "NO",
+           "SYS_NC00006$", 1, "DESC", '"EVENT_DATE"')
+    definition = normalize_index_rows([row], {"EVENT_DATE": "DATE"})["IX_NATIVE_DESC"]
+
+    assert definition["supported"] is True
+    assert definition["index_type"] == "NORMAL"
+    assert definition["columns"] == ["EVENT_DATE"]
+    assert definition["descending_columns"] == ["EVENT_DATE"]
+    assert definition["functional"] is False
+
+
+@pytest.mark.parametrize("expression", ['UPPER("EVENT_DATE")', '"MISSING_COLUMN"'])
+def test_oracle_26ai_bare_expression_does_not_expand_function_index_support(expression):
+    definition = normalize_index_rows(
+        [("IX_UNSUPPORTED", "NONUNIQUE", "FUNCTION-BASED NORMAL", "VALID", "NO",
+          "SYS_NC00006$", 1, "DESC", expression)],
+        {"EVENT_DATE": "DATE"},
+    )["IX_UNSUPPORTED"]
+
+    assert definition["supported"] is False
+    assert definition["functional"] is True
+
+
 @pytest.mark.parametrize(
     ("index_type", "status", "partitioned", "expression", "column_types", "reason"),
     [
@@ -502,6 +529,24 @@ def test_oracle_source_discovers_fixture_timestamp_tz_index_as_column_keys():
     assert schema.indexes[0].descending_columns == []
 
 
+def test_oracle_source_discovers_captured_native_descending_index_metadata():
+    connection, cursor = _connection_cursor()
+    cursor.fetchall.side_effect = [
+        [("EVENT_DATE", "DATE", 7, 7, None, None, None, "N", None, "NO", "NO")],
+        [],
+        [("IX_EVENT_DATE_DESC", "NONUNIQUE", "FUNCTION-BASED NORMAL", "VALID", "NO",
+          "SYS_NC00006$", 1, "DESC", '"EVENT_DATE"')],
+    ]
+    source = OracleSourceConnector({"username": "SOURCE_OWNER"})
+    source._conn = connection
+
+    schema = source.get_schema("EVENTS")
+
+    assert schema.indexes[0].name == "IX_EVENT_DATE_DESC"
+    assert schema.indexes[0].columns == ["EVENT_DATE"]
+    assert schema.indexes[0].descending_columns == ["EVENT_DATE"]
+
+
 def test_oracle_target_recreates_intrinsic_tstz_index_using_original_column_ddl():
     connection, cursor = _connection_cursor()
     cursor.fetchall.return_value = []
@@ -542,6 +587,26 @@ def test_oracle_target_matches_native_tstz_function_index_to_column_definition()
     assert target.apply_constraints(schema) == []
     assert not any("CREATE INDEX" in call.args[0] for call in cursor.execute.call_args_list)
     assert not any("DROP INDEX" in call.args[0] for call in cursor.execute.call_args_list)
+
+
+def test_oracle_target_repeat_matches_captured_native_descending_index():
+    connection, cursor = _connection_cursor()
+    cursor.fetchall.side_effect = [
+        [("IX_EVENT_DATE_DESC", "EVENTS", "NONUNIQUE", "FUNCTION-BASED NORMAL",
+          "VALID", "NO", None, "SYS_NC00006$", 1, "DESC", '"EVENT_DATE"')],
+        [("EVENT_DATE", "DATE")],
+    ]
+    target = OracleTargetConnector({})
+    target._conn = connection
+    schema = Schema(
+        "EVENTS", columns=[Column("EVENT_DATE", "DATE")],
+        indexes=[Index("IX_EVENT_DATE_DESC", ["EVENT_DATE"], index_type="NORMAL",
+                       descending_columns=["EVENT_DATE"])],
+    )
+
+    assert target.apply_constraints(schema) == []
+    statements = [str(call.args[0]).upper() for call in cursor.execute.call_args_list]
+    assert not any("CREATE INDEX" in statement or "DROP INDEX" in statement for statement in statements)
 
 
 def test_oracle_full_rejects_genuine_function_index_before_target_clear():
@@ -804,7 +869,6 @@ def test_oracle_primary_key_uses_generated_name_instead_of_source_name():
 
 def test_oracle_primary_key_name_conflict_fails_before_create_table():
     connection, cursor = _connection_cursor()
-    target_name = _oracle_constraint_name("ORDERS", "PK", "PK_SHARED_SOURCE_NAME")
     cursor.fetchone.side_effect = [None, ("OTHER_TABLE", "P", None, None)]
     target = OracleTargetConnector({"source_engine": "oracle"})
     target._conn = connection
@@ -889,7 +953,10 @@ def test_oracle_apply_unique_uses_target_generated_name_and_surfaces_conflict():
     target._conn = connection
     schema = Schema("T", unique_constraints=[UniqueConstraint("UQ_SHARED", ["A"])])
     assert target.apply_constraints(schema) == []
-    ddl = [call.args[0] for call in cursor.execute.call_args_list if "ALTER TABLE" in call.args[0]][0]
+    ddl = next(
+        call.args[0] for call in cursor.execute.call_args_list
+        if "ALTER TABLE" in call.args[0]
+    )
     assert _oracle_constraint_name("T", "UQ", "UQ_SHARED") in ddl
     assert "UQ_SHARED" not in ddl
 
@@ -949,7 +1016,7 @@ def test_oracle_full_load_temporarily_allows_always_identity_then_restores_and_a
     assert connection.commit.call_count == 2
 
 
-def test_oracle_by_default_identity_load_does_not_change_generation_mode():
+def test_oracle_by_default_identity_load_preserves_mode_and_advances_generator():
     connection, cursor = _connection_cursor()
     target = OracleTargetConnector({})
     target._conn = connection
@@ -961,7 +1028,11 @@ def test_oracle_by_default_identity_load_does_not_change_generation_mode():
     result = target.upsert_batch("IDENTITY_T", iter([{"RECORD_ID": 7}]), schema)
 
     assert result.success_count == 1
-    assert cursor.execute.call_count == 0
+    expected_sync = (
+        'ALTER TABLE "IDENTITY_T" MODIFY '
+        '("RECORD_ID" GENERATED BY DEFAULT AS IDENTITY (START WITH LIMIT VALUE))'
+    )
+    assert [call.args[0] for call in cursor.execute.call_args_list] == [expected_sync]
     cursor.executemany.assert_called_once()
 
 
@@ -2393,3 +2464,86 @@ def test_oracle_type_registry_entries(source_engine, target_engine, source_type,
     registry = TypeMappingRegistry()
     assert "oracle" in registry.get_supported_engines()
     assert registry.map_type(source_engine, target_engine, source_type) == expected
+
+
+def test_oracle_repeat_full_reapplies_managed_views_after_table_ddl():
+    view = ViewDefinition(
+        "V_T", "CREATE OR REPLACE VIEW V_T AS SELECT ID FROM T",
+        schema_name="SOURCE_OWNER",
+    )
+    events = []
+
+    class ViewSource(_OneTableOracleSource):
+        def list_views(self):
+            return [view]
+
+        def list_materialized_views(self):
+            return []
+
+        def list_all_sequences(self):
+            return []
+
+        def list_functions(self):
+            return []
+
+        def list_types(self):
+            return []
+
+        def get_all_triggers(self):
+            return []
+
+        def list_synonyms(self):
+            return []
+
+        def list_comments(self):
+            return []
+
+    class ViewTarget(_OneTableOracleTarget):
+        def set_managed_source_objects(self, _objects):
+            pass
+
+        def validate_object_privileges(self, **_objects):
+            pass
+
+        def create_view(self, _view):
+            self.view_valid = True
+            events.append("create-view")
+
+        def suspend_triggers_for_data_load(self, _triggers):
+            return []
+
+        def restore_suspended_triggers(self):
+            pass
+
+        def apply_constraints(self, _schema):
+            self.view_valid = False
+            events.append("apply-table-ddl")
+            return []
+
+        def clear_objects_for_full_sync(self, objects):
+            events.append("clear-target-rows")
+            return super().clear_objects_for_full_sync(objects)
+
+    config = {
+        "source": {"engine": "oracle", "connection": {"username": "SOURCE_OWNER"}},
+        "target": {"engine": "oracle", "connection": {"username": "TARGET_OWNER"}},
+        "migration": {"mode": "full", "batch_size": 20},
+        "secrets": {"provider": "env"},
+        "validation": {"mode": "count"},
+    }
+    source = ViewSource()
+    target = ViewTarget()
+    target.view_valid = False
+
+    for _ in range(2):
+        result = MigrationOrchestrator(source, target, config).run_full()
+        assert result["status"] == "success"
+        assert result["phases"]["views"] == {"V_T": "recreated_after_table_ddl"}
+        assert target.view_valid is True
+
+    assert events.count("create-view") == 4
+    for start in (0, 2):
+        cycle = events[start * 2 : start * 2 + 4]
+        assert cycle.index("clear-target-rows") < len(cycle)
+        view_positions = [index for index, event in enumerate(cycle) if event == "create-view"]
+        assert cycle.index("apply-table-ddl") < view_positions[-1]

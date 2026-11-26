@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -419,7 +420,7 @@ def test_missing_privilege_blocks_full_before_cleanup():
     events = []
 
     class Source(SourceConnector):
-        _config = {"username": "SOURCE_OWNER"}
+        _config: ClassVar[dict[str, str]] = {"username": "SOURCE_OWNER"}
         def connect(self): pass
         def close(self): pass
         def list_objects(self): return ["T"]
@@ -438,7 +439,9 @@ def test_missing_privilege_blocks_full_before_cleanup():
         def list_synonyms(self): return []
 
     class Target(TargetConnector):
-        _config = {"username": "TARGET_OWNER", "source_engine": "oracle"}
+        _config: ClassVar[dict[str, str]] = {
+            "username": "TARGET_OWNER", "source_engine": "oracle"
+        }
         def connect(self): pass
         def close(self): pass
         def ensure_database_exists(self): pass
