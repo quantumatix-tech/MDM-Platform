@@ -51,6 +51,96 @@ The application version is defined by the `version` field in `pyproject.toml`.
 - Unit tests: 1269 passed, 0 failed as of the 0.4.0 release. No known
   pre-existing failures remain in the current baseline.
 
+## [0.5.0] - 2026-11-27
+
+### Added
+
+- **Oracle-to-Oracle FULL migration integration.** Integrated `OracleSourceConnector`
+  and `OracleTargetConnector` under `core/connectors/oracle/`, registered in
+  `core/connectors/__init__.py` and `migration_platform/__main__.py` (`oracle` engine),
+  using `python-oracledb` (`oracledb>=2.5`) Thin mode and `core/orchestrator.py`
+  FULL orchestration.
+- **Oracle administrative setup and CLI options.** Added `migration_platform/oracle_setup_plan.py`
+  for interactive PLAN/APPLY owner, tablespace/quota, and executor authority
+  provisioning; added `--oracle-overwrite-plan` and `--oracle-permission-adopt-legacy`
+  CLI flags along with `config/oracle_local_to_local.yaml` and
+  `config/oracle_e2e_acceptance.yaml`.
+- **Supported Oracle schema objects.** Implemented owner-local discovery, DDL, and
+  validation for ordinary tables, native scalar types (plus partial `JSON`/`XMLTYPE`
+  and catalog-resolved custom types), `NOT NULL`/`DEFAULT`/identity columns,
+  PK/UNIQUE/CHECK/FK constraints with FK-ordered load and clear, nonpartitioned
+  B-tree and normalized `DESC` secondary indexes, single-key RANGE (and LIST in
+  code/unit) partitioned tables, standalone sequences and identity generator
+  synchronization (`START WITH LIMIT VALUE`), ordinary views (reapplied after
+  table DDL) and restricted materialized views (`BUILD IMMEDIATE`, `REFRESH COMPLETE
+  ON DEMAND`, `DISABLE QUERY REWRITE`), PL/SQL functions/procedures/packages,
+  table DML triggers (suspended during load, state restored), private synonyms with
+  safe local owner remapping, table/column comments, and schema-level
+  OBJECT/VARRAY/nested-table types (without type bodies or methods).
+- **Supported Oracle owner-level security and permission migration.** Added opt-in
+  (`oracle_permission_migration`) migration of locked local application users
+  (passwords/hashes not copied), non-authenticated local roles, role memberships
+  with `ADMIN OPTION` verification, object grants (`SELECT`, `INSERT`, `UPDATE`,
+  `DELETE`), column grants (`INSERT`, `UPDATE`, `REFERENCES`), and approved
+  `CREATE SESSION` privileges via a dedicated `TARGET_EXECUTOR` connection and
+  `DMT_PERMISSION_PROVENANCE` tracking (`core/connectors/oracle/permissions.py`).
+- **Existing-target reconciliation and repeat FULL support.** Added
+  `core/connectors/oracle/replacement.py` for managed replacement planning,
+  preservation of safe independent target-only objects, fail-closed dependency and
+  conflict checks, opt-in compatible column reconciliation (`reconcile_target_schema`),
+  repeat FULL replacement of managed rows, and final `USER_OBJECTS`/`USER_ERRORS`
+  managed-object status validation.
+
+### Documentation
+
+- Added consolidated Oracle release documentation suite:
+  - `docs/oracle/01_Oracle_Setup_and_Migration_Guide.md`
+  - `docs/oracle/02_Oracle_Object_Support_Matrix.md`
+  - `docs/oracle/03_Oracle_Migration_Flow_and_Connector_Design.md`
+  - `docs/oracle/04_Oracle_Existing_Target_and_Permission_Handling.md`
+  - `docs/oracle/05_Oracle_Testing_and_Acceptance_Runbook.md`
+- Updated `docs/README.md` with Oracle documentation links and local quick-start
+  notes.
+- Updated MySQL documentation suite (`docs/mysql/README.md`,
+  `MYSQL_E2E_RUNBOOK.md`, `MYSQL_MIGRATION_FLOW.md`,
+  `MYSQL_OBJECT_SUPPORT_MATRIX.md`, `MYSQL_LOCAL_AUDIT.md`,
+  `MYSQL_LOCAL_TO_AZURE_AUDIT.md`, `MYSQL_LIMITATIONS.md`,
+  `MYSQL_TEST_GUIDE.md`) merged into `main`.
+
+### Notes
+
+- **Recorded Oracle local-to-local acceptance (historical evidence, Oracle AI
+  Database 26ai Free `23.26.3.0.0`, `SOURCE_OWNER` to `TARGET_OWNER` via
+  `config/oracle_local_to_local.yaml`):**
+  - Corrected FULL (`bfd97adbdcd14347a5108d8ef6792e72`, 196.2 s) and repeat FULL
+    (`f79b3095da5e406e92e75416a3f1fc8e`, 33.9 s): 5 application tables, 50/50 rows,
+    0 migration errors, and independent read-only verification passed with 0
+    missing/mismatched SOURCE objects, 0 invalid TARGET objects, and 0 compilation
+    errors.
+  - Earlier acceptance records also verified exact row parity, functional
+    constraints, secondary/DESC indexes, RANGE partitions, views/materialized-view
+    query results, function/package execution, synonyms, comments, 10 object grants,
+    1 column grant, 2 `CREATE SESSION` grants, 3 memberships, 2 locked users, 2
+    roles, overwrite of a modified target row, and identity ID generation (`11`).
+  - Historical Oracle acceptance records reported 2,118 project unit tests, 826
+    Oracle unit tests, and 192 focused repeat-FULL/replacement regression tests
+    passing (overlapping selections).
+- **Known limitations and unverified scenarios:**
+  - No Oracle CDC or incremental mode (FULL only).
+  - Oracle `local_to_cloud`, `cloud_to_local`, and `cloud_to_cloud` flows have no
+    live acceptance evidence; Thick mode is not configured; TCPS/TLS is unit-tested
+    only.
+  - Unsupported objects fail closed: virtual columns, `LONG`/`LONG RAW`/`BFILE`/
+    `INTERVAL`/unknown types, HASH/interval/reference/composite/multi-key
+    partitioning, bitmap/arbitrary function-based/partitioned secondary indexes,
+    database-event/`INSTEAD OF` triggers, `PUBLIC`/DB-link/unsafe cross-owner
+    synonyms, `TYPE BODY`/inherited/method-bearing/external types, `PUBLIC` grants,
+    row-level security policies, and multi-owner migration in one run.
+  - Oracle DDL commits implicitly; FULL is not a single rollback-capable
+    transaction.
+  - Generic integration tests and guarded live Oracle E2E tests are not executed
+    as part of offline release validation.
+
 ## [0.4.1] - 2026-11-23
 
 ### Fixed
